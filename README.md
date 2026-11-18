@@ -1,94 +1,94 @@
-# Successor Stars — battle board (Rust · Bevy · ECS)
+# Successor Stars — fleet battle (Rust · Bevy · ECS)
 
-A rebuild of the [BattleStars](https://github.com/tharak/BattleStars) `battle.html` prototype, the hex fleet-battle board that passed its playtest, in Rust with [Bevy 0.19](https://bevy.org) and its ECS. It plays the same **Fleet Battle Rules v0.2.1** ([docs/battle-rules.md](docs/battle-rules.md)) and adds a new opponent AI built from the playtest findings.
+A real-time fleet battle with hundreds of ships a side, in Rust with [Bevy 0.19](https://bevy.org) and its ECS. You command divisions, and formation decides the fight: a deep arrow can tear a hole in a thin line, a crescent can close on an arrow's flanks, and shots into a ship's flank or rear land far more often than shots into its front.
 
 **Play:** <https://tharak.github.io/space-game/> (needs a browser with WebGL2)
 
+This started as a port of the [BattleStars](https://github.com/tharak/BattleStars) hex board (rules v0.2.1, still in this repo's history). Playing it showed that 9 squadrons a side, each destroyed in 2–3 shots, could not give a formation time to matter. So the game is now a continuous 2D simulation of every ship ([docs/fleet-rules.md](docs/fleet-rules.md)).
+
 ## How to play
 
-Pick a control mode, fleet size, movement mode, deployment mode and opponent AI on the menu, then a scenario.
+Pick a side, a fleet size (120/240/480 ships a side), an opponent and a scenario. When you command a fleet, the battle starts paused so you can give orders first.
 
 | Input | Action |
 | --- | --- |
-| Click/tap your squadron | Activate it (you can switch until you move or fire) |
-| `Q` / `E` or **Turn left / Turn right** | Turn 60° (1 MP) |
-| `W` or **Forward** | Move one hex ahead (1 MP) |
-| `S` or **Back** | One hex astern, keeping facing (all 3 MP) |
-| Click a red-outlined enemy (`F` highlights) | Fire |
-| `Space` or **End activation** | Done with this squadron |
+| Click a ship, or a row in the division list | Select its division (`Tab` cycles your divisions) |
+| Right-click the map (or **Move…**, then click/tap) | Move there; drag while holding the button to set the facing |
+| Click an enemy ship with your division selected | Engage that enemy division |
+| **Hold / Advance / Charge / Withdraw** (`H` `G` `C` `X`) | Orders |
+| Formation buttons (`F` cycles) | Line, Wedge, Crescent, Echelon L/R, Column |
+| Drag / arrows / WASD, wheel / pinch, `+` `-` | Pan and zoom |
+| `Space`, `1`–`4` | Pause, and speed 1× 2× 4× 8× |
 
-* Squadrons within 4 hexes of their flagship are **in command**: move *and* fire, in either order. Out of command they move *or* fire.
-* Hits need 5+ / 4+ / 3+ into the target's front / flank / rear arc. Morale fails go Steady → Shaken → Routed, and routs spread.
-* A fleet breaks when more than half its squadrons are destroyed or have fled.
+* Enemy ships block each other. To get through a line you must destroy the ships in the way.
+* A division that loses ships quickly turns Shaken, then Routs. Staying inside the flagship's command circle steadies it.
+* A fleet breaks when more than half its ships are destroyed, fled or routed.
 
-The full rules are in the in-game crib sheet and in [docs/battle-rules.md](docs/battle-rules.md).
+## How an arrow breaks a line
 
-## What was ported
+The breakthrough is not a scripted rule. It comes out of the simulation:
 
-The scenario menu (9 scenarios), the control modes (play Blue/Red, hotseat, spectate with Step/Auto), 5/9/12-squadron fleets, interleaved and all-at-once activation, manual and fixed deployment, the hexagonal 27×27 board, fire-zone and command-reach shading, legal-target outlines, laser beams, the battle log, the rules crib sheet, and the result overlay with **Copy result line**. The result line now also records which AI played (`ai=doctrine`).
+1. **Short range.** Guns have a short range and fire only in a forward cone. Only the part of a line facing the arrow's tip can shoot at it; the rest of the line is out of the fight until it wheels.
+2. **Depth.** A wedge closes ranks as it loses ships, so it always has a full front. A two-rank line keeps its holes.
+3. **Blocking.** Ships cannot pass through or push enemies, so the arrow grinds through the line by destroying the ships in its way.
+4. **Getting behind.** Once through, the arrow fires into rear arcs (40% to hit, against 12% from the front). The line's ships cannot turn far enough to answer until their division wheels.
+5. **Morale.** Being broken through, plus the sudden losses, shakes and routs the broken divisions.
 
-## Doctrine AI (new)
-
-The playtest found that the old AI's flagship "charges recklessly" and dies, so every battle turned into flagship sniping. The **doctrine** AI is the default opponent. For each squadron it searches every reachable pose this activation and scores each plan by:
-
-* **Attack:** expected hits by arc, with bonuses for likely kills, flank/rear shots, shaken targets and the enemy flagship.
-* **Exposure:** how much fire the pose invites next turn, weighting flank/rear exposure higher.
-* **Formation:** staying in command range and keeping adjacent support and cohesion.
-* **Pressure:** a will to close distance that grows every turn.
-
-The flagship keeps station behind the friendly line and inside command range of its squadrons, and moves last unless it is threatened. Squadrons in command can **shoot and scoot** (fire, then move away). The original advance-and-shoot logic is still selectable as **Baseline**, for comparisons with the old sim numbers.
+The counter is to put flanks on the arrow, for example with a crescent or by committing the reserve.
 
 ## Balance runs
 
-`cargo run --release --bin sim -- 200 9` plays every scenario AI-vs-AI, with each formation taking each seat half the time, as the original Python sim did. Cells are the first-named side's win % (400 games each):
+`cargo run --release --bin sim -- 25 240` plays every scenario AI-vs-AI, with each fleet taking each seat half the time. Each cell gives the first-named fleet's win %, and the battle length in minutes with contact at about 0:48. 50 games per cell:
 
-| Scenario | Baseline mirror | Doctrine mirror | Doctrine A vs baseline B | Baseline A vs doctrine B |
-| --- | ---: | ---: | ---: | ---: |
-| Spindle vs Wide Line | 54 | 54 | 92 | 4 |
-| Wide Line vs Crescent | 35 | 59 | 84 | 6 |
-| Crescent vs Spindle | 62 | 52 | 98 | 22 |
-| Echelon vs Spindle | 81 | 44 | 98 | 5 |
-| Sphere vs Crescent | 19 | 28 | 79 | 2 |
-| Wide Line vs Column | 86 | 75 | 100 | 24 |
-| Low-supply mirror (normal side) | 62 | 70 | 97 | 18 |
-| Flagship hunt (mirror) | 48 | 48 | 94 | 8 |
-| Critical-supply mirror (normal side) | 97 | 98 | 100 | 77 |
+| Scenario | Commander AI both sides | Formation only (opening orders) |
+| --- | ---: | ---: |
+| Arrow vs Line | **74%**, 3.1 min | 100%, on time |
+| Line vs Line | 50%, 3.7 min | 40%, 3.5 min |
+| Crescent vs Arrow | **72%**, 2.6 min | 2%, 6.6 min |
+| Echelon vs Line | 50%, 3.6 min | 18%, 3.8 min |
+| Columns vs Line | 46%, 3.2 min | 98%, 5.1 min |
+| Low supply (Red fires 8% slower) | 74%, 3.7 min | 98%, 3.4 min |
 
-* **Does the port match the old sim?** The baseline AI matches the old Python sim wherever the board shape doesn't matter: supply 62 vs 66, critical 97 vs 96, line vs column 86 vs 88, line vs crescent 35 vs 36. The spindle matchups differ because this board (like the old web page) is a hexagon, while the Python sim used a rectangle.
-* **Doctrine beats baseline** 79–100% from either seat. Doctrine mirrors resolve in about 5–9 turns, and low supply lands at 70/30, inside the 60–75% target band.
-* **First-mover effect:** Blue always opens turn 1. Without mirrored seats, the baseline line-vs-line mirror goes 23/77 to Red, because whoever walks into range first gets shot first. That's worth a rules decision; the paper rules roll off for first activation.
+* With commanders on both sides, the arrow beats the line and the crescent beats the arrow. The even matchups come out even.
+* "Formation only" means no division ever changes its opening order. That shows the raw shapes. The arrow wins on time there because it punches through and the line never turns to face it. Columns win for the same reason.
+* Hundreds of ships average out the dice, so a small edge (like 8% slower fire) decides most battles.
+* **Known weakness:** the commander AI loses Line vs Line to a formation-only line (18%). Its flanking moves cost it more than they gain, so it needs another pass.
 
 ## Architecture
 
 ```
 src/
-  hex.rs            pure hex math (odd-r offset grid, arcs, LOS — exact port incl. JS rounding)
-  rules/            headless battle rules; no rendering, no input
-    components.rs   Squadron, HexPos, Facing, Side, Strength, Morale, Flagship, Alive, Activated, ...
-    battle.rs       resources (MatchSettings, Battle, Activation, Deployment, Phase),
-                    fire / morale / rout / flagship loss / turn order / victory over a Bevy World
-    commands.rs     BattleCommand message: the player-intent vocabulary
-    ai.rs           Baseline (port) and Doctrine AIs
-    dice.rs         seeded or scripted d6 resource (Mulberry32, as in the original)
-    formations.rs   formation templates (positions + facings only)
-  game/             the Bevy app
-    flow.rs         applies commands, paces AI activations, turns BattleEvents into log lines
-    model.rs        per-frame UiModel read model built from the rules world
-    board.rs        camera fit, hex tiles, squadron visuals as child entities, gizmo outlines, lasers, picking
-    ui.rs           menu, side panel, log, crib sheet, result overlay (bevy_ui)
-    autoplay.rs     scripted native smoke run that saves screenshots (dev only)
-  bin/sim.rs        Monte-Carlo balance runner
+  sim/                headless simulation; no rendering, no input
+    components.rs     Ship, Pos, Vel, Heading, Side, InDivision, Slot, Weapon, FleetFlagship, Division
+    formation.rs      slot layouts per formation
+    spatial.rs        uniform-grid spatial hash (neighbours, targeting, centroids)
+    systems.rs        the SimTick schedule: steering, blocking, fire, close ranks, morale, breakthroughs, victory
+    ai.rs             the division-level commander AI
+    scenario.rs       fleet shapes and scenarios
+    battle.rs         settings, Tuning (every number), Battle state, SimEvent messages
+    rng.rs            seeded Mulberry32
+  game/               the Bevy app
+    flow.rs           start/restart, applies orders, steps the sim at the chosen speed, log lines
+    view.rs           ship meshes (shared mesh and materials, batched), labels, lasers, explosions, order overlays
+    camera.rs         pan and zoom around the side panel
+    input.rs          mouse, touch and keyboard
+    model.rs          per-frame UiModel read model
+    ui.rs             menu, side panel, division list, orders, log, rules, result overlay
+    autoplay.rs       scripted native smoke run that saves screenshots (dev only)
+  bin/sim.rs          balance runner
+examples/trace.rs     battle timeline, with optional PPM snapshots (TRACE_PPM=dir)
 ```
 
-Each squadron is one ECS entity. The rules mutate components and resources and publish `BattleEvent` messages. Presentation systems observe those events (the log and lasers) and read components (the tokens). Because the rules take only a `World`, the same code runs in the browser, in tests and in the sim.
+Every ship is an entity, and so is every division. The simulation is ordinary ECS systems in a custom `SimTick` schedule with a fixed step. The game runs that schedule from `FixedUpdate` 0–8 times per step, and the tests and balance runner call it directly on a bare `World`. A seed always replays the same battle.
 
 ## Develop
 
 ```bash
-cargo test --lib                          # rules tests (arcs, LOS, morale, rout, deployment, every scenario terminates)
+cargo test --lib                          # sim tests (formations, spatial hash, arcs, morale, blocking, breakthrough, determinism)
 cargo run                                 # native window
-cargo run --release --bin sim -- 200 9    # balance table
-SG_AUTOPLAY=/tmp/shots cargo run          # scripted run: menu → battle → deployment → spectate, saves PNGs
+cargo run --release --bin sim -- 25 240   # balance table
+cargo run --release --example trace -- 0 c 1   # timeline of Arrow vs Line, commander AI, seed 1
+SG_AUTOPLAY=/tmp/shots cargo run          # scripted run, saves PNGs
 ./scripts/build-web.sh                    # wasm bundle into dist/ (python3 -m http.server -d dist)
 ```
 

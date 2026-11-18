@@ -13,7 +13,7 @@ fn main() {
         }
     }));
     let window = Window {
-        title: "Successor Stars — Battle Prototype".into(),
+        title: "Successor Stars — Fleet Battle".into(),
         resolution: (1280, 820).into(),
         #[cfg(target_arch = "wasm32")]
         canvas: Some("#game".into()),

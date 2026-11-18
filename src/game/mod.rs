@@ -1,19 +1,24 @@
-//! The Bevy app layer: board rendering, UI and input on top of `rules`.
+//! The Bevy app layer: fleet view, camera, orders UI and input on top of
+//! the headless [`crate::sim`].
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod autoplay;
-pub mod board;
+pub mod camera;
 pub mod flow;
+pub mod input;
 pub mod model;
 pub mod theme;
 pub mod ui;
+pub mod view;
 
 use bevy::asset::AssetId;
 use bevy::prelude::*;
 
-use crate::rules::battle::{Activation, Battle, BattleEvent, Deployment, MatchSettings, Phase};
-use crate::rules::commands::BattleCommand;
-use crate::rules::dice::Dice;
+use crate::sim::Command;
+use crate::sim::battle::{Battle, DT, SimEvent, SimSettings, Tuning};
+use crate::sim::rng::Rng;
+use crate::sim::spatial::SpatialHash;
+use crate::sim::systems::build_schedule;
 
 /// Noto Sans Mono, subset to Latin + arrows/box symbols (SIL OFL 1.1).
 const FONT: &[u8] = include_bytes!("../../assets/fonts/NotoSansMono-subset.ttf");
@@ -23,59 +28,65 @@ pub struct GamePlugin;
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 enum Stage {
     Input,
-    Rules,
+    Apply,
     Model,
     Present,
 }
 
 impl Plugin for GamePlugin {
     fn build(&self, app: &mut App) {
-        // Replace Bevy's ASCII-only default font with one that has — → ↶ ▶ etc.
+        // Replace Bevy's ASCII-only default font with one that has — → ▶ etc.
         let _ = app
             .world_mut()
             .resource_mut::<Assets<Font>>()
             .insert(AssetId::default(), Font::from_bytes(FONT.to_vec()));
 
         app.insert_resource(ClearColor(theme::BG))
-            .insert_resource(Dice::seeded(random_seed() ^ 0x9e37_79b9))
-            .init_resource::<MatchSettings>()
-            .init_resource::<Phase>()
+            .insert_resource(Time::<Fixed>::from_seconds(DT as f64))
+            .insert_resource(flow::SeedSource(random_seed()))
+            .init_resource::<SimSettings>()
+            .init_resource::<Tuning>()
             .init_resource::<Battle>()
-            .init_resource::<Activation>()
-            .init_resource::<Deployment>()
-            .init_resource::<model::UiModel>()
-            .init_resource::<board::BoardView>()
-            .init_resource::<flow::AiPacing>()
+            .init_resource::<SpatialHash>()
+            .insert_resource(Rng::seeded(1))
+            .init_resource::<flow::Phase>()
+            .init_resource::<flow::Speed>()
             .init_resource::<flow::LogBook>()
             .init_resource::<flow::OverlayHidden>()
+            .init_resource::<model::UiModel>()
+            .init_resource::<camera::CameraRig>()
+            .init_resource::<input::Selection>()
+            .init_resource::<input::MoveDrag>()
+            .init_resource::<view::Fx>()
             .init_resource::<ui::CribOpen>()
-            .add_message::<BattleCommand>()
-            .add_message::<BattleEvent>()
-            .init_gizmo_group::<board::HaloGizmos>()
-            .init_gizmo_group::<board::ThinGizmos>()
-            .configure_sets(Update, (Stage::Input, Stage::Rules, Stage::Model, Stage::Present).chain())
-            .add_systems(Startup, (board::setup_board, ui::setup_ui))
+            .add_message::<SimEvent>()
+            .add_message::<Command>()
+            .add_message::<flow::AppRequest>()
+            .add_schedule(build_schedule())
+            .init_gizmo_group::<view::ThinGizmos>()
+            .configure_sets(Update, (Stage::Input, Stage::Apply, Stage::Model, Stage::Present).chain())
+            .add_systems(Startup, (camera::setup_camera, view::setup_view, ui::setup_ui))
+            .add_systems(FixedUpdate, flow::run_sim)
             .add_systems(
                 Update,
                 (
-                    (ui::handle_buttons, flow::keyboard, board::board_input, ui::scroll).in_set(Stage::Input),
-                    flow::run_battle.in_set(Stage::Rules),
+                    (ui::handle_buttons, input::keyboard, input::pointer, ui::scroll).in_set(Stage::Input),
+                    flow::apply_requests.in_set(Stage::Apply),
                     model::build_model.in_set(Stage::Model),
                     (
                         flow::log_events,
+                        view::collect_fx,
                         ui::sync_log,
                         ui::update_texts,
                         ui::update_layout,
                         ui::update_button_state,
                         ui::style_buttons,
-                        board::fit_camera,
-                        board::attach_ship_visuals,
-                        board::sync_ships,
-                        board::sync_setup_ghosts,
-                        board::paint_tiles,
-                        board::spawn_lasers,
-                        board::draw_lasers,
-                        board::draw_outlines,
+                        camera::apply_camera,
+                        view::attach_ship_visuals,
+                        view::sync_ships,
+                        view::sync_labels,
+                        view::draw_fx,
+                        view::draw_overlays,
                     )
                         .chain()
                         .in_set(Stage::Present),
@@ -88,7 +99,7 @@ impl Plugin for GamePlugin {
     }
 }
 
-/// A little entropy for the dice: wall-clock nanoseconds where available.
+/// A little entropy for battle seeds: wall-clock time where available.
 fn random_seed() -> u32 {
     #[cfg(target_arch = "wasm32")]
     {

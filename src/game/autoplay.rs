@@ -1,53 +1,52 @@
 //! Scripted smoke run for development: `SG_AUTOPLAY=<dir> cargo run`
-//! drives the real app through the menu, a battle, a human activation,
-//! manual deployment and a spectated AI game, saving screenshots to <dir>
-//! and exiting. Not compiled for the web.
+//! drives the real app through the menu, a commanded battle and a
+//! spectated one, saving screenshots to <dir> and exiting. Not compiled for
+//! the web.
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 
-use super::board::{BoardView, pixel_to_hex, to_world};
-use super::flow::AiPacing;
-use crate::hex::Hex;
-use crate::rules::battle::{Activation, MatchSettings, Phase};
-use crate::rules::commands::BattleCommand;
-use crate::rules::config::{ControlMode, DeployMode};
+use super::camera::CameraRig;
+use super::flow::{AppRequest, Phase, SeedSource, Speed};
+use super::input::Selection;
+use crate::sim::Command;
+use crate::sim::battle::{Battle, Control, SimSettings};
+use crate::sim::components::{Division, Order};
+use crate::sim::spatial::SpatialHash;
 
 #[derive(Resource)]
 pub struct Autoplay {
     dir: String,
     frame: u32,
-    spectate_started: Option<u32>,
+    step: u32,
+    wait_from: u32,
 }
 
 impl Autoplay {
     pub fn from_env() -> Option<Self> {
         std::env::var("SG_AUTOPLAY").ok().map(|dir| {
             std::fs::create_dir_all(&dir).ok();
-            Self { dir, frame: 0, spectate_started: None }
+            Self { dir, frame: 0, step: 0, wait_from: 0 }
         })
     }
-}
-
-/// Clicks a hex the way a player would: hex -> screen pixel -> board pick.
-fn click(view: &BoardView, h: Hex, out: &mut MessageWriter<BattleCommand>) {
-    let screen = view.world_to_screen(to_world(h));
-    let picked = pixel_to_hex(view.screen_to_world(screen));
-    assert_eq!(picked, Some(h), "screen/board mapping round-trip failed for {h:?}");
-    out.write(BattleCommand::SelectHex(h));
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn autoplay(
     mut commands: Commands,
     mut auto: ResMut<Autoplay>,
-    mut settings: ResMut<MatchSettings>,
-    mut out: MessageWriter<BattleCommand>,
-    mut pacing: ResMut<AiPacing>,
+    mut settings: ResMut<SimSettings>,
+    mut seed: ResMut<SeedSource>,
+    mut requests: MessageWriter<AppRequest>,
+    mut orders: MessageWriter<Command>,
+    mut speed: ResMut<Speed>,
+    mut sel: ResMut<Selection>,
     mut exit: MessageWriter<AppExit>,
-    view: Res<BoardView>,
+    rig: Res<CameraRig>,
+    hash: Res<SpatialHash>,
     phase: Res<Phase>,
-    act: Res<Activation>,
+    battle: Res<Battle>,
+    divs: Query<(Entity, &Division)>,
 ) {
     auto.frame += 1;
     let f = auto.frame;
@@ -57,60 +56,79 @@ pub fn autoplay(
         info!("autoplay screenshot {path}");
         commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
     };
-    match f {
-        40 => shot(&mut commands, "01-menu"),
-        45 => {
-            *settings = MatchSettings { scenario: 0, deploy_mode: DeployMode::Fixed, ..default() };
-            out.write(BattleCommand::Restart);
+    let find = |side: usize, number: usize| divs.iter().find(|(_, d)| d.side == side && d.number == number).map(|(e, _)| e);
+    let since = f - auto.wait_from;
+    let next = |auto: &mut Autoplay| {
+        auto.step += 1;
+        auto.wait_from = f;
+    };
+    match auto.step {
+        0 if f == 40 => {
+            shot(&mut commands, "01-menu");
+            next(&mut auto);
         }
-        90 => shot(&mut commands, "02-battle-start"),
-        95 => {
-            assert!(act.0.is_some_and(|a| a.side == 0 && a.unit.is_none()), "Blue should be picking a squadron");
-            click(&view, Hex::new(9, 13), &mut out); // spindle tip
+        1 if since == 5 => {
+            *settings = SimSettings { scenario: 0, ships: 240, control: Control::PlayBlue, ..default() };
+            seed.0 = 7;
+            requests.write(AppRequest::Start);
+            next(&mut auto);
         }
-        110 => shot(&mut commands, "03-selected"),
-        115 => {
-            out.write(BattleCommand::Forward);
-            out.write(BattleCommand::Forward);
-            out.write(BattleCommand::Forward);
+        2 if since == 40 => {
+            shot(&mut commands, "02-battle-start");
+            // Click the spearhead's ship the way a player would.
+            let tip = find(0, 3).expect("B3 exists");
+            let ship = hash.divisions.get(&tip).and_then(|d| d.members.first()).map(|i| hash.entries[*i as usize].pos);
+            let screen = rig.world_to_screen(ship.expect("B3 has ships"));
+            let world = rig.screen_to_world(screen);
+            let picked = super::input::pick_division(&hash, world, rig.scale);
+            assert_eq!(picked.map(|p| p.0), Some(tip), "screen/world pick round-trip failed");
+            sel.division = Some(tip);
+            next(&mut auto);
         }
-        130 => shot(&mut commands, "04-moved"),
-        135 => {
-            out.write(BattleCommand::EndActivation);
+        3 if since == 20 => {
+            shot(&mut commands, "03-selected");
+            // Swing the reserve out to the left as a flank guard, then go.
+            let reserve = find(0, 6).expect("B6 exists");
+            orders.write(Command::Order { division: reserve, order: Order::MoveTo { to: Vec2::new(-700.0, 500.0), facing: 0.0 } });
+            speed.paused = false;
+            speed.mult = 8;
+            next(&mut auto);
         }
-        700 => shot(&mut commands, "05-midgame"),
-        705 => {
-            settings.deploy_mode = DeployMode::Manual;
-            settings.control = ControlMode::PlayBlue;
-            out.write(BattleCommand::Restart);
+        4 if battle.time > 52.0 => {
+            shot(&mut commands, "04-contact");
+            next(&mut auto);
         }
-        720 => {
-            for r in [10, 12, 14] {
-                click(&view, Hex::new(6, r), &mut out);
-            }
-            out.write(BattleCommand::TurnRight);
+        5 if battle.time > 95.0 => {
+            shot(&mut commands, "05-breakthrough");
+            next(&mut auto);
         }
-        740 => shot(&mut commands, "06-deployment"),
-        745 => {
-            settings.control = ControlMode::Spectate;
-            settings.size = 12;
-            out.write(BattleCommand::Restart);
-            pacing.auto = true;
-            auto.spectate_started = Some(f);
+        6 if *phase == Phase::Over => {
+            shot(&mut commands, "06-result");
+            next(&mut auto);
         }
-        900 => shot(&mut commands, "07-spectate"),
+        7 if since == 20 => {
+            *settings = SimSettings { scenario: 2, ships: 480, control: Control::Spectate, ..default() };
+            requests.write(AppRequest::Start);
+            next(&mut auto);
+        }
+        8 if since >= 5 => {
+            speed.mult = 8;
+            next(&mut auto);
+        }
+        9 if battle.time > 80.0 => {
+            shot(&mut commands, "07-spectate-480");
+            next(&mut auto);
+        }
+        10 if *phase == Phase::Over => {
+            shot(&mut commands, "08-spectate-result");
+            next(&mut auto);
+        }
+        11 if since == 30 => {
+            exit.write(AppExit::Success);
+        }
         _ => {}
     }
-    if let Some(start) = auto.spectate_started {
-        if *phase == Phase::GameOver && f > 900 && f < 100_000 {
-            shot(&mut commands, "08-game-over");
-            auto.spectate_started = None;
-            auto.frame = 100_000;
-        } else if f - start > 20_000 {
-            panic!("spectated battle did not finish");
-        }
-    }
-    if f == 100_040 {
-        exit.write(AppExit::Success);
+    if f > 60 * 60 * 10 {
+        panic!("autoplay timed out at step {}", auto.step);
     }
 }

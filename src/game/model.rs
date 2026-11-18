@@ -1,159 +1,195 @@
-//! A per-frame read model of the battle for the UI and board overlays.
-//! Built by one exclusive system so every other presentation system is a
-//! plain, read-only system over `UiModel`.
-
-use std::collections::HashSet;
+//! A per-frame read model of the battle for the UI: status lines, the
+//! division list, the selected division and the result.
 
 use bevy::prelude::*;
 
+use super::flow::{Phase, Speed, clock};
+use super::input::{PointerMode, Selection};
 use super::theme::*;
-use crate::hex::Hex;
-use crate::rules::battle::*;
-use crate::rules::commands::fire_zone;
-use crate::rules::config::*;
+use crate::sim::battle::{Battle, Control, EndReason, SimSettings, Tuning};
+use crate::sim::components::*;
+use crate::sim::scenario::SCENARIOS;
+use crate::sim::spatial::SpatialHash;
 
 pub type Spans = Vec<(String, Color)>;
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
-pub struct Can {
-    pub turn: bool,
-    pub forward: bool,
-    pub back: bool,
-    pub fire: bool,
-    pub end: bool,
-    pub setup_turn: bool,
-    pub setup_flag: bool,
-    pub setup_remove: bool,
-    pub setup_confirm: bool,
+#[derive(Clone, Debug, PartialEq)]
+pub struct DivisionRow {
+    pub entity: Entity,
+    pub side: usize,
+    pub number: usize,
+    pub text: String,
+    pub color: Color,
+    pub selected: bool,
+    pub gone: bool,
 }
 
-#[derive(Resource, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResultView {
+    pub title: String,
+    pub body: String,
+    pub line: String,
+}
+
+#[derive(Resource, Default, Clone, Debug)]
 pub struct UiModel {
     pub phase: Phase,
-    pub status: Vec<Spans>,
-    /// One entry per line.
-    pub info: Vec<Spans>,
-    pub can: Can,
     pub spectate: bool,
-    pub fire_zone: HashSet<Hex>,
-    pub targets: Vec<Entity>,
-    pub selected: Option<Entity>,
-    /// Flagship hex per side, for the command-reach tint.
-    pub flagships: [Option<Hex>; 2],
-    pub setup: Option<SetupState>,
-    pub result: Option<BattleResult>,
+    pub paused: bool,
+    pub mult: u32,
+    pub status: Vec<Spans>,
+    pub divisions: Vec<DivisionRow>,
+    pub info: Vec<Spans>,
+    /// The selected division is the player's and can take orders.
+    pub can_order: bool,
+    pub move_mode: bool,
+    pub formation: Option<crate::sim::formation::Formation>,
+    pub result: Option<ResultView>,
+}
+
+fn span(s: impl Into<String>, c: Color) -> (String, Color) {
+    (s.into(), c)
 }
 
 pub fn build_model(world: &mut World) {
     let phase = *world.resource::<Phase>();
-    let settings = *world.resource::<MatchSettings>();
-    let mut m = UiModel { phase, spectate: settings.control == ControlMode::Spectate, ..default() };
-    if phase == Phase::Menu {
-        world.insert_resource(m);
-        return;
-    }
+    let settings = *world.resource::<SimSettings>();
+    let speed = *world.resource::<Speed>();
+    let sel = *world.resource::<Selection>();
     let battle = world.resource::<Battle>().clone();
-    let ships = snapshot(world);
-    for side in 0..2 {
-        m.flagships[side] = flagship_of(&ships, side).map(|s| s.hex);
-    }
-    m.result = battle.result.clone();
-
-    if phase == Phase::Deployment {
-        let setup = world.resource::<Deployment>().current.clone();
-        if let Some(setup) = &setup {
-            let size = settings.size;
-            m.status = vec![vec![
-                (format!("{} deployment", side_name(setup.side)), side_text(setup.side)),
-                (format!(" — {}/{} placed", setup.placed.len(), size), TEXT),
-            ]];
-            let sel = setup.selected;
-            m.info = vec![vec![(
-                match sel {
-                    Some(i) => format!(
-                        "Selected squadron{}. Turn it, set flagship, remove it, or click an empty zone hex to place another.",
-                        if setup.flagship == Some(i) { " — flagship" } else { "" }
-                    ),
-                    None if setup.placed.len() < size => format!(
-                        "Click an empty hex in your shaded zone to place your next squadron ({} left).",
-                        size - setup.placed.len()
-                    ),
-                    None => format!("All {size} squadrons placed. Click one to adjust, or confirm."),
-                },
-                TEXT,
-            )]];
-            m.can.setup_turn = sel.is_some();
-            m.can.setup_flag = sel.is_some() && sel != setup.flagship;
-            m.can.setup_remove = sel.is_some();
-            m.can.setup_confirm = setup.placed.len() == size;
-        }
-        m.setup = setup;
-        world.insert_resource(m);
+    let command_radius = world.resource::<Tuning>().command_radius;
+    let mut m = UiModel {
+        phase,
+        spectate: settings.control == Control::Spectate,
+        paused: speed.paused,
+        mult: speed.mult,
+        ..default()
+    };
+    if phase == Phase::Menu {
+        *world.resource_mut::<UiModel>() = m;
         return;
     }
+    let mut divs: Vec<(Entity, Division)> = world.query::<(Entity, &Division)>().iter(world).map(|(e, d)| (e, d.clone())).collect();
+    divs.sort_by_key(|(_, d)| (d.side, d.number));
+    let flags: Vec<(Vec2, usize)> =
+        world.query_filtered::<(&Pos, &Side), With<FleetFlagship>>().iter(world).map(|(p, s)| (p.0, s.0)).collect();
+    let hash = world.resource::<SpatialHash>();
 
-    let losses_of = |side: usize| battle.fleets[side].roster.iter().filter(|e| find(&ships, **e).is_some_and(|s| !s.alive)).count();
-    let fleet_tag = |side: usize| {
-        let f = &battle.fleets[side];
-        let sup = if f.supply == Supply::Ok { String::new() } else { format!(" ({} supply)", f.supply.name()) };
-        format!("{} {}{}: {}/{} losses", side_name(side), f.formation.name(), sup, losses_of(side), battle.break_at)
-    };
-    m.status = vec![
-        vec![(format!("Turn {}/{}", battle.turn, MAX_TURNS), GOLD)],
-        vec![(fleet_tag(0), BLUE)],
-        vec![(fleet_tag(1), RED)],
-    ];
-
-    let act = world.resource::<Activation>().0;
-    if battle.over() {
-        m.info = vec![vec![("Battle over.".into(), TEXT)]];
-    } else if let Some(a) = act {
-        match a.unit {
-            None => {
-                m.info = vec![vec![
-                    (side_name(a.side).into(), side_text(a.side)),
-                    (": click one of your un-activated squadrons.".into(), TEXT),
-                ]];
-            }
-            Some(u) => {
-                let me = *find(&ships, u).expect("selected ship");
-                let label = label_of(world, u);
-                let can_fire_now = can_fire(world, &a);
-                let mut info: Vec<Spans> = vec![
-                    vec![
-                        (format!("{}{}", label, if me.flagship { " (flagship)" } else { "" }), GOLD),
-                        (format!(" — str {}, {}", me.strength, me.morale.name()), TEXT),
-                    ],
-                    vec![(
-                        if a.cmd { "In command: move AND fire".into() } else { "OUT of command: move OR fire".to_string() },
-                        if a.cmd { TEXT } else { BAD },
-                    )],
-                    vec![(format!("MP {}/{}{}", a.mp, MP_MAX, if a.fired { " · has fired" } else { "" }), TEXT)],
-                ];
-                if can_fire_now {
-                    info.push(vec![("Click a red-outlined enemy to fire.".into(), RED)]);
-                }
-                if can_switch_selection(&a) {
-                    info.push(vec![(
-                        "Changed your mind? Click another un-activated squadron — nothing's committed yet.".into(),
-                        DIM,
-                    )]);
-                }
-                m.info = info;
-                m.can.turn = can_move(&a);
-                m.can.forward = can_move(&a);
-                m.can.back = can_back(&a);
-                m.can.fire = can_fire_now;
-                m.can.end = true;
-                m.selected = Some(u);
-                if can_fire_now {
-                    m.targets = legal_targets(&ships, &me).iter().map(|t| t.e).collect();
-                }
-                m.fire_zone = fire_zone(world).into_iter().collect();
-            }
-        }
+    // Status: the clock and each fleet's strength.
+    let scenario = SCENARIOS[settings.scenario];
+    let state = if phase == Phase::Over {
+        "ended"
+    } else if speed.paused {
+        "paused"
     } else {
-        m.info = vec![vec![(if m.spectate { "Spectating — press Step or Auto." } else { "AI is acting…" }.into(), DIM)]];
+        ""
+    };
+    m.status.push(vec![
+        span(format!("{}  ", scenario.title), GOLD),
+        span(clock(battle.time), TEXT),
+        span(format!("  ×{} {state}", speed.mult), DIM),
+    ]);
+    for side in 0..2 {
+        let fighting = battle.start[side].saturating_sub(battle.lost[side]);
+        let you = if settings.control.human_controls(side) { " (you)" } else { "" };
+        let mut line = vec![
+            span(format!("{}{you}: ", side_name(side)), side_color(side)),
+            span(format!("{fighting}/{} fighting", battle.start[side]), TEXT),
+            span(format!(" · breaks below {}", battle.start[side] / 2), DIM),
+        ];
+        if battle.flag_lost[side] {
+            line.push(span(" · flagship lost", BAD));
+        }
+        m.status.push(line);
     }
-    world.insert_resource(m);
+
+    // Division list: the player's fleet, or both when spectating.
+    for (e, d) in &divs {
+        if !(m.spectate || settings.control.human_controls(d.side)) {
+            continue;
+        }
+        let gone = d.alive == 0 || d.morale == Morale::Routed;
+        let flag = if d.flagship { " ◆" } else { "" };
+        let text = if gone {
+            format!("{}{flag}  {}  — {}", d.label(), d.formation.name(), if d.alive == 0 { "destroyed" } else { "routed" })
+        } else {
+            format!("{}{flag}  {:<9} {:>3}/{:<3} {:<6} {}", d.label(), d.formation.name(), d.alive, d.start, d.morale.name(), d.order.name())
+        };
+        let color = if gone {
+            DIM
+        } else if d.morale == Morale::Steady {
+            side_color(d.side)
+        } else {
+            morale_color(d.morale)
+        };
+        m.divisions.push(DivisionRow { entity: *e, side: d.side, number: d.number, text, color, selected: sel.division == Some(*e), gone });
+    }
+
+    // Selected division detail.
+    if let Some((e, d)) = sel.division.and_then(|s| divs.iter().find(|(e, _)| *e == s)) {
+        let centre = hash.centroid(*e).unwrap_or(d.anchor);
+        let in_command = d.flagship || flags.iter().any(|(p, s)| *s == d.side && p.distance(centre) <= command_radius);
+        m.info.push(vec![
+            span(format!("{} ", d.label()), side_color(d.side)),
+            span(format!("{} division · {}", side_name(d.side), d.formation.name()), TEXT),
+            span(if d.flagship { " · flagship" } else { "" }, GOLD),
+        ]);
+        m.info.push(vec![
+            span(format!("{} of {} ships · ", d.alive, d.start), TEXT),
+            span(d.morale.name(), morale_color(d.morale)),
+            span(if in_command { " · in command" } else { " · OUT of command" }, if in_command { DIM } else { BAD }),
+        ]);
+        let order = match d.order {
+            Order::Engage(t) => {
+                let name = divs.iter().find(|(x, _)| *x == t).map_or("?".to_string(), |(_, d)| d.label());
+                format!("Order: engage {name}")
+            }
+            o => format!("Order: {}", o.name()),
+        };
+        m.info.push(vec![span(order, DIM)]);
+        m.can_order = settings.control.human_controls(d.side) && d.alive > 0 && d.morale != Morale::Routed && phase == Phase::Battle;
+        m.formation = Some(d.formation);
+        m.move_mode = sel.mode == PointerMode::Move;
+    } else if !m.spectate {
+        m.info.push(vec![span("Click one of your ships, a division in the list, or press Tab.", DIM)]);
+    } else {
+        m.info.push(vec![span("Click any ship to inspect its division.", DIM)]);
+    }
+
+    if phase == Phase::Over
+        && let Some(outcome) = &battle.result
+    {
+        let title = match outcome.winner {
+            Some(w) if settings.control.human_controls(w) => "Victory".to_string(),
+            Some(w) if settings.control != Control::Spectate => format!("Defeat — {} wins", side_name(w)),
+            Some(w) => format!("{} wins", side_name(w)),
+            None => "Draw".to_string(),
+        };
+        let body = match (outcome.winner, outcome.reason) {
+            (Some(w), EndReason::Broke) => format!(
+                "{}'s fleet broke after {}: {} of {} ships destroyed, fled or routed.",
+                side_name(1 - w),
+                clock(outcome.time),
+                battle.lost[1 - w],
+                battle.start[1 - w]
+            ),
+            (Some(w), EndReason::TimeLimit) => format!("Time ran out; {} kept more of its fleet in the fight.", side_name(w)),
+            (None, _) => "Time ran out with both fleets still fighting.".to_string(),
+        };
+        let line = format!(
+            "{} | ctrl={} | ships={} | ai={} | winner={} | time={} | lost {}-{} | destroyed {}-{}",
+            scenario.title,
+            settings.control.tag(),
+            settings.ships,
+            settings.ai[0].tag(),
+            outcome.winner.map_or("draw", side_name),
+            clock(outcome.time),
+            battle.lost[0],
+            battle.lost[1],
+            battle.destroyed[0],
+            battle.destroyed[1],
+        );
+        m.result = Some(ResultView { title, body, line });
+    }
+    *world.resource_mut::<UiModel>() = m;
 }

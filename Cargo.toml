@@ -2,8 +2,9 @@
 name = "space-game"
 version = "0.1.0"
 edition = "2024"
-description = "Successor Stars: a hex fleet-battle rules prototype in Rust, Bevy and ECS"
+description = "Successor Stars: a real-time fleet battle with hundreds of ships, in Rust, Bevy and ECS"
 license = "MIT"
+default-run = "space-game"
 
 [lib]
 name = "space_game"

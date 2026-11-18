@@ -1,6 +1,6 @@
-//! Bevy UI: scenario menu, side panel (status, controls, log, crib sheet)
-//! and the result overlay. Every widget reads from `UiModel`; button
-//! presses become `BattleCommand`s or settings changes.
+//! Bevy UI: the menu, the side panel (status, division list, orders,
+//! speed, log, rules) and the result overlay. Widgets read `UiModel`;
+//! button presses become orders, speed changes or settings.
 
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::input::touch::Touches;
@@ -8,34 +8,46 @@ use bevy::prelude::*;
 use bevy::ui::RelativeCursorPosition;
 use bevy::window::PrimaryWindow;
 
-use super::board::{PANEL_W, is_portrait, panel_height};
-use super::flow::{AiPacing, LogBook, OverlayHidden, copy_to_clipboard};
+use super::camera::{PANEL_W, is_portrait, panel_height};
+use super::flow::{AppRequest, LogBook, OverlayHidden, Phase, Speed, copy_to_clipboard};
+use super::input::{PointerMode, Selection};
 use super::model::{Spans, UiModel};
 use super::theme::*;
-use crate::rules::battle::{MatchSettings, Phase};
-use crate::rules::commands::BattleCommand;
-use crate::rules::config::*;
+use crate::sim::Command;
+use crate::sim::battle::{AiKind, Control, SimSettings};
+use crate::sim::components::Order;
+use crate::sim::formation::Formation;
+use crate::sim::scenario::{SCENARIOS, Scenario};
 
 // ---------------------------------------------------------------------------
 // Components
 // ---------------------------------------------------------------------------
 
-#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OrderKind {
+    Hold,
+    Advance,
+    Charge,
+    Withdraw,
+}
+
+#[derive(Component, Clone, Copy, PartialEq, Debug)]
 pub enum UiAction {
-    Cmd(BattleCommand),
     Menu,
     Restart,
-    Step,
-    Auto,
     Copy,
     CloseOverlay,
     ToggleCrib,
-    Control(ControlMode),
-    Size(usize),
-    Move(MoveMode),
-    Deploy(DeployMode),
+    Control(Control),
+    Ships(usize),
     Ai(AiKind),
     Scenario(usize),
+    Pause,
+    Speed(u32),
+    Division(usize, usize),
+    Order(OrderKind),
+    MoveMode,
+    Formation(Formation),
 }
 
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +57,7 @@ pub enum BtnKind {
     Danger,
     Choice,
     Scenario,
+    List,
 }
 
 #[derive(Component)]
@@ -86,9 +99,7 @@ pub enum Section {
     Menu,
     Panel,
     Overlay,
-    Controls,
-    SetupControls,
-    KbdHint,
+    Orders,
     Crib,
     Log,
 }
@@ -180,8 +191,32 @@ fn scenario_button(parent: &mut ChildSpawnerCommands, index: usize, s: &Scenario
     ));
     entity.with_children(|b| {
         labels.push(b.spawn(text(format!("{}. {}", index + 1, s.title), 15.0, GOLD)).id());
-        labels.push(b.spawn(text(s.note, 13.0, DIM)).id());
+        labels.push(b.spawn(text(format!("{} vs {}", s.fleets[0].name(), s.fleets[1].name()), 13.0, TEXT)).id());
+        labels.push(b.spawn(text(s.blurb, 13.0, DIM)).id());
     });
+    entity.insert(BtnLabel(labels));
+}
+
+/// A full-width, left-aligned row button for the division list.
+fn list_button(parent: &mut ChildSpawnerCommands, action: UiAction) {
+    let mut labels = Vec::new();
+    let mut entity = parent.spawn((
+        Button,
+        Node {
+            width: Val::Percent(100.0),
+            padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(4.0)),
+            ..default()
+        },
+        BackgroundColor(PANEL2),
+        BorderColor::all(LINE),
+        action,
+        BtnKind::List,
+        Enabled(true),
+        Selected(false),
+    ));
+    entity.with_children(|b| labels.push(b.spawn(text("", 13.0, TEXT)).id()));
     entity.insert(BtnLabel(labels));
 }
 
@@ -226,43 +261,28 @@ pub fn setup_ui(mut commands: Commands) {
                 ..default()
             })
             .with_children(|c| {
-                c.spawn(text("Successor Stars — battle rules prototype  v0.2.1", 22.0, TEXT));
+                c.spawn(text("Successor Stars — fleet battle", 22.0, TEXT));
                 c.spawn(text(
-                    "Rust + Bevy ECS rebuild of the paper rules (docs/battle-rules.md). Zero formation modifiers — \
-                     formations are only positions and facings. Pick your options, then a scenario.",
+                    "Hundreds of ships a side, in divisions you command in real time (pause any time). \
+                     Formation is everything: a deep arrow can tear a hole in a thin line, a crescent can close on an \
+                     arrow's flanks, and shots into a ship's flank or rear hit far more often than shots into its front.",
                     14.0,
                     DIM,
                 ));
                 option_group(c, "Control:", &[
-                    ("Play Blue (left)", UiAction::Control(ControlMode::PlayBlue)),
-                    ("Play Red (right)", UiAction::Control(ControlMode::PlayRed)),
-                    ("Hotseat (both)", UiAction::Control(ControlMode::Hotseat)),
-                    ("Spectate (AI vs AI)", UiAction::Control(ControlMode::Spectate)),
+                    ("Command Blue (left)", UiAction::Control(Control::PlayBlue)),
+                    ("Command Red (right)", UiAction::Control(Control::PlayRed)),
+                    ("Spectate (AI vs AI)", UiAction::Control(Control::Spectate)),
                 ]);
                 option_group(c, "Fleet size:", &[
-                    ("5 squadrons (breaks at 3)", UiAction::Size(5)),
-                    ("9 squadrons (breaks at 5)", UiAction::Size(9)),
-                    ("12 squadrons (breaks at 7)", UiAction::Size(12)),
+                    ("120 ships a side", UiAction::Ships(120)),
+                    ("240 ships a side", UiAction::Ships(240)),
+                    ("480 ships a side", UiAction::Ships(480)),
                 ]);
-                option_group(c, "Movement:", &[
-                    ("Interleaved (alternate squadrons)", UiAction::Move(MoveMode::Interleaved)),
-                    ("All-at-once (whole side, you first)", UiAction::Move(MoveMode::AllAtOnce)),
+                option_group(c, "Opponent:", &[
+                    ("Commander — pins, flanks, keeps a reserve", UiAction::Ai(AiKind::Commander)),
+                    ("Formation only — opening orders, never adapts", UiAction::Ai(AiKind::Advance)),
                 ]);
-                option_group(c, "Deployment:", &[
-                    ("Manual placement", UiAction::Deploy(DeployMode::Manual)),
-                    ("Battle formation (scenario's fixed setup)", UiAction::Deploy(DeployMode::Fixed)),
-                ]);
-                option_group(c, "Opponent AI:", &[
-                    ("Doctrine — guards its flagship, hunts flanks", UiAction::Ai(AiKind::Doctrine)),
-                    ("Baseline — the sim's advance-and-shoot", UiAction::Ai(AiKind::Baseline)),
-                ]);
-                c.spawn(text(
-                    "Manual placement: each side you control places its squadrons in its shaded zone; the AI then \
-                     picks a random formation. Battle formation: both sides start in the scenario's exact setup — use \
-                     it to test your play against the benchmarked matchup. Spectate always uses the fixed setup.",
-                    12.5,
-                    DIM,
-                ));
                 for (i, s) in SCENARIOS.iter().enumerate() {
                     scenario_button(c, i, s);
                 }
@@ -285,39 +305,57 @@ pub fn setup_ui(mut commands: Commands) {
                 overflow: Overflow::scroll_y(),
                 ..default()
             },
-            BackgroundColor(BG),
+            BackgroundColor(BG.with_alpha(0.94)),
             ScrollPosition::default(),
             RelativeCursorPosition::default(),
+            GlobalZIndex(5),
         ))
         .with_children(|s| {
             s.spawn(panel()).with_children(|p| {
-                p.spawn((StatusText, RichText::sized(15.0), Node { flex_direction: FlexDirection::Column, ..default() }));
+                p.spawn((StatusText, RichText::sized(14.0), Node { flex_direction: FlexDirection::Column, ..default() }));
+                p.spawn(row()).with_children(|r| {
+                    button(r, "Pause", UiAction::Pause, BtnKind::Primary);
+                    for (label, mult) in [("1×", 1), ("2×", 2), ("4×", 4), ("8×", 8)] {
+                        button(r, label, UiAction::Speed(mult), BtnKind::Choice);
+                    }
+                });
+            });
+            s.spawn(panel()).with_children(|p| {
+                p.spawn(Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(3.0), ..default() }).with_children(|l| {
+                    for side in 0..2 {
+                        for number in 1..=6 {
+                            list_button(l, UiAction::Division(side, number));
+                        }
+                    }
+                });
             });
             s.spawn(panel()).with_children(|p| {
                 p.spawn((
                     InfoText,
                     RichText::sized(13.5),
-                    Node { flex_direction: FlexDirection::Column, min_height: Val::Px(40.0), row_gap: Val::Px(2.0), ..default() },
+                    Node { flex_direction: FlexDirection::Column, min_height: Val::Px(36.0), row_gap: Val::Px(2.0), ..default() },
                 ));
-                p.spawn((Section::Controls, row())).with_children(|r| {
-                    button(r, "Turn left", UiAction::Cmd(BattleCommand::TurnLeft), BtnKind::Normal);
-                    button(r, "↑ Forward", UiAction::Cmd(BattleCommand::Forward), BtnKind::Normal);
-                    button(r, "Turn right", UiAction::Cmd(BattleCommand::TurnRight), BtnKind::Normal);
-                    button(r, "↓ Back (3 MP)", UiAction::Cmd(BattleCommand::Backward), BtnKind::Normal);
-                    button(r, "Fire", UiAction::Cmd(BattleCommand::FireMode), BtnKind::Danger);
-                    button(r, "End activation", UiAction::Cmd(BattleCommand::EndActivation), BtnKind::Primary);
-                });
-                p.spawn((Section::SetupControls, row())).with_children(|r| {
-                    button(r, "Turn left", UiAction::Cmd(BattleCommand::TurnLeft), BtnKind::Normal);
-                    button(r, "Turn right", UiAction::Cmd(BattleCommand::TurnRight), BtnKind::Normal);
-                    button(r, "Set flagship", UiAction::Cmd(BattleCommand::SetFlagship), BtnKind::Normal);
-                    button(r, "Remove", UiAction::Cmd(BattleCommand::RemoveDeployed), BtnKind::Danger);
-                    button(r, "Confirm deployment", UiAction::Cmd(BattleCommand::ConfirmDeployment), BtnKind::Primary);
-                });
-                p.spawn((
-                    Section::KbdHint,
-                    text("Q/E turn · W forward · S back · F fire · Space end · click a unit to select, a red-outlined enemy to shoot", 12.0, DIM),
-                ));
+                p.spawn((Section::Orders, Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(6.0), ..default() }))
+                    .with_children(|o| {
+                        o.spawn(row()).with_children(|r| {
+                            button(r, "Move…", UiAction::MoveMode, BtnKind::Primary);
+                            button(r, "Hold", UiAction::Order(OrderKind::Hold), BtnKind::Normal);
+                            button(r, "Advance", UiAction::Order(OrderKind::Advance), BtnKind::Normal);
+                            button(r, "Charge", UiAction::Order(OrderKind::Charge), BtnKind::Danger);
+                            button(r, "Withdraw", UiAction::Order(OrderKind::Withdraw), BtnKind::Normal);
+                        });
+                        o.spawn(row()).with_children(|r| {
+                            for f in Formation::PLAYER {
+                                button(r, f.name(), UiAction::Formation(f), BtnKind::Choice);
+                            }
+                        });
+                        o.spawn(text(
+                            "Right-click: move there (drag to set facing) · click an enemy: engage · drag: pan · \
+                             wheel: zoom · Space: pause · 1–4: speed · Tab: next division · H/G/C/X: hold/advance/charge/withdraw · F: formation",
+                            11.5,
+                            DIM,
+                        ));
+                    });
             });
             s.spawn(panel()).with_children(|p| {
                 p.spawn((
@@ -325,7 +363,7 @@ pub fn setup_ui(mut commands: Commands) {
                     Section::Log,
                     Node {
                         flex_direction: FlexDirection::Column,
-                        height: Val::Px(300.0),
+                        height: Val::Px(220.0),
                         overflow: Overflow::scroll_y(),
                         ..default()
                     },
@@ -337,29 +375,22 @@ pub fn setup_ui(mut commands: Commands) {
                 p.spawn(row()).with_children(|r| {
                     button(r, "Menu", UiAction::Menu, BtnKind::Normal);
                     button(r, "Restart", UiAction::Restart, BtnKind::Normal);
-                    button(r, "Step", UiAction::Step, BtnKind::Normal);
-                    button(r, "Auto ▶", UiAction::Auto, BtnKind::Normal);
+                    button(r, "Rules ▸", UiAction::ToggleCrib, BtnKind::Normal);
                 });
-            });
-            s.spawn(panel()).with_children(|p| {
-                button(p, "Rules crib sheet ▸", UiAction::ToggleCrib, BtnKind::Normal);
                 p.spawn((
                     Section::Crib,
                     Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(4.0), display: Display::None, ..default() },
                 ))
                 .with_children(|c| {
-                    c.spawn(text("Fire into target's…   hit on   (critical supply)", 12.5, GOLD));
-                    c.spawn(text("  Front arc            5+       6", 12.5, TEXT));
-                    c.spawn(text("  Flank arc            4+       5+", 12.5, TEXT));
-                    c.spawn(text("  Rear arc             3+       4+", 12.5, TEXT));
-                    for line in [
-                        "Dice = Strength (Shaken: half, round up) · range 3 · fire only into your own front arc · LOS blocked by any squadron.",
-                        "Move: 3 MP; 1 per hex forward, 1 per 60° turn, or all 3 to back up one hex (facing kept). In command (≤4 of flagship): move AND fire, in either order; outside: move OR fire.",
-                        "Morale (d6 ≥ 4) on: taking losses · friend routs/dies within 2 · flagship lost. Mods: +1 steady friend adjacent, +1 in command, −1 hit from flank/rear, −1 low or critical supply, −1 flagship lost. Fail: Steady → Shaken → Routed.",
-                        "Supply: low = −1 morale only · critical = −1 morale and the worse to-hit column.",
-                        "Fleet breaks at more than half destroyed/fled (3 of 5 · 5 of 9 · 7 of 12). Draw at turn 15.",
+                    for (line, color) in [
+                        ("Hit chance by the target's arc you fire into:", GOLD),
+                        ("  front 12% · flank 25% · rear 40%  (less at long range)", TEXT),
+                        ("Guns fire in a 60° cone ahead. Ships can only turn a little away from their division's facing, so a division hit from behind must wheel to answer.", DIM),
+                        ("Enemy ships block movement: to get through a line you must destroy the ships in the way. Deep formations (wedge, column) close ranks as they lose ships; a line keeps its holes.", DIM),
+                        ("Morale: recent losses, total losses, a lost flagship and being broken through push a division to Shaken (slower fire, won't advance) and then Routed (flees, counts as lost). Staying within the flagship's command radius steadies it.", DIM),
+                        ("A fleet breaks when more than half its ships are destroyed, fled or routed. After 10 minutes the fleet with more hull in the fight wins.", DIM),
                     ] {
-                        c.spawn(text(line, 12.5, DIM));
+                        c.spawn(text(line, 12.5, color));
                     }
                 });
             });
@@ -387,7 +418,7 @@ pub fn setup_ui(mut commands: Commands) {
                 Node {
                     flex_direction: FlexDirection::Column,
                     align_items: AlignItems::Center,
-                    max_width: Val::Px(540.0),
+                    max_width: Val::Px(560.0),
                     padding: UiRect::axes(Val::Px(30.0), Val::Px(24.0)),
                     border: UiRect::all(Val::Px(1.0)),
                     border_radius: BorderRadius::all(Val::Px(10.0)),
@@ -404,7 +435,7 @@ pub fn setup_ui(mut commands: Commands) {
                 card.spawn(row()).with_children(|r| {
                     button(r, "Copy result line", UiAction::Copy, BtnKind::Normal);
                     button(r, "Play again", UiAction::Restart, BtnKind::Primary);
-                    button(r, "View board", UiAction::CloseOverlay, BtnKind::Normal);
+                    button(r, "View battlefield", UiAction::CloseOverlay, BtnKind::Normal);
                     button(r, "Menu", UiAction::Menu, BtnKind::Normal);
                 });
             });
@@ -415,11 +446,14 @@ pub fn setup_ui(mut commands: Commands) {
 // Systems
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub fn handle_buttons(
     buttons: Query<(&Interaction, &UiAction, &Enabled), Changed<Interaction>>,
-    mut settings: ResMut<MatchSettings>,
-    mut commands: MessageWriter<BattleCommand>,
-    mut pacing: ResMut<AiPacing>,
+    mut settings: ResMut<SimSettings>,
+    mut requests: MessageWriter<AppRequest>,
+    mut orders: MessageWriter<Command>,
+    mut speed: ResMut<Speed>,
+    mut sel: ResMut<Selection>,
     mut crib: ResMut<CribOpen>,
     mut overlay_hidden: ResMut<OverlayHidden>,
     model: Res<UiModel>,
@@ -428,19 +462,14 @@ pub fn handle_buttons(
         if *interaction != Interaction::Pressed || !enabled.0 {
             continue;
         }
+        let me = sel.division.filter(|_| model.can_order);
         match *action {
-            UiAction::Cmd(cmd) => {
-                commands.write(cmd);
-            }
             UiAction::Menu => {
-                pacing.auto = false;
-                commands.write(BattleCommand::ToMenu);
+                requests.write(AppRequest::Menu);
             }
             UiAction::Restart => {
-                commands.write(BattleCommand::Restart);
+                requests.write(AppRequest::Start);
             }
-            UiAction::Step => pacing.step = true,
-            UiAction::Auto => pacing.auto = !pacing.auto,
             UiAction::Copy => {
                 if let Some(r) = &model.result {
                     copy_to_clipboard(&r.line);
@@ -449,73 +478,95 @@ pub fn handle_buttons(
             UiAction::CloseOverlay => overlay_hidden.0 = true,
             UiAction::ToggleCrib => crib.0 = !crib.0,
             UiAction::Control(c) => settings.control = c,
-            UiAction::Size(s) => settings.size = s,
-            UiAction::Move(m) => settings.move_mode = m,
-            UiAction::Deploy(d) => settings.deploy_mode = d,
+            UiAction::Ships(n) => settings.ships = n,
             UiAction::Ai(a) => settings.ai = [a; 2],
             UiAction::Scenario(i) => {
                 settings.scenario = i;
-                pacing.auto = false;
-                commands.write(BattleCommand::Restart);
+                requests.write(AppRequest::Start);
+            }
+            UiAction::Pause => speed.paused = !speed.paused,
+            UiAction::Speed(m) => {
+                speed.mult = m;
+                speed.paused = false;
+            }
+            UiAction::Division(side, number) => {
+                if let Some(row) = model.divisions.iter().find(|r| r.side == side && r.number == number) {
+                    sel.division = Some(row.entity);
+                    sel.mode = PointerMode::Normal;
+                }
+            }
+            UiAction::MoveMode => {
+                if me.is_some() {
+                    sel.mode = if sel.mode == PointerMode::Move { PointerMode::Normal } else { PointerMode::Move };
+                }
+            }
+            UiAction::Order(kind) => {
+                if let Some(division) = me {
+                    let order = match kind {
+                        OrderKind::Hold => Order::Hold,
+                        OrderKind::Advance => Order::Advance,
+                        OrderKind::Charge => Order::Charge,
+                        OrderKind::Withdraw => Order::Withdraw,
+                    };
+                    orders.write(Command::Order { division, order });
+                }
+            }
+            UiAction::Formation(formation) => {
+                if let Some(division) = me {
+                    orders.write(Command::Formation { division, formation });
+                }
             }
         }
     }
 }
 
-/// Which buttons are enabled/selected right now.
+fn set_label(texts: &mut Query<(&mut Text, &mut TextColor)>, labels: &BtnLabel, s: &str, color: Option<Color>) {
+    if let Some(t) = labels.0.first()
+        && let Ok((mut text, mut c)) = texts.get_mut(*t)
+    {
+        if text.0 != s {
+            text.0 = s.to_string();
+        }
+        if let Some(color) = color
+            && c.0 != color
+        {
+            c.0 = color;
+        }
+    }
+}
+
+/// Which buttons are enabled/selected/visible right now, and their labels.
 pub fn update_button_state(
     model: Res<UiModel>,
-    settings: Res<MatchSettings>,
-    pacing: Res<AiPacing>,
+    settings: Res<SimSettings>,
     crib: Res<CribOpen>,
     mut buttons: Query<(&UiAction, &mut Enabled, &mut Selected, &mut Node, &BtnLabel)>,
-    mut texts: Query<&mut Text>,
+    mut texts: Query<(&mut Text, &mut TextColor)>,
 ) {
-    let c = &model.can;
-    let setup = model.phase == Phase::Deployment;
     for (action, mut enabled, mut selected, mut node, labels) in &mut buttons {
         let (on, sel, visible) = match *action {
-            UiAction::Cmd(cmd) => (
-                match cmd {
-                    BattleCommand::TurnLeft | BattleCommand::TurnRight => if setup { c.setup_turn } else { c.turn },
-                    BattleCommand::Forward => c.forward,
-                    BattleCommand::Backward => c.back,
-                    BattleCommand::FireMode => c.fire,
-                    BattleCommand::EndActivation => c.end,
-                    BattleCommand::SetFlagship => c.setup_flag,
-                    BattleCommand::RemoveDeployed => c.setup_remove,
-                    BattleCommand::ConfirmDeployment => c.setup_confirm,
-                    _ => true,
-                },
-                false,
-                true,
-            ),
-            UiAction::Step => (model.phase == Phase::Combat && !pacing.auto, false, model.spectate),
-            UiAction::Auto => {
-                let label = if pacing.auto { "Auto ❚❚" } else { "Auto ▶" };
-                if let Some(t) = labels.0.first()
-                    && let Ok(mut text) = texts.get_mut(*t)
-                    && text.0 != label
-                {
-                    text.0 = label.to_string();
-                }
-                (model.phase == Phase::Combat, pacing.auto, model.spectate)
+            UiAction::Pause => {
+                set_label(&mut texts, labels, if model.paused { "▶ Resume" } else { "Pause" }, None);
+                (model.phase == Phase::Battle, model.paused, true)
             }
+            UiAction::Speed(m) => (model.phase == Phase::Battle, model.mult == m, true),
             UiAction::ToggleCrib => {
-                let label = if crib.0 { "Rules crib sheet ▾" } else { "Rules crib sheet ▸" };
-                if let Some(t) = labels.0.first()
-                    && let Ok(mut text) = texts.get_mut(*t)
-                    && text.0 != label
-                {
-                    text.0 = label.to_string();
-                }
+                set_label(&mut texts, labels, if crib.0 { "Rules ▾" } else { "Rules ▸" }, None);
                 (true, false, true)
             }
+            UiAction::Division(side, number) => match model.divisions.iter().find(|r| r.side == side && r.number == number) {
+                Some(row) => {
+                    set_label(&mut texts, labels, &row.text, Some(row.color));
+                    (!row.gone, row.selected, true)
+                }
+                None => (false, false, false),
+            },
+            UiAction::MoveMode => (model.can_order, model.move_mode, true),
+            UiAction::Order(_) => (model.can_order, false, true),
+            UiAction::Formation(f) => (model.can_order, model.formation == Some(f), true),
             UiAction::Copy => (model.result.is_some(), false, true),
             UiAction::Control(v) => (true, settings.control == v, true),
-            UiAction::Size(v) => (true, settings.size == v, true),
-            UiAction::Move(v) => (true, settings.move_mode == v, true),
-            UiAction::Deploy(v) => (true, settings.deploy_mode == v, true),
+            UiAction::Ships(v) => (true, settings.ships == v, true),
             UiAction::Ai(v) => (true, settings.ai[0] == v, true),
             _ => (true, false, true),
         };
@@ -548,6 +599,7 @@ pub fn style_buttons(mut buttons: Query<ButtonLook>, mut colors: Query<&mut Text
         let (mut b, mut line) = match kind {
             BtnKind::Primary => (PRIMARY_BG, BLUE),
             BtnKind::Danger => (PANEL2, RED),
+            BtnKind::List => (PANEL, PANEL),
             _ => (PANEL2, LINE),
         };
         if selected.0 {
@@ -624,15 +676,13 @@ pub fn update_layout(
     let win = Vec2::new(window.width(), window.height());
     let portrait = is_portrait(win);
     let in_menu = model.phase == Phase::Menu;
-    let setup = model.phase == Phase::Deployment;
-    let over = model.phase == Phase::GameOver && model.result.is_some() && !overlay_hidden.0;
+    let over = model.phase == Phase::Over && model.result.is_some() && !overlay_hidden.0;
     for (mut node, section) in &mut sections {
         let visible = match section {
             Section::Menu => in_menu,
             Section::Panel => !in_menu,
             Section::Overlay => over,
-            Section::Controls | Section::KbdHint => !setup,
-            Section::SetupControls => setup,
+            Section::Orders => !model.spectate,
             Section::Crib => crib.0,
             Section::Log => true,
         };
@@ -654,7 +704,7 @@ pub fn update_layout(
                 }
             }
             Section::Log => {
-                let h = Val::Px(if portrait { 150.0 } else { 300.0 });
+                let h = Val::Px(if portrait { 120.0 } else { 220.0 });
                 if node.height != h {
                     node.height = h;
                 }

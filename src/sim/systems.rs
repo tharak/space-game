@@ -1,0 +1,553 @@
+//! The fixed-step simulation, one ordinary ECS system per concern, chained
+//! in the `SimTick` schedule. Nothing here knows about rendering or input.
+
+use bevy::ecs::schedule::ScheduleLabel;
+use bevy::prelude::*;
+
+use super::battle::*;
+use super::components::*;
+use super::rng::Rng;
+use super::spatial::{Entry, SpatialHash};
+
+#[derive(ScheduleLabel, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SimTick;
+
+pub fn build_schedule() -> Schedule {
+    let mut schedule = Schedule::new(SimTick);
+    schedule.add_systems(
+        (
+            tick_clock,
+            rebuild_hash,
+            super::ai::commander,
+            steer_divisions,
+            steer_ships,
+            integrate,
+            fire,
+            remove_fled,
+            close_ranks,
+            morale,
+            check_end,
+        )
+            .chain()
+            .run_if(sim_running),
+    );
+    schedule
+}
+
+pub fn sim_running(battle: Res<Battle>) -> bool {
+    !battle.over()
+}
+
+pub fn tick_clock(mut battle: ResMut<Battle>) {
+    battle.time += DT;
+}
+
+pub fn rebuild_hash(mut hash: ResMut<SpatialHash>, ships: Query<(Entity, &Pos, &Heading, &Side, &InDivision)>) {
+    hash.rebuild(ships.iter().map(|(entity, pos, heading, side, division)| Entry {
+        entity,
+        pos: pos.0,
+        heading: heading.0,
+        side: side.0,
+        division: division.0,
+    }));
+}
+
+/// Direction a side runs to when routed.
+pub fn home_dir(side: usize) -> Vec2 {
+    if side == 0 { Vec2::NEG_X } else { Vec2::X }
+}
+
+/// Moves each division's anchor and wheels its facing according to its
+/// order and morale.
+pub fn steer_divisions(mut divs: Query<(Entity, &mut Division)>, hash: Res<SpatialHash>, tuning: Res<Tuning>) {
+    let mut targets: Vec<(Entity, Option<Vec2>)> = Vec::new();
+    let mut fighting: Vec<(Entity, usize, Vec2)> = Vec::new();
+    for (e, d) in &divs {
+        if let Order::Engage(t) = d.order {
+            targets.push((e, hash.centroid(t)));
+        }
+        if d.morale != Morale::Routed
+            && let Some(c) = hash.centroid(e)
+        {
+            fighting.push((e, d.side, c));
+        }
+    }
+    for (e, mut d) in &mut divs {
+        d.since_contact += DT;
+        d.closest += 10.0 * DT;
+        let centroid = hash.centroid(e).unwrap_or(d.anchor);
+        let shaken = d.morale == Morale::Shaken;
+        // A charge that has gone clear through the enemy wheels about and
+        // engages the nearest enemy division, usually from behind.
+        if d.order == Order::Charge && d.since_contact > 4.0 && d.since_contact.is_finite() && d.closest > tuning.range * 2.0 {
+            let nearest = fighting
+                .iter()
+                .filter(|(_, s, _)| *s != d.side)
+                .min_by(|a, b| a.2.distance_squared(centroid).total_cmp(&b.2.distance_squared(centroid)));
+            if let Some((t, _, _)) = nearest {
+                d.order = Order::Engage(*t);
+            }
+        }
+        let base = tuning.anchor_speed;
+        let ahead = |d: &Division| d.anchor + d.forward() * 100.0;
+        let (goal, facing, speed) = if d.morale == Morale::Routed {
+            let home = home_dir(d.side);
+            (Some(d.anchor + home * 200.0), home.to_angle(), tuning.rout_speed * 0.9)
+        } else {
+            match d.order {
+                Order::Hold => (None, d.facing, 0.0),
+                Order::Advance => {
+                    // Stop at firing range, or once level with the nearest
+                    // enemy division (rather than sailing past it).
+                    let passed = fighting
+                        .iter()
+                        .filter(|(_, s, _)| *s != d.side)
+                        .min_by(|a, b| a.2.distance_squared(centroid).total_cmp(&b.2.distance_squared(centroid)))
+                        .is_some_and(|(_, _, c)| (*c - centroid).dot(d.forward()) < tuning.range * 0.5);
+                    let stop = shaken || passed || d.closest < tuning.range * tuning.standoff;
+                    ((!stop).then(|| ahead(&d)), d.facing, base)
+                }
+                Order::Charge => ((!shaken).then(|| ahead(&d)), d.facing, base),
+                Order::MoveTo { to, facing } => {
+                    let travel = to - d.anchor;
+                    // Face the way you are going on a long move, unless that
+                    // would mean turning your back to reach it.
+                    let face = if travel.length() > 150.0 && angle_diff(facing, travel.to_angle()).abs() < 1.7 {
+                        travel.to_angle()
+                    } else {
+                        facing
+                    };
+                    let closer = shaken && travel.dot(d.forward()) > 0.0;
+                    ((!closer).then_some(to), face, base)
+                }
+                Order::Engage(_) => match targets.iter().find(|(x, _)| *x == e).and_then(|(_, c)| *c) {
+                    Some(tc) => {
+                        let dir = (tc - centroid).normalize_or(d.forward());
+                        let want = tc - dir * (tuning.range * tuning.standoff - d.depth * 0.5);
+                        // Close to firing range, but never back away from an
+                        // enemy that comes closer: hold the position instead.
+                        let backing = want.distance(tc) > centroid.distance(tc);
+                        let stay = backing || (shaken && want.distance(tc) < centroid.distance(tc));
+                        ((!stay).then_some(want), dir.to_angle(), base)
+                    }
+                    None => {
+                        d.order = Order::Hold;
+                        (None, d.facing, 0.0)
+                    }
+                },
+                Order::Withdraw => (Some(d.anchor + home_dir(d.side) * 200.0), d.facing, base * 0.7),
+            }
+        };
+        d.facing = turn_toward(d.facing, facing, tuning.div_turn_rate * DT);
+        if let Some(goal) = goal {
+            let to = goal - d.anchor;
+            let dist = to.length();
+            if dist > 0.5 {
+                let dir = to / dist;
+                // Never run more than a little ahead of the ships themselves.
+                let lead = (d.anchor - centroid).dot(dir);
+                if lead < 30.0 || d.morale == Morale::Routed {
+                    d.anchor += dir * (speed * DT).min(dist);
+                }
+            }
+        }
+    }
+}
+
+/// Each ship steers for its slot and turns toward what it is shooting at.
+pub fn steer_ships(
+    mut ships: Query<(&mut Vel, &mut Heading, &Pos, &Slot, &InDivision, &Weapon)>,
+    divs: Query<&Division>,
+    tuning: Res<Tuning>,
+) {
+    for (mut vel, mut heading, pos, slot, div, weapon) in &mut ships {
+        let Ok(d) = divs.get(div.0) else { continue };
+        let target = d.to_world(slot.0);
+        let to = target - pos.0;
+        let max = match (d.morale, d.order) {
+            (Morale::Routed, _) => tuning.rout_speed,
+            (_, Order::Charge) => tuning.ship_speed * tuning.charge_mult,
+            _ => tuning.ship_speed,
+        };
+        let len = to.length();
+        let desired = if len > 0.5 { to / len * (len * 0.8).min(max) } else { Vec2::ZERO };
+        vel.0 = vel.0.lerp(desired, 0.15);
+        let want = match (d.morale, weapon.aim) {
+            (Morale::Routed, _) => d.facing,
+            (_, Some(aim)) => d.facing + angle_diff(d.facing, aim.to_angle()).clamp(-tuning.aim_limit, tuning.aim_limit),
+            _ => d.facing,
+        };
+        heading.0 = turn_toward(heading.0, want, tuning.ship_turn_rate * DT);
+    }
+}
+
+/// Moves ships and keeps them apart: friends at most a little closer than
+/// formation spacing, enemies further, so an intact line physically blocks.
+pub fn integrate(
+    mut ships: Query<(Entity, &mut Pos, &Vel, &Side, &InDivision)>,
+    divs: Query<&Division>,
+    hash: Res<SpatialHash>,
+    tuning: Res<Tuning>,
+    battle: Res<Battle>,
+) {
+    let s = tuning.spacing;
+    let (friend, block) = (s * 0.8, s * 1.4);
+    for (e, mut pos, vel, side, div) in &mut ships {
+        let p = pos.0;
+        // Friends keep a little apart.
+        let mut push = Vec2::ZERO;
+        let mut blockers: Vec<Vec2> = Vec::new();
+        hash.for_each_within(p, block, |o, d2| {
+            if o.entity == e {
+                return;
+            }
+            let d = d2.sqrt();
+            let away = if d > 1e-4 { (p - o.pos) / d } else if e < o.entity { Vec2::Y } else { Vec2::NEG_Y };
+            if o.side == side.0 {
+                if d < friend {
+                    push += away * (friend - d) * 0.5;
+                }
+            } else {
+                blockers.push(away);
+            }
+        });
+        // Enemies never shove each other: a ship simply stops rather than
+        // move into a hostile ship's space (a defending line holds its
+        // ground; the way through it is to destroy the ships in the way).
+        let mut step = vel.0 * DT + push * 0.5;
+        for away in blockers {
+            let into = -step.dot(away);
+            if into > 0.0 {
+                step += away * into;
+            }
+        }
+        pos.0 = p + step;
+        let routed = divs.get(div.0).is_ok_and(|d| d.morale == Morale::Routed);
+        if !routed {
+            let b = battle.bounds;
+            pos.0 = pos.0.clamp(b.min, b.max);
+        }
+    }
+}
+
+/// Which arc of a target (facing `heading`) a shot from `from` lands in:
+/// 0 front, 1 flank, 2 rear.
+pub fn incoming_arc(target: Vec2, heading: f32, from: Vec2) -> usize {
+    let a = angle_diff(heading, (from - target).to_angle()).abs();
+    if a <= std::f32::consts::FRAC_PI_3 {
+        0
+    } else if a <= 2.0 * std::f32::consts::FRAC_PI_3 {
+        1
+    } else {
+        2
+    }
+}
+
+pub fn hit_chance(tuning: &Tuning, arc: usize, dist: f32) -> f32 {
+    tuning.hit[arc] * (1.0 - (1.0 - tuning.range_falloff) * (dist / tuning.range).clamp(0.0, 1.0))
+}
+
+/// Every ship whose guns are ready shoots the nearest enemy inside its gun
+/// cone. Damage lands after everyone has fired.
+#[allow(clippy::too_many_arguments)]
+pub fn fire(
+    mut commands: Commands,
+    mut shooters: Query<(&Pos, &Heading, &Side, &InDivision, &mut Weapon)>,
+    mut hulls: Query<(&mut Ship, Has<FleetFlagship>)>,
+    mut divs: Query<&mut Division>,
+    hash: Res<SpatialHash>,
+    tuning: Res<Tuning>,
+    mut battle: ResMut<Battle>,
+    mut rng: ResMut<Rng>,
+    mut events: MessageWriter<SimEvent>,
+) {
+    let mut hits: Vec<(Entry, f32)> = Vec::new();
+    let mut contact: Vec<Entity> = Vec::new();
+    let mut shock: Vec<(Entity, f32)> = Vec::new();
+    let mut closest: Vec<(Entity, f32)> = Vec::new();
+    // Iterate in the hash's stable order so a seed always replays the same.
+    for i in 0..hash.entries.len() {
+        let me = hash.entries[i];
+        let Ok((pos, heading, side, div, mut weapon)) = shooters.get_mut(me.entity) else { continue };
+        weapon.cooldown -= DT;
+        let Ok(d) = divs.get(div.0) else { continue };
+        if d.morale == Morale::Routed {
+            weapon.aim = None;
+            continue;
+        }
+        if weapon.cooldown > 0.0 {
+            continue;
+        }
+        let (p, h, s) = (pos.0, heading.0, side.0);
+        let mut nearest: Option<(Entry, f32)> = None;
+        let mut in_arc: Option<(Entry, f32)> = None;
+        hash.for_each_within(p, tuning.range, |o, d2| {
+            if o.side == s {
+                return;
+            }
+            if nearest.is_none_or(|n| d2 < n.1) {
+                nearest = Some((*o, d2));
+            }
+            let bearing = (o.pos - p).to_angle();
+            if angle_diff(h, bearing).abs() <= tuning.fire_arc && in_arc.is_none_or(|n| d2 < n.1) {
+                in_arc = Some((*o, d2));
+            }
+        });
+        if let Some((_, n2)) = nearest {
+            closest.push((div.0, n2.sqrt()));
+        }
+        let Some((target, d2)) = in_arc else {
+            weapon.aim = nearest.map(|(n, _)| n.pos - p);
+            continue;
+        };
+        let dist = d2.sqrt();
+        let arc = incoming_arc(target.pos, target.heading, p);
+        let hit = rng.chance(hit_chance(&tuning, arc, dist));
+        let slow = if d.morale == Morale::Shaken { tuning.shaken_cooldown } else { 1.0 };
+        weapon.cooldown = tuning.cooldown * slow / battle.fire_rate[s].max(0.1) * rng.range(0.85, 1.15);
+        weapon.aim = Some(target.pos - p);
+        events.write(SimEvent::Shot { from: p, to: target.pos, side: s, hit });
+        contact.push(div.0);
+        contact.push(target.division);
+        if hit {
+            hits.push((target, 1.0));
+            shock.push((target.division, if arc == 0 { 0.1 } else { 0.25 }));
+        }
+        if battle.first_contact.is_none() {
+            battle.first_contact = Some(battle.time);
+            events.write(SimEvent::Contact);
+        }
+    }
+    for e in contact {
+        if let Ok(mut d) = divs.get_mut(e) {
+            d.since_contact = 0.0;
+        }
+    }
+    for (e, dist) in closest {
+        if let Ok(mut d) = divs.get_mut(e) {
+            d.closest = d.closest.min(dist);
+        }
+    }
+    for (e, amount) in shock {
+        if let Ok(mut d) = divs.get_mut(e) {
+            d.shock += amount / d.start.max(1) as f32;
+        }
+    }
+    for (target, damage) in hits {
+        let Ok((mut ship, flagship)) = hulls.get_mut(target.entity) else { continue };
+        if ship.hull <= 0.0 {
+            continue;
+        }
+        ship.hull -= damage;
+        if ship.hull > 0.0 {
+            continue;
+        }
+        commands.entity(target.entity).despawn();
+        battle.destroyed[target.side] += 1;
+        let mut label = String::new();
+        if let Ok(mut d) = divs.get_mut(target.division) {
+            d.alive = d.alive.saturating_sub(1);
+            d.shock += 1.0 / d.start.max(1) as f32;
+            label = d.label();
+        }
+        events.write(SimEvent::Destroyed { pos: target.pos, side: target.side, flagship, division: label });
+        if flagship {
+            battle.flag_lost[target.side] = true;
+            events.write(SimEvent::FlagshipLost { side: target.side });
+        }
+    }
+}
+
+/// Deep formations (wedge, column, ring) close up every few seconds: rear
+/// ships step into the gaps at the front. Lines are too thin to do that,
+/// so a line that loses ships keeps the hole.
+pub fn close_ranks(world: &mut World) {
+    let due = {
+        let b = world.resource::<Battle>();
+        (b.time / 3.0).floor() != ((b.time - DT) / 3.0).floor()
+    };
+    if !due {
+        return;
+    }
+    let deep: Vec<(Entity, super::formation::Formation)> = world
+        .query::<(Entity, &Division)>()
+        .iter(world)
+        .filter(|(_, d)| d.morale != Morale::Routed && d.alive > 0 && d.formation.closes_ranks() && d.alive < d.slots)
+        .map(|(e, d)| (e, d.formation))
+        .collect();
+    for (e, f) in deep {
+        super::set_formation(world, e, f);
+    }
+}
+
+/// Routed ships that leave the battle area are gone for good.
+pub fn remove_fled(
+    mut commands: Commands,
+    ships: Query<(Entity, &Pos, &InDivision)>,
+    mut divs: Query<&mut Division>,
+    mut battle: ResMut<Battle>,
+) {
+    let b = battle.bounds;
+    let mut fled = Vec::new();
+    for (e, pos, div) in &ships {
+        if b.contains(pos.0) {
+            continue;
+        }
+        if let Ok(mut d) = divs.get_mut(div.0)
+            && d.morale == Morale::Routed
+        {
+            d.alive = d.alive.saturating_sub(1);
+            fled.push((e, d.side));
+        }
+    }
+    for (e, side) in fled {
+        commands.entity(e).despawn();
+        battle.fled[side] += 1;
+    }
+}
+
+/// Once a second: breakthroughs, then each division's morale. Stress grows
+/// with recent losses (shock), total losses, a lost flagship, poor supply
+/// and being broken through; command presence steadies it.
+#[allow(clippy::too_many_arguments)]
+pub fn morale(
+    mut divs: Query<(Entity, &mut Division)>,
+    flagships: Query<(&Pos, &Side), With<FleetFlagship>>,
+    hash: Res<SpatialHash>,
+    tuning: Res<Tuning>,
+    mut battle: ResMut<Battle>,
+    mut rng: ResMut<Rng>,
+    mut events: MessageWriter<SimEvent>,
+) {
+    let decay = 0.5f32.powf(DT / tuning.shock_half_life);
+    for (_, mut d) in &mut divs {
+        d.shock *= decay;
+    }
+    battle.morale_timer += DT;
+    if battle.morale_timer < 1.0 {
+        return;
+    }
+    battle.morale_timer -= 1.0;
+
+    // Breakthroughs: enough of a division's ships are behind an enemy
+    // division's rear rank, inside its width.
+    let snapshot: Vec<(Entity, Division)> =
+        divs.iter().filter(|(_, d)| d.morale != Morale::Routed && d.alive > 0).map(|(e, d)| (e, d.clone())).collect();
+    let mut broken: Vec<(Entity, Entity)> = Vec::new();
+    for (a, da) in &snapshot {
+        let Some(ships) = hash.divisions.get(a) else { continue };
+        for (b, db) in &snapshot {
+            if da.side == db.side || battle.breakthroughs.contains(&(*a, *b)) {
+                continue;
+            }
+            let Some(cb) = hash.centroid(*b) else { continue };
+            let frame = Division { anchor: cb, ..db.clone() };
+            let behind = ships
+                .members
+                .iter()
+                .filter(|i| {
+                    let local = frame.to_local(hash.entries[**i as usize].pos);
+                    local.x < db.depth - tuning.spacing && local.x > db.depth - 250.0 && local.y.abs() < db.half_width
+                })
+                .count() as u32;
+            if behind >= (da.alive / 4).max(6) {
+                broken.push((*a, *b));
+            }
+        }
+    }
+    // Two divisions that have passed into each other are a melee, not a
+    // breakthrough.
+    let mutual: Vec<(Entity, Entity)> = broken.iter().filter(|(a, b)| broken.contains(&(*b, *a))).copied().collect();
+    broken.retain(|p| !mutual.contains(p));
+    for (a, b) in broken {
+        let (da, db) = (&snapshot.iter().find(|(e, _)| *e == a).unwrap().1, &snapshot.iter().find(|(e, _)| *e == b).unwrap().1);
+        battle.breakthroughs.push((a, b));
+        let side = da.side;
+        if battle.first_breakthrough[side].is_none() {
+            battle.first_breakthrough[side] = Some(battle.time);
+        }
+        events.write(SimEvent::Breakthrough { side, division: da.label(), through: db.label() });
+        if let Ok((_, mut d)) = divs.get_mut(b) {
+            d.shock += tuning.k_breakthrough;
+        }
+    }
+
+    let flag_pos: Vec<(Vec2, usize)> = flagships.iter().map(|(p, s)| (p.0, s.0)).collect();
+    let flag_lost = battle.flag_lost;
+    let fire_rate = battle.fire_rate;
+    for (e, mut d) in &mut divs {
+        if d.morale == Morale::Routed || d.alive == 0 {
+            continue;
+        }
+        let centroid = hash.centroid(e).unwrap_or(d.anchor);
+        let in_command = d.flagship
+            || flag_pos.iter().any(|(p, s)| *s == d.side && p.distance(centroid) <= tuning.command_radius);
+        let lost = 1.0 - d.alive as f32 / d.start.max(1) as f32;
+        let stress = d.shock * tuning.k_shock
+            + lost * tuning.k_lost
+            + if flag_lost[d.side] { tuning.k_flag_lost } else { 0.0 }
+            + if fire_rate[d.side] < 1.0 { tuning.k_supply } else { 0.0 }
+            - if in_command { tuning.k_command } else { 0.0 }
+            + rng.range(-tuning.noise, tuning.noise);
+        let next = match d.morale {
+            Morale::Steady if stress > tuning.shake_at => Morale::Shaken,
+            Morale::Shaken if stress > tuning.rout_at => Morale::Routed,
+            Morale::Shaken if stress < tuning.rally_at => Morale::Steady,
+            m => m,
+        };
+        if next != d.morale {
+            events.write(SimEvent::MoraleChanged { side: d.side, division: d.label(), from: d.morale, to: next });
+            d.morale = next;
+        }
+    }
+}
+
+/// A fleet breaks when more than half its ships are destroyed, fled or in
+/// routed divisions. At the time limit the side with more hull left wins.
+pub fn check_end(
+    divs: Query<&Division>,
+    ships: Query<(&Ship, &Side, &InDivision)>,
+    tuning: Res<Tuning>,
+    mut battle: ResMut<Battle>,
+    mut events: MessageWriter<SimEvent>,
+) {
+    let mut fighting = [0u32; 2];
+    for d in &divs {
+        if d.morale != Morale::Routed {
+            fighting[d.side] += d.alive;
+        }
+    }
+    let lost: [u32; 2] = std::array::from_fn(|s| battle.start[s].saturating_sub(fighting[s]));
+    battle.lost = lost;
+    let broke: [bool; 2] = std::array::from_fn(|s| lost[s] * 2 > battle.start[s]);
+    let (winner, reason) = if broke[0] || broke[1] {
+        let frac = |s: usize| lost[s] as f32 / battle.start[s].max(1) as f32;
+        let winner = match (broke[0], broke[1]) {
+            (true, false) => Some(1),
+            (false, true) => Some(0),
+            _ if frac(0) > frac(1) => Some(1),
+            _ if frac(1) > frac(0) => Some(0),
+            _ => None,
+        };
+        (winner, EndReason::Broke)
+    } else if battle.time >= tuning.time_limit {
+        let mut hull = [0.0f32; 2];
+        for (ship, side, div) in &ships {
+            if divs.get(div.0).is_ok_and(|d| d.morale != Morale::Routed) {
+                hull[side.0] += ship.hull;
+            }
+        }
+        let winner = if (hull[0] - hull[1]).abs() < 1.0 {
+            None
+        } else if hull[0] > hull[1] {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        (winner, EndReason::TimeLimit)
+    } else {
+        return;
+    };
+    battle.result = Some(Outcome { winner, reason, time: battle.time });
+    events.write(SimEvent::Over { winner, reason });
+}
