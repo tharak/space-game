@@ -31,11 +31,10 @@ fn main() {
 /// Removes the HTML loading screen once a few frames have rendered.
 fn hide_splash(mut frames: Local<u32>) {
     *frames += 1;
-    if *frames != 3 {
-        return;
-    }
     #[cfg(target_arch = "wasm32")]
-    if let Some(el) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("loading")) {
+    if *frames == 3
+        && let Some(el) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("loading"))
+    {
         let _ = el.set_attribute("style", "display: none");
     }
 }

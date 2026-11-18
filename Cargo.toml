@@ -48,6 +48,7 @@ bevy = { version = "0.19", default-features = false, features = [
   "webgl2",
   "web",
   "x11",
+  "png",
 ] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

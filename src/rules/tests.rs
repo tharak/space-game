@@ -151,7 +151,7 @@ fn every_scenario_terminates_for_both_ais_and_sizes() {
             for ai in [AiKind::Baseline, AiKind::Doctrine] {
                 let settings = MatchSettings { scenario, size, ai: [ai; 2], ..default() };
                 let (_, turns) = crate::simulate(settings, scenario as u32 * 31 + size as u32);
-                assert!(turns >= 1 && turns <= MAX_TURNS, "{scenario} {size} {ai:?}");
+                assert!((1..=MAX_TURNS).contains(&turns), "{scenario} {size} {ai:?}");
             }
         }
     }

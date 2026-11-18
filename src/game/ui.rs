@@ -58,14 +58,15 @@ pub struct Selected(pub bool);
 pub struct BtnLabel(Vec<Entity>);
 
 #[derive(Component)]
+/// A column of lines, each made of coloured spans.
 pub struct RichText {
-    spans: Spans,
+    lines: Vec<Spans>,
     size: f32,
 }
 
 impl RichText {
     fn sized(size: f32) -> Self {
-        Self { spans: Vec::new(), size }
+        Self { lines: Vec::new(), size }
     }
 }
 
@@ -78,23 +79,26 @@ pub struct StatusText;
 #[derive(Component)]
 pub struct InfoText;
 #[derive(Component)]
-pub struct ControlsRow;
-#[derive(Component)]
-pub struct SetupRow;
-#[derive(Component)]
-pub struct KbdHint;
-#[derive(Component)]
 pub struct LogView;
-#[derive(Component)]
-pub struct CribBody;
-#[derive(Component)]
-pub struct Overlay;
-#[derive(Component)]
-pub struct OverlayTitle;
-#[derive(Component)]
-pub struct OverlayBody;
-#[derive(Component)]
-pub struct OverlayLine;
+/// Which part of the screen a UI node is; drives show/hide and layout.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Menu,
+    Panel,
+    Overlay,
+    Controls,
+    SetupControls,
+    KbdHint,
+    Crib,
+    Log,
+}
+
+#[derive(Component, Clone, Copy)]
+pub enum OverlayText {
+    Title,
+    Body,
+    Line,
+}
 
 #[derive(Resource, Default)]
 pub struct CribOpen(pub bool);
@@ -197,6 +201,7 @@ pub fn setup_ui(mut commands: Commands) {
     commands
         .spawn((
             MenuScreen,
+            Section::Menu,
             Node {
                 position_type: PositionType::Absolute,
                 width: Val::Percent(100.0),
@@ -268,6 +273,7 @@ pub fn setup_ui(mut commands: Commands) {
     commands
         .spawn((
             SidePanel,
+            Section::Panel,
             Node {
                 position_type: PositionType::Absolute,
                 right: Val::Px(0.0),
@@ -285,33 +291,38 @@ pub fn setup_ui(mut commands: Commands) {
         ))
         .with_children(|s| {
             s.spawn(panel()).with_children(|p| {
-                p.spawn((StatusText, RichText::sized(15.0), text("", 15.0, TEXT)));
+                p.spawn((StatusText, RichText::sized(15.0), Node { flex_direction: FlexDirection::Column, ..default() }));
             });
             s.spawn(panel()).with_children(|p| {
-                p.spawn((InfoText, RichText::sized(13.5), text("", 13.5, TEXT), Node { min_height: Val::Px(40.0), ..default() }));
-                p.spawn((ControlsRow, row())).with_children(|r| {
-                    button(r, "↶ Left", UiAction::Cmd(BattleCommand::TurnLeft), BtnKind::Normal);
+                p.spawn((
+                    InfoText,
+                    RichText::sized(13.5),
+                    Node { flex_direction: FlexDirection::Column, min_height: Val::Px(40.0), row_gap: Val::Px(2.0), ..default() },
+                ));
+                p.spawn((Section::Controls, row())).with_children(|r| {
+                    button(r, "Turn left", UiAction::Cmd(BattleCommand::TurnLeft), BtnKind::Normal);
                     button(r, "↑ Forward", UiAction::Cmd(BattleCommand::Forward), BtnKind::Normal);
-                    button(r, "↷ Right", UiAction::Cmd(BattleCommand::TurnRight), BtnKind::Normal);
+                    button(r, "Turn right", UiAction::Cmd(BattleCommand::TurnRight), BtnKind::Normal);
                     button(r, "↓ Back (3 MP)", UiAction::Cmd(BattleCommand::Backward), BtnKind::Normal);
                     button(r, "Fire", UiAction::Cmd(BattleCommand::FireMode), BtnKind::Danger);
                     button(r, "End activation", UiAction::Cmd(BattleCommand::EndActivation), BtnKind::Primary);
                 });
-                p.spawn((SetupRow, row())).with_children(|r| {
-                    button(r, "↶ Turn", UiAction::Cmd(BattleCommand::TurnLeft), BtnKind::Normal);
-                    button(r, "↷ Turn", UiAction::Cmd(BattleCommand::TurnRight), BtnKind::Normal);
+                p.spawn((Section::SetupControls, row())).with_children(|r| {
+                    button(r, "Turn left", UiAction::Cmd(BattleCommand::TurnLeft), BtnKind::Normal);
+                    button(r, "Turn right", UiAction::Cmd(BattleCommand::TurnRight), BtnKind::Normal);
                     button(r, "Set flagship", UiAction::Cmd(BattleCommand::SetFlagship), BtnKind::Normal);
                     button(r, "Remove", UiAction::Cmd(BattleCommand::RemoveDeployed), BtnKind::Danger);
                     button(r, "Confirm deployment", UiAction::Cmd(BattleCommand::ConfirmDeployment), BtnKind::Primary);
                 });
                 p.spawn((
-                    KbdHint,
+                    Section::KbdHint,
                     text("Q/E turn · W forward · S back · F fire · Space end · click a unit to select, a red-outlined enemy to shoot", 12.0, DIM),
                 ));
             });
             s.spawn(panel()).with_children(|p| {
                 p.spawn((
                     LogView,
+                    Section::Log,
                     Node {
                         flex_direction: FlexDirection::Column,
                         height: Val::Px(300.0),
@@ -333,7 +344,7 @@ pub fn setup_ui(mut commands: Commands) {
             s.spawn(panel()).with_children(|p| {
                 button(p, "Rules crib sheet ▸", UiAction::ToggleCrib, BtnKind::Normal);
                 p.spawn((
-                    CribBody,
+                    Section::Crib,
                     Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(4.0), display: Display::None, ..default() },
                 ))
                 .with_children(|c| {
@@ -357,7 +368,7 @@ pub fn setup_ui(mut commands: Commands) {
     // --- Result overlay ---
     commands
         .spawn((
-            Overlay,
+            Section::Overlay,
             Node {
                 position_type: PositionType::Absolute,
                 width: Val::Percent(100.0),
@@ -387,9 +398,9 @@ pub fn setup_ui(mut commands: Commands) {
                 BorderColor::all(GOLD),
             ))
             .with_children(|card| {
-                card.spawn((OverlayTitle, text("", 24.0, GOLD)));
-                card.spawn((OverlayBody, text("", 14.0, TEXT)));
-                card.spawn((OverlayLine, text("", 12.0, DIM)));
+                card.spawn((OverlayText::Title, text("", 24.0, GOLD)));
+                card.spawn((OverlayText::Body, text("", 14.0, TEXT)));
+                card.spawn((OverlayText::Line, text("", 12.0, DIM)));
                 card.spawn(row()).with_children(|r| {
                     button(r, "Copy result line", UiAction::Copy, BtnKind::Normal);
                     button(r, "Play again", UiAction::Restart, BtnKind::Primary);
@@ -569,17 +580,21 @@ pub fn style_buttons(mut buttons: Query<ButtonLook>, mut colors: Query<&mut Text
     }
 }
 
-fn set_rich(commands: &mut Commands, entity: Entity, rich: &mut RichText, spans: &Spans) {
-    if rich.spans == *spans {
+fn set_rich(commands: &mut Commands, entity: Entity, rich: &mut RichText, lines: &[Spans]) {
+    if rich.lines == lines {
         return;
     }
-    rich.spans = spans.clone();
+    rich.lines = lines.to_vec();
     let size = rich.size;
     let mut e = commands.entity(entity);
     e.despawn_related::<Children>();
     e.with_children(|p| {
-        for (s, color) in spans {
-            p.spawn((TextSpan::new(s.clone()), TextFont::from_font_size(size), TextColor(*color)));
+        for spans in lines {
+            p.spawn((Text::new(""), TextFont::from_font_size(size), TextColor(TEXT))).with_children(|t| {
+                for (s, color) in spans {
+                    t.spawn((TextSpan::new(s.clone()), TextFont::from_font_size(size), TextColor(*color)));
+                }
+            });
         }
     });
 }
@@ -598,67 +613,64 @@ pub fn update_texts(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn update_layout(
     window: Single<&Window, With<PrimaryWindow>>,
     model: Res<UiModel>,
     crib: Res<CribOpen>,
     overlay_hidden: Res<OverlayHidden>,
-    mut menu: Query<&mut Node, (With<MenuScreen>, Without<SidePanel>, Without<Overlay>, Without<ControlsRow>, Without<SetupRow>, Without<KbdHint>, Without<CribBody>, Without<LogView>)>,
-    mut side: Query<&mut Node, (With<SidePanel>, Without<MenuScreen>, Without<Overlay>, Without<ControlsRow>, Without<SetupRow>, Without<KbdHint>, Without<CribBody>, Without<LogView>)>,
-    mut overlay: Query<&mut Node, (With<Overlay>, Without<MenuScreen>, Without<SidePanel>, Without<ControlsRow>, Without<SetupRow>, Without<KbdHint>, Without<CribBody>, Without<LogView>)>,
-    mut rows: Query<(&mut Node, Has<ControlsRow>, Has<SetupRow>, Has<KbdHint>, Has<CribBody>, Has<LogView>), (Or<(With<ControlsRow>, With<SetupRow>, With<KbdHint>, With<CribBody>, With<LogView>)>, Without<MenuScreen>, Without<SidePanel>, Without<Overlay>)>,
-    mut overlay_texts: Query<(&mut Text, Has<OverlayTitle>, Has<OverlayBody>), Or<(With<OverlayTitle>, With<OverlayBody>, With<OverlayLine>)>>,
+    mut sections: Query<(&mut Node, &Section)>,
+    mut overlay_texts: Query<(&mut Text, &OverlayText)>,
 ) {
-    fn show(node: &mut Node, on: bool) {
-        let d = if on { Display::Flex } else { Display::None };
-        if node.display != d {
-            node.display = d;
-        }
-    }
     let win = Vec2::new(window.width(), window.height());
     let portrait = is_portrait(win);
     let in_menu = model.phase == Phase::Menu;
-    if let Ok(mut n) = menu.single_mut() {
-        show(&mut n, in_menu);
-    }
-    if let Ok(mut n) = side.single_mut() {
-        show(&mut n, !in_menu);
-        let (w, h, top) = if portrait {
-            (Val::Percent(100.0), Val::Px(panel_height(win)), Val::Px(win.y - panel_height(win)))
-        } else {
-            (Val::Px(PANEL_W), Val::Percent(100.0), Val::Px(0.0))
-        };
-        if n.width != w || n.height != h || n.top != top {
-            n.width = w;
-            n.height = h;
-            n.top = top;
-        }
-    }
+    let setup = model.phase == Phase::Deployment;
     let over = model.phase == Phase::GameOver && model.result.is_some() && !overlay_hidden.0;
-    if let Ok(mut n) = overlay.single_mut() {
-        show(&mut n, over);
+    for (mut node, section) in &mut sections {
+        let visible = match section {
+            Section::Menu => in_menu,
+            Section::Panel => !in_menu,
+            Section::Overlay => over,
+            Section::Controls | Section::KbdHint => !setup,
+            Section::SetupControls => setup,
+            Section::Crib => crib.0,
+            Section::Log => true,
+        };
+        let display = if visible { Display::Flex } else { Display::None };
+        if node.display != display {
+            node.display = display;
+        }
+        match section {
+            Section::Panel => {
+                let (w, h, top) = if portrait {
+                    (Val::Percent(100.0), Val::Px(panel_height(win)), Val::Px(win.y - panel_height(win)))
+                } else {
+                    (Val::Px(PANEL_W), Val::Percent(100.0), Val::Px(0.0))
+                };
+                if node.width != w || node.height != h || node.top != top {
+                    node.width = w;
+                    node.height = h;
+                    node.top = top;
+                }
+            }
+            Section::Log => {
+                let h = Val::Px(if portrait { 150.0 } else { 300.0 });
+                if node.height != h {
+                    node.height = h;
+                }
+            }
+            _ => {}
+        }
     }
     if let Some(r) = &model.result {
-        for (mut t, title, body) in &mut overlay_texts {
-            let want = if title { &r.title } else if body { &r.body } else { &r.line };
+        for (mut t, which) in &mut overlay_texts {
+            let want = match which {
+                OverlayText::Title => &r.title,
+                OverlayText::Body => &r.body,
+                OverlayText::Line => &r.line,
+            };
             if t.0 != *want {
                 t.0 = want.clone();
-            }
-        }
-    }
-    let setup = model.phase == Phase::Deployment;
-    for (mut n, controls, setup_row, kbd, crib_body, log) in &mut rows {
-        if controls || kbd {
-            show(&mut n, !setup);
-        } else if setup_row {
-            show(&mut n, setup);
-        } else if crib_body {
-            show(&mut n, crib.0);
-        } else if log {
-            let h = Val::Px(if portrait { 150.0 } else { 300.0 });
-            if n.height != h {
-                n.height = h;
             }
         }
     }

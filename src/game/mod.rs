@@ -1,5 +1,7 @@
 //! The Bevy app layer: board rendering, UI and input on top of `rules`.
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod autoplay;
 pub mod board;
 pub mod flow;
 pub mod model;
@@ -79,6 +81,10 @@ impl Plugin for GamePlugin {
                         .in_set(Stage::Present),
                 ),
             );
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(script) = autoplay::Autoplay::from_env() {
+            app.insert_resource(script).add_systems(Update, autoplay::autoplay.in_set(Stage::Input));
+        }
     }
 }
 

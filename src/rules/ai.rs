@@ -102,8 +102,8 @@ pub fn baseline_activate(world: &mut World, e: Entity) {
     let hold = world.resource::<Battle>().fleets[s.side].formation.holds();
     let tgt = pick_target(&ships, &s);
     if s.morale == Morale::Shaken {
-        if tgt.is_some() {
-            fire(world, e, tgt.unwrap().e);
+        if let Some(t) = tgt {
+            fire(world, e, t.e);
             return;
         }
         if !hold && let Some(ne) = nearest_enemy(&ships, &s) {

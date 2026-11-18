@@ -27,7 +27,7 @@ pub fn to_world(h: Hex) -> Vec2 {
     Vec2::new(x, -y)
 }
 
-fn pixel_to_hex(p: Vec2) -> Option<Hex> {
+pub fn pixel_to_hex(p: Vec2) -> Option<Hex> {
     let mut best = None;
     let mut best_d = f32::INFINITY;
     for h in board_hexes() {
@@ -51,6 +51,13 @@ pub struct BoardView {
 }
 
 impl BoardView {
+    pub fn world_to_screen(&self, w: Vec2) -> Vec2 {
+        Vec2::new(
+            (w.x - self.camera.x) / self.scale + self.window.x / 2.0,
+            -(w.y - self.camera.y) / self.scale + self.window.y / 2.0,
+        )
+    }
+
     pub fn screen_to_world(&self, s: Vec2) -> Vec2 {
         Vec2::new(
             self.camera.x + (s.x - self.window.x / 2.0) * self.scale,
@@ -96,6 +103,7 @@ pub struct Tile {
 pub struct ShipVisual {
     border: Entity,
     arrow: Entity,
+    mark: Entity,
     pips: [Entity; 4],
 }
 
@@ -168,9 +176,8 @@ pub fn setup_board(
     let (config, _) = gizmo_store.config_mut::<ThinGizmos>();
     config.line.width = 1.6;
 
-    let tip = Vec2::new(HS - 4.0, 0.0);
-    let back = HS - 11.0;
-    let arrow = polygon(&[tip, Vec2::from_angle(2.6) * back, Vec2::from_angle(-2.6) * back]);
+    // Facing arrow in the front half of the token; the id sits behind it.
+    let arrow = polygon(&[Vec2::new(HS - 4.0, 0.0), Vec2::new(1.5, 5.0), Vec2::new(1.5, -5.0)]);
     let star: Vec<Vec2> = (0..10)
         .map(|k| {
             let r = if k % 2 == 0 { 5.5 } else { 2.3 };
@@ -261,9 +268,9 @@ pub fn paint_tiles(model: Res<UiModel>, tiles: Query<&Tile>, mut materials: ResM
         {
             c = blend(c, SIDE_FILL[s], SETUP_ALPHA);
         }
-        for side in 0..2 {
-            if model.flagships[side].is_some_and(|f| hex::dist(f, tile.hex) <= CMD_R) {
-                c = blend(c, SIDE_FILL[side], COMMAND_ALPHA);
+        for (flagship, fill) in model.flagships.iter().zip(SIDE_FILL) {
+            if flagship.is_some_and(|f| hex::dist(f, tile.hex) <= CMD_R) {
+                c = blend(c, fill, COMMAND_ALPHA);
             }
         }
         let color = Color::srgb_from_array(c);
@@ -275,13 +282,25 @@ pub fn paint_tiles(model: Res<UiModel>, tiles: Query<&Tile>, mut materials: ResM
     }
 }
 
+/// Where the id label / flagship star sits: behind the facing arrow.
+fn mark_offset(facing: u8) -> Vec2 {
+    Vec2::from_angle((-DIR_ANGLE[facing as usize] as f32).to_radians()) * -5.5
+}
+
+fn facing_rotation(facing: u8) -> Quat {
+    Quat::from_rotation_z((-DIR_ANGLE[facing as usize] as f32).to_radians())
+}
+
+/// Spawns a squadron token's parts; returns (border, arrow, mark).
 fn spawn_token(
     parent: &mut ChildSpawnerCommands,
     assets: &BoardAssets,
     side: usize,
     border: Handle<ColorMaterial>,
     flagship: bool,
-) -> (Entity, Entity) {
+    label: &str,
+    facing: u8,
+) -> (Entity, Entity, Entity) {
     let border = parent.spawn((Mesh2d(assets.ship_border.clone()), MeshMaterial2d(border), Transform::default())).id();
     parent.spawn((
         Mesh2d(assets.ship_fill.clone()),
@@ -292,41 +311,35 @@ fn spawn_token(
         .spawn((
             Mesh2d(assets.arrow.clone()),
             MeshMaterial2d(if flagship { assets.gold.clone() } else { assets.dark.clone() }),
-            Transform::from_xyz(0.0, 0.0, 0.2),
+            Transform::from_xyz(0.0, 0.0, 0.2).with_rotation(facing_rotation(facing)),
         ))
         .id();
-    if flagship {
+    let at = mark_offset(facing).extend(0.3);
+    let mark = if flagship {
+        parent.spawn((Mesh2d(assets.star.clone()), MeshMaterial2d(assets.dark.clone()), Transform::from_translation(at)))
+    } else {
         parent.spawn((
-            Mesh2d(assets.star.clone()),
-            MeshMaterial2d(assets.dark.clone()),
-            Transform::from_xyz(0.0, 0.0, 0.3),
-        ));
+            Text2d::new(label),
+            TextFont::from_font_size(20.0),
+            TextColor(DARK),
+            Transform::from_translation(at).with_scale(Vec3::splat(0.5)),
+        ))
     }
-    (border, arrow)
-}
-
-fn facing_rotation(facing: u8) -> Quat {
-    Quat::from_rotation_z((-DIR_ANGLE[facing as usize] as f32).to_radians())
+    .id();
+    (border, arrow, mark)
 }
 
 pub fn attach_ship_visuals(
     mut commands: Commands,
-    added: Query<(Entity, &Side, &Callsign, &HexPos, Has<Flagship>), Added<Squadron>>,
+    added: Query<(Entity, &Side, &Callsign, &HexPos, &Facing, Has<Flagship>), Added<Squadron>>,
     assets: Res<BoardAssets>,
 ) {
-    for (e, side, label, pos, flagship) in &added {
+    for (e, side, label, pos, facing, flagship) in &added {
         let p = to_world(pos.0);
         let mut visual = None;
         commands.entity(e).insert((Transform::from_xyz(p.x, p.y, 2.0), Visibility::Inherited)).with_children(|parent| {
-            let (border, arrow) = spawn_token(parent, &assets, side.0, assets.state[0].clone(), flagship);
-            if !flagship {
-                parent.spawn((
-                    Text2d::new(label.0[1..].to_string()),
-                    TextFont::from_font_size(18.0),
-                    TextColor(DARK),
-                    Transform::from_xyz(0.0, 0.5, 0.3).with_scale(Vec3::splat(0.5)),
-                ));
-            }
+            let (border, arrow, mark) =
+                spawn_token(parent, &assets, side.0, assets.state[0].clone(), flagship, &label.0[1..], facing.0);
             let pips = std::array::from_fn(|i| {
                 parent
                     .spawn((
@@ -336,7 +349,7 @@ pub fn attach_ship_visuals(
                     ))
                     .id()
             });
-            visual = Some(ShipVisual { border, arrow, pips });
+            visual = Some(ShipVisual { border, arrow, mark, pips });
         });
         if let Some(v) = visual {
             commands.entity(e).insert(v);
@@ -359,6 +372,7 @@ type ShipState<'a> = (
 pub fn sync_ships(
     mut ships: Query<ShipState, With<Squadron>>,
     mut parts: Query<(&mut MeshMaterial2d<ColorMaterial>, &mut Transform), Without<Squadron>>,
+    mut marks: Query<&mut Transform, (Without<Squadron>, Without<MeshMaterial2d<ColorMaterial>>)>,
     assets: Res<BoardAssets>,
 ) {
     for (pos, facing, morale, strength, alive, activated, visual, mut transform, mut visibility) in &mut ships {
@@ -384,6 +398,16 @@ pub fn sync_ships(
             if t.rotation != r {
                 t.rotation = r;
             }
+        }
+        let at = mark_offset(facing.0).extend(0.3);
+        let mark = match parts.get_mut(visual.mark) {
+            Ok((_, t)) => Some(t),
+            Err(_) => marks.get_mut(visual.mark).ok(),
+        };
+        if let Some(mut t) = mark
+            && t.translation != at
+        {
+            t.translation = at;
         }
         for (i, pip) in visual.pips.iter().enumerate() {
             let want = if (i as u8) < strength.0 { &assets.pip_on } else { &assets.pip_off };
@@ -418,8 +442,7 @@ pub fn sync_setup_ghosts(
         let is_flag = flag == Some(i);
         commands.spawn((SetupGhost, Transform::from_xyz(p.x, p.y, 2.0), Visibility::Inherited)).with_children(|parent| {
             let border = if is_flag { assets.gold.clone() } else { assets.dark.clone() };
-            let (_, arrow) = spawn_token(parent, &assets, side, border, is_flag);
-            parent.commands().entity(arrow).insert(Transform::from_xyz(0.0, 0.0, 0.2).with_rotation(facing_rotation(facing)));
+            spawn_token(parent, &assets, side, border, is_flag, &(i + 1).to_string(), facing);
         });
     }
 }

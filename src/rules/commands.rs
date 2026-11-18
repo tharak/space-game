@@ -179,11 +179,7 @@ fn apply_combat(world: &mut World, cmd: BattleCommand) {
                 set_act(world, Some(a));
             }
         }
-        BattleCommand::EndActivation => {
-            if a.unit.is_some() {
-                set_act(world, None);
-            }
-        }
+        BattleCommand::EndActivation if a.unit.is_some() => set_act(world, None),
         _ => {}
     }
 }

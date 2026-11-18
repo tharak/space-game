@@ -4,6 +4,9 @@
 //! * [`rules`]: the headless ECS battle rules, commands and AI.
 //! * [`game`]: the Bevy app (board rendering, UI, input) built on the rules.
 
+// Bevy system signatures are long by nature.
+#![allow(clippy::type_complexity)]
+
 pub mod game;
 pub mod hex;
 pub mod rules;

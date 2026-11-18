@@ -30,8 +30,9 @@ pub struct Can {
 #[derive(Resource, Default)]
 pub struct UiModel {
     pub phase: Phase,
-    pub status: Spans,
-    pub info: Spans,
+    pub status: Vec<Spans>,
+    /// One entry per line.
+    pub info: Vec<Spans>,
     pub can: Can,
     pub spectate: bool,
     pub fire_zone: HashSet<Hex>,
@@ -62,12 +63,12 @@ pub fn build_model(world: &mut World) {
         let setup = world.resource::<Deployment>().current.clone();
         if let Some(setup) = &setup {
             let size = settings.size;
-            m.status = vec![
+            m.status = vec![vec![
                 (format!("{} deployment", side_name(setup.side)), side_text(setup.side)),
                 (format!(" — {}/{} placed", setup.placed.len(), size), TEXT),
-            ];
+            ]];
             let sel = setup.selected;
-            m.info = vec![(
+            m.info = vec![vec![(
                 match sel {
                     Some(i) => format!(
                         "Selected squadron{}. Turn it, set flagship, remove it, or click an empty zone hex to place another.",
@@ -80,7 +81,7 @@ pub fn build_model(world: &mut World) {
                     None => format!("All {size} squadrons placed. Click one to adjust, or confirm."),
                 },
                 TEXT,
-            )];
+            )]];
             m.can.setup_turn = sel.is_some();
             m.can.setup_flag = sel.is_some() && sel != setup.flagship;
             m.can.setup_remove = sel.is_some();
@@ -98,51 +99,45 @@ pub fn build_model(world: &mut World) {
         format!("{} {}{}: {}/{} losses", side_name(side), f.formation.name(), sup, losses_of(side), battle.break_at)
     };
     m.status = vec![
-        (format!("Turn {}/{}", battle.turn, MAX_TURNS), GOLD),
-        (" — ".into(), TEXT),
-        (fleet_tag(0), BLUE),
-        (" · ".into(), TEXT),
-        (fleet_tag(1), RED),
+        vec![(format!("Turn {}/{}", battle.turn, MAX_TURNS), GOLD)],
+        vec![(fleet_tag(0), BLUE)],
+        vec![(fleet_tag(1), RED)],
     ];
 
     let act = world.resource::<Activation>().0;
     if battle.over() {
-        m.info = vec![("Battle over.".into(), TEXT)];
+        m.info = vec![vec![("Battle over.".into(), TEXT)]];
     } else if let Some(a) = act {
         match a.unit {
             None => {
-                m.info = vec![
+                m.info = vec![vec![
                     (side_name(a.side).into(), side_text(a.side)),
                     (": click one of your un-activated squadrons.".into(), TEXT),
-                ];
+                ]];
             }
             Some(u) => {
                 let me = *find(&ships, u).expect("selected ship");
                 let label = label_of(world, u);
-                let mut info: Spans = vec![
-                    (format!("{}{}", label, if me.flagship { " (flagship)" } else { "" }), GOLD),
-                    (
-                        format!(
-                            " — str {}, {}, {}\nMP {}/{}{}",
-                            me.strength,
-                            me.morale.name(),
-                            if a.cmd { "in command (move + fire)" } else { "OUT of command (move OR fire)" },
-                            a.mp,
-                            MP_MAX,
-                            if a.fired { " · has fired" } else { "" }
-                        ),
-                        TEXT,
-                    ),
-                ];
                 let can_fire_now = can_fire(world, &a);
-                if a.fire_mode || can_fire_now {
-                    info.push((" · click a red-outlined target to fire".into(), RED));
+                let mut info: Vec<Spans> = vec![
+                    vec![
+                        (format!("{}{}", label, if me.flagship { " (flagship)" } else { "" }), GOLD),
+                        (format!(" — str {}, {}", me.strength, me.morale.name()), TEXT),
+                    ],
+                    vec![(
+                        if a.cmd { "In command: move AND fire".into() } else { "OUT of command: move OR fire".to_string() },
+                        if a.cmd { TEXT } else { BAD },
+                    )],
+                    vec![(format!("MP {}/{}{}", a.mp, MP_MAX, if a.fired { " · has fired" } else { "" }), TEXT)],
+                ];
+                if can_fire_now {
+                    info.push(vec![("Click a red-outlined enemy to fire.".into(), RED)]);
                 }
                 if can_switch_selection(&a) {
-                    info.push((
-                        "\nChanged your mind? Click another un-activated squadron to switch — nothing's committed yet.".into(),
+                    info.push(vec![(
+                        "Changed your mind? Click another un-activated squadron — nothing's committed yet.".into(),
                         DIM,
-                    ));
+                    )]);
                 }
                 m.info = info;
                 m.can.turn = can_move(&a);
@@ -158,7 +153,7 @@ pub fn build_model(world: &mut World) {
             }
         }
     } else {
-        m.info = vec![(if m.spectate { "Spectating — press Step or Auto." } else { "AI is acting…" }.into(), DIM)];
+        m.info = vec![vec![(if m.spectate { "Spectating — press Step or Auto." } else { "AI is acting…" }.into(), DIM)]];
     }
     world.insert_resource(m);
 }
