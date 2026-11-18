@@ -1,0 +1,68 @@
+[package]
+name = "space-game"
+version = "0.1.0"
+edition = "2024"
+description = "Successor Stars: a hex fleet-battle rules prototype in Rust, Bevy and ECS"
+license = "MIT"
+
+[lib]
+name = "space_game"
+path = "src/lib.rs"
+
+[[bin]]
+name = "space-game"
+path = "src/main.rs"
+
+[[bin]]
+name = "sim"
+path = "src/bin/sim.rs"
+
+[dependencies]
+bevy = { version = "0.19", default-features = false, features = [
+  "std",
+  "async_executor",
+  "multi_threaded",
+  "bevy_asset",
+  "bevy_log",
+  "bevy_state",
+  "bevy_color",
+  "bevy_camera",
+  "bevy_mesh",
+  "bevy_shader",
+  "bevy_image",
+  "bevy_material",
+  "bevy_render",
+  "bevy_core_pipeline",
+  "bevy_post_process",
+  "bevy_sprite",
+  "bevy_sprite_render",
+  "bevy_gizmos",
+  "bevy_gizmos_render",
+  "bevy_text",
+  "bevy_ui",
+  "bevy_ui_render",
+  "bevy_input_focus",
+  "bevy_window",
+  "bevy_winit",
+  "default_font",
+  "webgl2",
+  "web",
+  "x11",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element"] }
+
+[profile.dev]
+opt-level = 1
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = true
