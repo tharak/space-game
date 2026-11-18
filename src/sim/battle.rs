@@ -80,6 +80,8 @@ pub struct Tuning {
     /// How far a ship may turn away from its division's facing to aim.
     pub aim_limit: f32,
     pub range: f32,
+    /// Ships stop rather than come closer than this to an enemy ship.
+    pub stop_distance: f32,
     /// Half-angle of the gun cone around the ship's heading.
     pub fire_arc: f32,
     pub cooldown: f32,
@@ -120,7 +122,8 @@ impl Default for Tuning {
             div_turn_rate: 0.22,
             ship_turn_rate: 1.6,
             aim_limit: 0.6,
-            range: 110.0,
+            range: 150.0,
+            stop_distance: 37.5,
             fire_arc: 1.05,
             cooldown: 4.0,
             hit: [0.12, 0.25, 0.4],

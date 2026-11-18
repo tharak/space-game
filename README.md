@@ -20,7 +20,7 @@ Pick a side, a fleet size (120/240/480 ships a side), an opponent and a scenario
 | Drag / arrows / WASD, wheel / pinch, `+` `-` | Pan and zoom |
 | `Space`, `1`–`4` | Pause, and speed 1× 2× 4× 8× |
 
-* Enemy ships block each other. To get through a line you must destroy the ships in the way.
+* Ships stop short of enemy ships (a quarter of weapon range) instead of colliding. To get through a line you must destroy the ships in the way.
 * A division that loses ships quickly turns Shaken, then Routs. Staying inside the flagship's command circle steadies it.
 * A fleet breaks when more than half its ships are destroyed, fled or routed.
 
@@ -30,7 +30,7 @@ The breakthrough is not a scripted rule. It comes out of the simulation:
 
 1. **Short range.** Guns have a short range and fire only in a forward cone. Only the part of a line facing the arrow's tip can shoot at it; the rest of the line is out of the fight until it wheels.
 2. **Depth.** A wedge closes ranks as it loses ships, so it always has a full front. A two-rank line keeps its holes.
-3. **Blocking.** Ships cannot pass through or push enemies, so the arrow grinds through the line by destroying the ships in its way.
+3. **Blocking.** Ships stop a quarter of weapon range short of any enemy and never push through, so the arrow grinds into the line by destroying the ships in its way.
 4. **Getting behind.** Once through, the arrow fires into rear arcs (40% to hit, against 12% from the front). The line's ships cannot turn far enough to answer until their division wheels.
 5. **Morale.** Being broken through, plus the sudden losses, shakes and routs the broken divisions.
 
@@ -42,17 +42,20 @@ The counter is to put flanks on the arrow, for example with a crescent or by com
 
 | Scenario | Commander AI both sides | Formation only (opening orders) |
 | --- | ---: | ---: |
-| Arrow vs Line | **74%**, 3.1 min | 100%, on time |
-| Line vs Line | 50%, 3.7 min | 40%, 3.5 min |
-| Crescent vs Arrow | **72%**, 2.6 min | 2%, 6.6 min |
-| Echelon vs Line | 50%, 3.6 min | 18%, 3.8 min |
-| Columns vs Line | 46%, 3.2 min | 98%, 5.1 min |
-| Low supply (Red fires 8% slower) | 74%, 3.7 min | 98%, 3.4 min |
+| Arrow vs Line | **70%**, 3.2 min | 100%, on time |
+| Line vs Line | 58%, 3.9 min | 44%, 3.6 min |
+| Crescent vs Arrow | 50%, 3.0 min | 12%, 6.7 min |
+| Echelon vs Line | 44%, 3.8 min | 16%, 3.9 min |
+| Columns vs Line | 80%, 2.8 min | 96%, 5.0 min |
+| Low supply (Red fires 8% slower) | 80%, 4.0 min | 94%, 3.5 min |
 
-* With commanders on both sides, the arrow beats the line and the crescent beats the arrow. The even matchups come out even.
+* With commanders on both sides, the arrow beats the line and the even matchups come out roughly even.
 * "Formation only" means no division ever changes its opening order. That shows the raw shapes. The arrow wins on time there because it punches through and the line never turns to face it. Columns win for the same reason.
 * Hundreds of ships average out the dice, so a small edge (like 8% slower fire) decides most battles.
-* **Known weakness:** the commander AI loses Line vs Line to a formation-only line (18%). Its flanking moves cost it more than they gain, so it needs another pass.
+* **Known weaknesses:**
+  * With weapon range 150 and a 37.5 stopping distance, the crescent no longer reliably beats the arrow (50%), and deep columns beat lines (80%).
+  * The commander AI loses Line vs Line to a formation-only line (34%). Its flanking moves cost it more than they gain.
+  * Both need another tuning pass.
 
 ## Architecture
 

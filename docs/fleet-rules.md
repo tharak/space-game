@@ -25,7 +25,7 @@ Formations are Line (2 ranks), Wedge, Crescent, Echelon left/right, and Column. 
 
 ## Fire
 
-* Range is 110. Guns fire in a 60° cone ahead of the ship.
+* Range is 150. Guns fire in a 60° cone ahead of the ship.
 * A ship can turn up to about 34° away from its division's facing to aim. So a division attacked from behind cannot answer until it wheels.
 * Each ship fires about every 4 s at the nearest enemy in its cone.
 * The hit chance depends on which arc of the target the shot comes from:
@@ -38,7 +38,7 @@ Formations are Line (2 ranks), Wedge, Crescent, Echelon left/right, and Column. 
 
 ## Contact
 
-Enemy ships never pass through or shove each other. A ship simply stops instead of moving into an enemy's space. To get through a line you must destroy the ships in the way. A defending line holds its ground.
+Enemy ships never pass through or shove each other. A ship stops rather than come within 37.5 of an enemy ship (a quarter of weapon range), so fleets fight at a distance and do not collide. To get through a line you must destroy the ships in the way. A defending line holds its ground.
 
 Deep formations (Wedge, Column) close ranks every 3 s, so rear ships step into the gaps at the front. A Line does not, so its holes stay open. This is why a wedge can tear a line open: it keeps a fresh front while the line thins at one point.
 

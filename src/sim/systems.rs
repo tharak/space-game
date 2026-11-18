@@ -191,7 +191,7 @@ pub fn integrate(
     battle: Res<Battle>,
 ) {
     let s = tuning.spacing;
-    let (friend, block) = (s * 0.8, s * 1.4);
+    let (friend, block) = (s * 0.8, tuning.stop_distance.max(s * 1.4));
     for (e, mut pos, vel, side, div) in &mut ships {
         let p = pos.0;
         // Friends keep a little apart.

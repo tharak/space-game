@@ -107,7 +107,7 @@ fn plan(side: usize, views: &[View], tuning: &Tuning) -> Vec<(Entity, Order)> {
         } else if d.morale == Morale::Shaken {
             // Hold, face the threat, let it rally.
             Order::MoveTo { to: d.centroid, facing: bearing.to_angle() }
-        } else if dist > tuning.range * 4.0 {
+        } else if dist > tuning.range * 2.0 {
             // Still closing: keep the fleet's line and advance together.
             let to = d.centroid + toward * 200.0;
             Order::MoveTo { to, facing: toward.to_angle() }
