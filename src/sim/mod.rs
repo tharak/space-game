@@ -116,6 +116,69 @@ pub struct Report {
     pub lost: [u32; 2],
     pub destroyed: [u32; 2],
     pub start: [u32; 2],
+    /// Ships still alive at the end, routed ones included.
+    pub survivors: [u32; 2],
+    /// Of the survivors, how many are below 60% hull.
+    pub damaged: [u32; 2],
+}
+
+/// Summarises a finished battle in `world` (works for a live game too).
+pub fn report(world: &mut World) -> Option<Report> {
+    let mut survivors = [0u32; 2];
+    let mut damaged = [0u32; 2];
+    for (ship, side) in world.query::<(&Ship, &Side)>().iter(world) {
+        survivors[side.0] += 1;
+        if ship.hull < ship.max_hull * 0.6 {
+            damaged[side.0] += 1;
+        }
+    }
+    let b = world.resource::<Battle>();
+    let outcome = b.result.clone()?;
+    Some(Report {
+        winner: outcome.winner,
+        reason: outcome.reason,
+        time: outcome.time,
+        first_contact: b.first_contact,
+        first_breakthrough: b.first_breakthrough,
+        lost: b.lost,
+        destroyed: b.destroyed,
+        start: b.start,
+        survivors,
+        damaged,
+    })
+}
+
+/// A battle simulated a slice at a time in its own `World`, so the game can
+/// auto-resolve a big battle without freezing a frame.
+pub struct AutoResolve {
+    world: World,
+}
+
+impl AutoResolve {
+    pub fn new(settings: SimSettings, seed: u32) -> Self {
+        let mut world = World::new();
+        let settings = SimSettings { control: Control::Spectate, ..settings };
+        init_world(&mut world, settings, seed);
+        Self { world }
+    }
+
+    /// Runs up to `ticks` steps; returns the report once the battle is over.
+    pub fn advance(&mut self, ticks: u32) -> Option<Report> {
+        for _ in 0..ticks {
+            if self.world.resource::<Battle>().over() {
+                break;
+            }
+            step(&mut self.world);
+            self.world.resource_mut::<Messages<SimEvent>>().update();
+        }
+        report(&mut self.world)
+    }
+
+    /// Battle time so far, against the time limit (for a progress bar).
+    pub fn progress(&self) -> f32 {
+        let t = self.world.resource::<Tuning>().time_limit;
+        (self.world.resource::<Battle>().time / t).clamp(0.0, 1.0)
+    }
 }
 
 /// Runs a whole AI-vs-AI battle with no rendering.
@@ -130,16 +193,5 @@ pub fn simulate(settings: SimSettings, seed: u32, tuning: Option<Tuning>) -> Rep
         step(&mut world);
         world.resource_mut::<Messages<SimEvent>>().update();
     }
-    let b = world.resource::<Battle>();
-    let outcome = b.result.clone().expect("battle over");
-    Report {
-        winner: outcome.winner,
-        reason: outcome.reason,
-        time: outcome.time,
-        first_contact: b.first_contact,
-        first_breakthrough: b.first_breakthrough,
-        lost: b.lost,
-        destroyed: b.destroyed,
-        start: b.start,
-    }
+    report(&mut world).expect("battle over")
 }

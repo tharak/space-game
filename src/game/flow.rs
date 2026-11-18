@@ -5,6 +5,7 @@ use bevy::ecs::message::Messages;
 use bevy::prelude::*;
 
 use super::camera::CameraRig;
+use super::campaign_ui::{self, CampaignState};
 use super::input::Selection;
 use crate::sim::battle::{Battle, Control, EndReason, SimEvent, SimSettings};
 use crate::sim::components::{Morale, side_name};
@@ -17,6 +18,18 @@ pub enum Phase {
     Menu,
     Battle,
     Over,
+    /// The galaxy map.
+    Campaign,
+    /// The card before a campaign battle: fight, auto-resolve or withdraw.
+    PreBattle,
+    /// A campaign battle being auto-resolved.
+    Resolving,
+}
+
+impl Phase {
+    pub fn in_battle(self) -> bool {
+        matches!(self, Phase::Battle | Phase::Over)
+    }
 }
 
 /// Simulation speed: ticks per fixed step (1 = real time), or paused.
@@ -36,6 +49,13 @@ impl Default for Speed {
 pub enum AppRequest {
     Start,
     Menu,
+    NewCampaign,
+    ContinueCampaign,
+    EndTurn,
+    ReturnToCampaign,
+    Fight,
+    AutoResolve,
+    Withdraw,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -71,8 +91,25 @@ pub fn apply_requests(world: &mut World) {
     let requests: Vec<AppRequest> = world.resource_mut::<Messages<AppRequest>>().drain().collect();
     for r in requests {
         match r {
-            AppRequest::Start => start_battle(world),
-            AppRequest::Menu => *world.resource_mut::<Phase>() = Phase::Menu,
+            AppRequest::Start => {
+                world.resource_mut::<CampaignState>().battle = None;
+                world.resource_mut::<SimSettings>().forces = None;
+                start_battle(world)
+            }
+            AppRequest::Menu => {
+                *world.resource_mut::<Phase>() = Phase::Menu;
+                world.resource_mut::<super::ui::SaveExists>().0 = crate::campaign::save::load().is_some();
+            }
+            AppRequest::NewCampaign => {
+                campaign_ui::new_campaign(world);
+                world.resource_mut::<super::ui::SaveExists>().0 = true;
+            }
+            AppRequest::ContinueCampaign => campaign_ui::continue_campaign(world),
+            AppRequest::EndTurn => campaign_ui::end_player_turn(world),
+            AppRequest::ReturnToCampaign => campaign_ui::return_to_campaign(world),
+            AppRequest::Fight => campaign_ui::prebattle_fight(world),
+            AppRequest::AutoResolve => campaign_ui::prebattle_auto(world),
+            AppRequest::Withdraw => campaign_ui::prebattle_withdraw(world),
         }
     }
     let commands: Vec<Command> = world.resource_mut::<Messages<Command>>().drain().collect();
@@ -84,6 +121,12 @@ pub fn apply_requests(world: &mut World) {
 }
 
 pub fn start_battle(world: &mut World) {
+    start_battle_with(world, None);
+}
+
+/// Starts a battle from the current `SimSettings`; `intro` replaces the
+/// scenario's log lines (campaign battles).
+pub fn start_battle_with(world: &mut World, intro: Option<Vec<String>>) {
     let seed = {
         let mut s = world.resource_mut::<SeedSource>();
         s.0 = s.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -102,10 +145,20 @@ pub fn start_battle(world: &mut World) {
     let mut log = world.resource_mut::<LogBook>();
     log.lines.clear();
     log.generation += 1;
-    log.push(format!("{} — {} ships a side", scenario.title, start[0]), Tone::Title);
-    log.push(scenario.blurb, Tone::Plain);
-    let (a, b) = if settings.mirror { (scenario.fleets[1], scenario.fleets[0]) } else { (scenario.fleets[0], scenario.fleets[1]) };
-    log.push(format!("Blue: {} · Red: {}", a.name(), b.name()), Tone::Plain);
+    if let Some(lines) = intro {
+        let mut lines = lines.into_iter();
+        if let Some(first) = lines.next() {
+            log.push(first, Tone::Title);
+        }
+        for l in lines {
+            log.push(l, Tone::Plain);
+        }
+    } else {
+        log.push(format!("{} — {} ships a side", scenario.title, start[0]), Tone::Title);
+        log.push(scenario.blurb, Tone::Plain);
+        let (a, b) = if settings.mirror { (scenario.fleets[1], scenario.fleets[0]) } else { (scenario.fleets[0], scenario.fleets[1]) };
+        log.push(format!("Blue: {} · Red: {}", a.name(), b.name()), Tone::Plain);
+    }
     log.push("A fleet breaks when it has lost more than half its ships.", Tone::Plain);
     if settings.control != Control::Spectate {
         log.push("Paused — give orders, then press Space or Resume.", Tone::Good);

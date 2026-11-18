@@ -4,6 +4,18 @@ A real-time fleet battle with hundreds of ships a side, in Rust with [Bevy 0.19]
 
 **Play:** <https://tharak.github.io/space-game/> (needs a browser with WebGL2)
 
+## Campaign
+
+**New campaign** on the menu starts a turn-based war over a galaxy split by an impassable nebula. Two corridors cross it: a fortress in the north, a neutral trade world in the south ([docs/campaign-rules.md](docs/campaign-rules.md)).
+
+* You command the Meridian Compact's fleets, each under an admiral, against the AI Hesper Throne.
+* Each turn you send fleets to systems. Wherever fleets meet, you **fight** the battle on the battle screen, **auto-resolve** it with the same simulation, or **withdraw**.
+* **Fleet sizes persist:** losses and damage carry over between battles.
+* Held systems pay **ships every turn**, but only while supplied, meaning connected to your capital through your own systems. Fleets that push too far beyond that lose supply and fight worse.
+* Damaged ships repair at home.
+* Winning admirals are promoted and gain traits (Gunnery, Steadfast, Maneuver, Logistician).
+* Take the enemy capital to win. The campaign autosaves every turn.
+
 This started as a port of the [BattleStars](https://github.com/tharak/BattleStars) hex board (rules v0.2.1, still in this repo's history). Playing it showed that 9 squadrons a side, each destroyed in 2–3 shots, could not give a formation time to matter. So the game is now a continuous 2D simulation of every ship ([docs/fleet-rules.md](docs/fleet-rules.md)).
 
 ## How to play
@@ -57,6 +69,13 @@ The counter is to put flanks on the arrow, for example with a crescent or by com
   * The commander AI loses Line vs Line to a formation-only line (34%). Its flanking moves cost it more than they gain.
   * Both need another tuning pass.
 
+## Campaign balance
+
+`cargo run --release --bin campaign_sim -- 16` plays whole wars with the AI on both sides. Over 16 wars:
+* The sides split 6–10.
+* Wars last 90 turns on average, with about 90 battles.
+* Some end with a capital falling by turns 20–60. Others see-saw over the corridors until the 120-turn limit.
+
 ## Architecture
 
 ```
@@ -70,6 +89,13 @@ src/
     scenario.rs       fleet shapes and scenarios
     battle.rs         settings, Tuning (every number), Battle state, SimEvent messages
     rng.rs            seeded Mulberry32
+  campaign/           turn-based strategic layer, headless
+    map.rs            the galaxy: systems, lanes, the nebula and its two corridors
+    state.rs          Campaign (systems, fleets, admirals, pending battles), serde
+    turn.rs           movement and battle detection; capture, supply, income, repair, replacements
+    battle.rs         campaign fleets -> sim Forces (with admiral traits and supply), Report -> losses and retreats
+    ai.rs             the rival power's strategy
+    save.rs           JSON save in localStorage / ~/.local/share
   game/               the Bevy app
     flow.rs           start/restart, applies orders, steps the sim at the chosen speed, log lines
     view.rs           ship meshes (shared mesh and materials, batched), labels, lasers, explosions, order overlays
@@ -77,9 +103,12 @@ src/
     input.rs          mouse, touch and keyboard
     model.rs          per-frame UiModel read model
     ui.rs             menu, side panel, division list, orders, log, rules, result overlay
+    campaign_ui.rs    galaxy map, fleet orders, pre-battle card, auto-resolve, campaign panel model
     autoplay.rs       scripted native smoke run that saves screenshots (dev only)
-  bin/sim.rs          balance runner
+  bin/sim.rs          battle balance runner
+  bin/campaign_sim.rs AI-vs-AI campaign runner
 examples/trace.rs     battle timeline, with optional PPM snapshots (TRACE_PPM=dir)
+examples/campaign_trace.rs   AI-vs-AI war, turn by turn
 ```
 
 Every ship is an entity, and so is every division. The simulation is ordinary ECS systems in a custom `SimTick` schedule with a fixed step. The game runs that schedule from `FixedUpdate` 0–8 times per step, and the tests and balance runner call it directly on a bare `World`. A seed always replays the same battle.
@@ -87,9 +116,10 @@ Every ship is an entity, and so is every division. The simulation is ordinary EC
 ## Develop
 
 ```bash
-cargo test --lib                          # sim tests (formations, spatial hash, arcs, morale, blocking, breakthrough, determinism)
+cargo test --lib                          # sim + campaign tests (formations, blocking, morale, supply, income, battles, saves)
 cargo run                                 # native window
-cargo run --release --bin sim -- 25 240   # balance table
+cargo run --release --bin sim -- 25 240   # battle balance table
+cargo run --release --bin campaign_sim -- 16   # AI-vs-AI wars
 cargo run --release --example trace -- 0 c 1   # timeline of Arrow vs Line, commander AI, seed 1
 SG_AUTOPLAY=/tmp/shots cargo run          # scripted run, saves PNGs
 ./scripts/build-web.sh                    # wasm bundle into dist/ (python3 -m http.server -d dist)

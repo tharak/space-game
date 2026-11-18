@@ -13,6 +13,7 @@ use crate::sim::Command;
 use crate::sim::battle::{Battle, Control, SimSettings};
 use crate::sim::components::{Division, Order};
 use crate::sim::spatial::SpatialHash;
+use crate::campaign::map::{FORTRESS, HUB};
 
 #[derive(Resource)]
 pub struct Autoplay {
@@ -20,13 +21,16 @@ pub struct Autoplay {
     frame: u32,
     step: u32,
     wait_from: u32,
+    prebattles: u32,
+    shot_campaign_battle: bool,
+    last_phase: Phase,
 }
 
 impl Autoplay {
     pub fn from_env() -> Option<Self> {
         std::env::var("SG_AUTOPLAY").ok().map(|dir| {
             std::fs::create_dir_all(&dir).ok();
-            Self { dir, frame: 0, step: 0, wait_from: 0 }
+            Self { dir, frame: 0, step: 0, wait_from: 0, prebattles: 0, shot_campaign_battle: false, last_phase: Phase::Menu }
         })
     }
 }
@@ -47,6 +51,7 @@ pub fn autoplay(
     phase: Res<Phase>,
     battle: Res<Battle>,
     divs: Query<(Entity, &Division)>,
+    mut camp: ResMut<super::campaign_ui::CampaignState>,
 ) {
     auto.frame += 1;
     let f = auto.frame;
@@ -124,11 +129,80 @@ pub fn autoplay(
             next(&mut auto);
         }
         11 if since == 30 => {
+            requests.write(AppRequest::NewCampaign);
+            next(&mut auto);
+        }
+        12 if since == 40 => {
+            shot(&mut commands, "09-campaign-map");
+            // Fleet 3 waits at Aster Reach, fleet 4 at Brine: send them
+            // into the two corridors.
+            camp.fleet = Some(3);
+            super::campaign_ui::order_move(&mut camp, FORTRESS);
+            camp.fleet = Some(4);
+            super::campaign_ui::order_move(&mut camp, HUB);
+            camp.system = Some(HUB);
+            next(&mut auto);
+        }
+        13 if since == 20 => {
+            shot(&mut commands, "10-campaign-orders");
+            next(&mut auto);
+        }
+        14 => {
+            // Play turns: auto-resolve the first battle, fight the second.
+            if *phase != auto.last_phase {
+                auto.last_phase = *phase;
+                auto.wait_from = f;
+            }
+            let since = f - auto.wait_from;
+            match *phase {
+                Phase::Campaign if !camp.turn_open && since > 10 => {
+                    let turn = camp.c.as_ref().map_or(0, |c| c.turn);
+                    if turn >= 9 || camp.c.as_ref().is_some_and(|c| c.winner.is_some()) {
+                        shot(&mut commands, "14-campaign-later");
+                        next(&mut auto);
+                    } else {
+                        requests.write(AppRequest::EndTurn);
+                        auto.wait_from = f;
+                    }
+                }
+                Phase::PreBattle if since == 10 && auto.prebattles == 0 => {
+                    shot(&mut commands, "11-prebattle");
+                }
+                Phase::PreBattle if since > 25 => {
+                    auto.prebattles += 1;
+                    if auto.prebattles == 1 {
+                        requests.write(AppRequest::AutoResolve);
+                    } else if auto.prebattles == 2 {
+                        requests.write(AppRequest::Fight);
+                    } else {
+                        requests.write(AppRequest::AutoResolve);
+                    }
+                    auto.wait_from = f;
+                }
+                Phase::Battle if since > 10 && (speed.paused || speed.mult != 8) => {
+                    speed.paused = false;
+                    speed.mult = 8;
+                }
+                Phase::Battle if battle.time > 60.0 && !auto.shot_campaign_battle => {
+                    auto.shot_campaign_battle = true;
+                    shot(&mut commands, "12-campaign-battle");
+                }
+                Phase::Over if since == 10 => {
+                    shot(&mut commands, "13-campaign-battle-result");
+                }
+                Phase::Over if since > 25 => {
+                    requests.write(AppRequest::ReturnToCampaign);
+                    auto.wait_from = f;
+                }
+                _ => {}
+            }
+        }
+        15 if since == 30 => {
             exit.write(AppExit::Success);
         }
         _ => {}
     }
-    if f > 60 * 60 * 10 {
+    if f > 60 * 60 * 20 {
         panic!("autoplay timed out at step {}", auto.step);
     }
 }

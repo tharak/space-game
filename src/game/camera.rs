@@ -96,7 +96,9 @@ pub fn apply_camera(
     mut rig: ResMut<CameraRig>,
     battle: Res<Battle>,
     divs: Query<&Division>,
+    phase: Res<super::flow::Phase>,
 ) {
+    let campaign = super::campaign_ui::in_campaign(*phase);
     let win = Vec2::new(window.width(), window.height());
     if win.x <= 1.0 || win.y <= 1.0 {
         return;
@@ -108,7 +110,10 @@ pub fn apply_camera(
     if rig.area.width() < 1.0 {
         rig.area = map_area(win);
     }
-    if rig.fit_pending && !divs.is_empty() {
+    if rig.fit_pending && campaign {
+        rig.fit_pending = false;
+        rig.fit(super::campaign_ui::MAP_RECT);
+    } else if rig.fit_pending && !divs.is_empty() {
         rig.fit_pending = false;
         let (mut min, mut max) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
         for d in &divs {
@@ -119,7 +124,7 @@ pub fn apply_camera(
         rig.fit(Rect::from_corners(min, max).inflate(60.0));
     }
     // Keep the battle area in view.
-    let b = battle.bounds;
+    let b = if campaign { super::campaign_ui::MAP_RECT } else { battle.bounds };
     if b.width() > 0.0 {
         rig.center = rig.center.clamp(b.min, b.max);
     }

@@ -11,7 +11,7 @@ use super::*;
 
 fn world_for(scenario: usize, ships: usize, ai: AiKind, seed: u32) -> World {
     let mut world = World::new();
-    let settings = SimSettings { scenario, ships, ai: [ai; 2], control: Control::Spectate, mirror: false };
+    let settings = SimSettings { scenario, ships, ai: [ai; 2], control: Control::Spectate, mirror: false, forces: None };
     init_world(&mut world, settings, seed);
     world
 }
@@ -156,4 +156,44 @@ fn every_scenario_ends_before_the_time_limit() {
 fn the_arrow_breaks_through_the_line() {
     let r = simulate(SimSettings { scenario: 0, ships: 240, ..default() }, 3, None);
     assert!(r.first_breakthrough[0].is_some(), "the arrow (Blue) never broke through: {r:?}");
+}
+
+#[test]
+fn campaign_forces_set_sizes_damage_and_modifiers() {
+    use super::scenario::FleetShape;
+    let fast = SideMods { fire_rate: 1.5, ..default() };
+    let forces = [
+        Force { ships: 60, damaged: 30, shape: FleetShape::Arrow, mods: fast },
+        Force { ships: 150, damaged: 0, shape: FleetShape::Line, mods: SideMods::default() },
+    ];
+    let mut world = World::new();
+    init_world(&mut world, SimSettings { forces: Some(forces), control: Control::Spectate, ..default() }, 4);
+    let mut count = [0u32; 2];
+    let mut half = [0u32; 2];
+    for (ship, side) in world.query::<(&Ship, &Side)>().iter(&world) {
+        count[side.0] += 1;
+        if ship.hull < ship.max_hull {
+            half[side.0] += 1;
+        }
+    }
+    assert_eq!(count, [60, 150]);
+    assert_eq!(half, [30, 0]);
+    assert_eq!(world.resource::<Battle>().mods[0].fire_rate, 1.5);
+    let r = simulate(SimSettings { forces: Some(forces), ..default() }, 4, None);
+    assert!(r.survivors[0] <= 60 && r.survivors[1] <= 150);
+    assert!(r.damaged[0] <= r.survivors[0] && r.damaged[1] <= r.survivors[1]);
+    assert_eq!(r.winner, Some(1), "150 fresh ships should beat 60 half-damaged ones");
+}
+
+#[test]
+fn auto_resolve_matches_simulate() {
+    let settings = SimSettings { scenario: 1, ships: 120, ..default() };
+    let full = simulate(settings, 21, None);
+    let mut auto = AutoResolve::new(settings, 21);
+    let r = loop {
+        if let Some(r) = auto.advance(97) {
+            break r;
+        }
+    };
+    assert_eq!((r.winner, r.time, r.survivors), (full.winner, full.time, full.survivors));
 }

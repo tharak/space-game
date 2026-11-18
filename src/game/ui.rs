@@ -17,7 +17,9 @@ use crate::sim::Command;
 use crate::sim::battle::{AiKind, Control, SimSettings};
 use crate::sim::components::Order;
 use crate::sim::formation::Formation;
-use crate::sim::scenario::{SCENARIOS, Scenario};
+use crate::sim::scenario::{FleetShape, SCENARIOS, Scenario};
+use super::campaign_ui::{CampaignState, PLAYER};
+use crate::campaign::state::{absorb_garrison, raise_fleet};
 
 // ---------------------------------------------------------------------------
 // Components
@@ -48,6 +50,18 @@ pub enum UiAction {
     Order(OrderKind),
     MoveMode,
     Formation(Formation),
+    NewCampaign,
+    ContinueCampaign,
+    EndTurn,
+    ReturnToCampaign,
+    Fight,
+    AutoResolve,
+    Withdraw,
+    CampFleet(usize),
+    CampShape(FleetShape),
+    CampHold,
+    CampAbsorb,
+    CampRaise,
 }
 
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
@@ -87,12 +101,26 @@ impl RichText {
 pub struct MenuScreen;
 #[derive(Component)]
 pub struct SidePanel;
+/// Which model text a `RichText` shows.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+pub enum RichSource {
+    Status,
+    Info,
+    CampStatus,
+    CampInfo,
+    PreBattle,
+}
+/// A log list; remembers how many lines it shows.
+#[derive(Component, Default)]
+pub struct LogView {
+    shown: usize,
+    generation: u64,
+}
 #[derive(Component)]
-pub struct StatusText;
-#[derive(Component)]
-pub struct InfoText;
-#[derive(Component)]
-pub struct LogView;
+pub struct ResolvingText;
+/// Whether a save exists (for the menu's Continue button).
+#[derive(Resource, Default)]
+pub struct SaveExists(pub bool);
 /// Which part of the screen a UI node is; drives show/hide and layout.
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
@@ -102,6 +130,9 @@ pub enum Section {
     Orders,
     Crib,
     Log,
+    CampaignPanel,
+    PreBattle,
+    Resolving,
 }
 
 #[derive(Component, Clone, Copy)]
@@ -269,6 +300,17 @@ pub fn setup_ui(mut commands: Commands) {
                     14.0,
                     DIM,
                 ));
+                option_group(c, "Campaign:", &[
+                    ("New campaign", UiAction::NewCampaign),
+                    ("Continue", UiAction::ContinueCampaign),
+                ]);
+                c.spawn(text(
+                    "Command the Meridian Compact's fleets across a galaxy split by the Shroud nebula. Take systems for ship \
+                     income, keep your supply lines to the capital, and fight (or auto-resolve) every battle. Or pick a \
+                     single skirmish below.",
+                    13.0,
+                    DIM,
+                ));
                 option_group(c, "Control:", &[
                     ("Command Blue (left)", UiAction::Control(Control::PlayBlue)),
                     ("Command Red (right)", UiAction::Control(Control::PlayRed)),
@@ -312,7 +354,7 @@ pub fn setup_ui(mut commands: Commands) {
         ))
         .with_children(|s| {
             s.spawn(panel()).with_children(|p| {
-                p.spawn((StatusText, RichText::sized(14.0), Node { flex_direction: FlexDirection::Column, ..default() }));
+                p.spawn((RichSource::Status, RichText::sized(14.0), Node { flex_direction: FlexDirection::Column, ..default() }));
                 p.spawn(row()).with_children(|r| {
                     button(r, "Pause", UiAction::Pause, BtnKind::Primary);
                     for (label, mult) in [("1×", 1), ("2×", 2), ("4×", 4), ("8×", 8)] {
@@ -331,7 +373,7 @@ pub fn setup_ui(mut commands: Commands) {
             });
             s.spawn(panel()).with_children(|p| {
                 p.spawn((
-                    InfoText,
+                    RichSource::Info,
                     RichText::sized(13.5),
                     Node { flex_direction: FlexDirection::Column, min_height: Val::Px(36.0), row_gap: Val::Px(2.0), ..default() },
                 ));
@@ -359,7 +401,7 @@ pub fn setup_ui(mut commands: Commands) {
             });
             s.spawn(panel()).with_children(|p| {
                 p.spawn((
-                    LogView,
+                    LogView::default(),
                     Section::Log,
                     Node {
                         flex_direction: FlexDirection::Column,
@@ -435,11 +477,131 @@ pub fn setup_ui(mut commands: Commands) {
                 card.spawn(row()).with_children(|r| {
                     button(r, "Copy result line", UiAction::Copy, BtnKind::Normal);
                     button(r, "Play again", UiAction::Restart, BtnKind::Primary);
+                    button(r, "Return to campaign", UiAction::ReturnToCampaign, BtnKind::Primary);
                     button(r, "View battlefield", UiAction::CloseOverlay, BtnKind::Normal);
                     button(r, "Menu", UiAction::Menu, BtnKind::Normal);
                 });
             });
         });
+}
+
+fn overlay_card(commands: &mut Commands, section: Section, build: impl FnOnce(&mut ChildSpawnerCommands)) {
+    commands
+        .spawn((
+            section,
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                padding: UiRect::all(Val::Px(16.0)),
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            GlobalZIndex(20),
+        ))
+        .with_children(|o| {
+            o.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    max_width: Val::Px(600.0),
+                    padding: UiRect::axes(Val::Px(26.0), Val::Px(20.0)),
+                    border: UiRect::all(Val::Px(1.0)),
+                    border_radius: BorderRadius::all(Val::Px(10.0)),
+                    row_gap: Val::Px(10.0),
+                    ..default()
+                },
+                BackgroundColor(PANEL),
+                BorderColor::all(GOLD),
+            ))
+            .with_children(build);
+        });
+}
+
+pub fn setup_campaign_ui(mut commands: Commands) {
+    commands
+        .spawn((
+            SidePanel,
+            Section::CampaignPanel,
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(0.0),
+                top: Val::Px(0.0),
+                width: Val::Px(PANEL_W),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                padding: UiRect::all(Val::Px(10.0)),
+                overflow: Overflow::scroll_y(),
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(BG.with_alpha(0.94)),
+            ScrollPosition::default(),
+            RelativeCursorPosition::default(),
+            GlobalZIndex(5),
+        ))
+        .with_children(|s| {
+            s.spawn(panel()).with_children(|p| {
+                p.spawn((RichSource::CampStatus, RichText::sized(13.5), Node { flex_direction: FlexDirection::Column, ..default() }));
+                p.spawn(row()).with_children(|r| {
+                    button(r, "End turn ▶", UiAction::EndTurn, BtnKind::Primary);
+                    button(r, "Menu", UiAction::Menu, BtnKind::Normal);
+                });
+            });
+            s.spawn(panel()).with_children(|p| {
+                p.spawn(Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(3.0), ..default() }).with_children(|l| {
+                    for i in 0..crate::campaign::state::MAX_FLEETS {
+                        list_button(l, UiAction::CampFleet(i));
+                    }
+                });
+            });
+            s.spawn(panel()).with_children(|p| {
+                p.spawn((
+                    RichSource::CampInfo,
+                    RichText::sized(13.0),
+                    Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0), ..default() },
+                ));
+                p.spawn(row()).with_children(|r| {
+                    button(r, "Hold", UiAction::CampHold, BtnKind::Normal);
+                    button(r, "Absorb garrison", UiAction::CampAbsorb, BtnKind::Normal);
+                    button(r, "Raise fleet", UiAction::CampRaise, BtnKind::Normal);
+                });
+                p.spawn(row()).with_children(|r| {
+                    for shape in FleetShape::ALL {
+                        button(r, shape.name(), UiAction::CampShape(shape), BtnKind::Choice);
+                    }
+                });
+            });
+            s.spawn(panel()).with_children(|p| {
+                p.spawn((
+                    LogView::default(),
+                    Section::Log,
+                    Node { flex_direction: FlexDirection::Column, height: Val::Px(220.0), overflow: Overflow::scroll_y(), ..default() },
+                    ScrollPosition::default(),
+                    RelativeCursorPosition::default(),
+                ));
+            });
+        });
+
+    overlay_card(&mut commands, Section::PreBattle, |card| {
+        card.spawn((RichSource::PreBattle, RichText::sized(14.0), Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(4.0), ..default() }));
+        card.spawn(text("Your formation:", 13.0, GOLD));
+        card.spawn(row()).with_children(|r| {
+            for shape in FleetShape::ALL {
+                button(r, shape.name(), UiAction::CampShape(shape), BtnKind::Choice);
+            }
+        });
+        card.spawn(row()).with_children(|r| {
+            button(r, "Fight it", UiAction::Fight, BtnKind::Primary);
+            button(r, "Auto-resolve", UiAction::AutoResolve, BtnKind::Normal);
+            button(r, "Withdraw (lose 10%)", UiAction::Withdraw, BtnKind::Danger);
+        });
+    });
+    overlay_card(&mut commands, Section::Resolving, |card| {
+        card.spawn((ResolvingText, text("", 15.0, TEXT)));
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +618,7 @@ pub fn handle_buttons(
     mut sel: ResMut<Selection>,
     mut crib: ResMut<CribOpen>,
     mut overlay_hidden: ResMut<OverlayHidden>,
+    mut camp: ResMut<CampaignState>,
     model: Res<UiModel>,
 ) {
     for (interaction, action, enabled) in &buttons {
@@ -516,8 +679,84 @@ pub fn handle_buttons(
                     orders.write(Command::Formation { division, formation });
                 }
             }
+            UiAction::NewCampaign => {
+                requests.write(AppRequest::NewCampaign);
+            }
+            UiAction::ContinueCampaign => {
+                requests.write(AppRequest::ContinueCampaign);
+            }
+            UiAction::EndTurn => {
+                requests.write(AppRequest::EndTurn);
+            }
+            UiAction::ReturnToCampaign => {
+                requests.write(AppRequest::ReturnToCampaign);
+            }
+            UiAction::Fight => {
+                requests.write(AppRequest::Fight);
+            }
+            UiAction::AutoResolve => {
+                requests.write(AppRequest::AutoResolve);
+            }
+            UiAction::Withdraw => {
+                requests.write(AppRequest::Withdraw);
+            }
+            UiAction::CampFleet(i) => {
+                if let Some(row) = model.campaign.fleets.get(i) {
+                    camp.fleet = Some(row.id);
+                    let at = camp.c.as_ref().and_then(|c| c.fleet(row.id)).and_then(|f| f.at());
+                    camp.system = at;
+                }
+            }
+            UiAction::CampShape(shape) => {
+                if model.phase == Phase::PreBattle {
+                    camp.shape = shape;
+                } else if let Some(id) = camp.fleet
+                    && let Some(f) = camp.c.as_mut().and_then(|c| c.fleet_mut(id)).filter(|f| f.side == PLAYER)
+                {
+                    f.shape = shape;
+                }
+            }
+            UiAction::CampHold => {
+                if let Some(id) = camp.fleet
+                    && let Some(f) = camp.c.as_mut().and_then(|c| c.fleet_mut(id)).filter(|f| f.side == PLAYER)
+                {
+                    f.path.clear();
+                }
+            }
+            UiAction::CampAbsorb => {
+                if let Some(id) = camp.fleet
+                    && let Some(c) = camp.c.as_mut()
+                {
+                    absorb_garrison(c, id);
+                }
+            }
+            UiAction::CampRaise => {
+                if let Some(s) = camp.system
+                    && let Some(c) = camp.c.as_mut()
+                    && let Some(id) = raise_fleet(c, PLAYER, s)
+                {
+                    camp.fleet = Some(id);
+                }
+            }
         }
     }
+}
+
+fn campaign_state(action: UiAction, model: &UiModel) -> Option<(bool, bool, bool)> {
+    let m = &model.campaign;
+    Some(match action {
+        UiAction::NewCampaign => (true, false, true),
+        UiAction::ContinueCampaign => (model.has_save, false, true),
+        UiAction::EndTurn => (m.can_end_turn, false, true),
+        UiAction::ReturnToCampaign => (true, false, model.campaign_battle),
+        UiAction::Restart => (true, false, !model.campaign_battle),
+        UiAction::Fight | UiAction::AutoResolve | UiAction::Withdraw => (model.phase == Phase::PreBattle, false, true),
+        UiAction::CampShape(s) => (model.phase == Phase::PreBattle || m.fleet_selected, m.shape == Some(s), true),
+        UiAction::CampHold => (m.fleet_selected, false, true),
+        UiAction::CampAbsorb => (m.can_absorb, false, true),
+        UiAction::CampRaise => (m.can_raise, false, true),
+        _ => return None,
+    })
 }
 
 fn set_label(texts: &mut Query<(&mut Text, &mut TextColor)>, labels: &BtnLabel, s: &str, color: Option<Color>) {
@@ -544,7 +783,23 @@ pub fn update_button_state(
     mut texts: Query<(&mut Text, &mut TextColor)>,
 ) {
     for (action, mut enabled, mut selected, mut node, labels) in &mut buttons {
-        let (on, sel, visible) = match *action {
+        if let UiAction::CampFleet(i) = *action {
+            let (on, sel, visible) = match model.campaign.fleets.get(i) {
+                Some(row) => {
+                    set_label(&mut texts, labels, &row.text, Some(row.color));
+                    (true, row.selected, true)
+                }
+                None => (false, false, false),
+            };
+            enabled.0 = on;
+            selected.0 = sel;
+            let display = if visible { Display::Flex } else { Display::None };
+            if node.display != display {
+                node.display = display;
+            }
+            continue;
+        }
+        let (on, sel, visible) = if let Some(state) = campaign_state(*action, &model) { state } else { match *action {
             UiAction::Pause => {
                 set_label(&mut texts, labels, if model.paused { "▶ Resume" } else { "Pause" }, None);
                 (model.phase == Phase::Battle, model.paused, true)
@@ -569,7 +824,7 @@ pub fn update_button_state(
             UiAction::Ships(v) => (true, settings.ships == v, true),
             UiAction::Ai(v) => (true, settings.ai[0] == v, true),
             _ => (true, false, true),
-        };
+        } };
         if enabled.0 != on {
             enabled.0 = on;
         }
@@ -654,14 +909,23 @@ fn set_rich(commands: &mut Commands, entity: Entity, rich: &mut RichText, lines:
 pub fn update_texts(
     mut commands: Commands,
     model: Res<UiModel>,
-    mut status: Query<(Entity, &mut RichText), (With<StatusText>, Without<InfoText>)>,
-    mut info: Query<(Entity, &mut RichText), (With<InfoText>, Without<StatusText>)>,
+    mut rich: Query<(Entity, &RichSource, &mut RichText)>,
+    mut resolving: Query<&mut Text, With<ResolvingText>>,
 ) {
-    if let Ok((e, mut r)) = status.single_mut() {
-        set_rich(&mut commands, e, &mut r, &model.status);
+    for (e, source, mut r) in &mut rich {
+        let lines = match source {
+            RichSource::Status => &model.status,
+            RichSource::Info => &model.info,
+            RichSource::CampStatus => &model.campaign.status,
+            RichSource::CampInfo => &model.campaign.info,
+            RichSource::PreBattle => &model.campaign.prebattle,
+        };
+        set_rich(&mut commands, e, &mut r, lines);
     }
-    if let Ok((e, mut r)) = info.single_mut() {
-        set_rich(&mut commands, e, &mut r, &model.info);
+    for mut t in &mut resolving {
+        if t.0 != model.campaign.resolving {
+            t.0 = model.campaign.resolving.clone();
+        }
     }
 }
 
@@ -677,10 +941,14 @@ pub fn update_layout(
     let portrait = is_portrait(win);
     let in_menu = model.phase == Phase::Menu;
     let over = model.phase == Phase::Over && model.result.is_some() && !overlay_hidden.0;
+    let campaign = super::campaign_ui::in_campaign(model.phase);
     for (mut node, section) in &mut sections {
         let visible = match section {
             Section::Menu => in_menu,
-            Section::Panel => !in_menu,
+            Section::Panel => model.phase.in_battle(),
+            Section::CampaignPanel => campaign,
+            Section::PreBattle => model.phase == Phase::PreBattle,
+            Section::Resolving => model.phase == Phase::Resolving,
             Section::Overlay => over,
             Section::Orders => !model.spectate,
             Section::Crib => crib.0,
@@ -691,7 +959,7 @@ pub fn update_layout(
             node.display = display;
         }
         match section {
-            Section::Panel => {
+            Section::Panel | Section::CampaignPanel => {
                 let (w, h, top) = if portrait {
                     (Val::Percent(100.0), Val::Px(panel_height(win)), Val::Px(win.y - panel_height(win)))
                 } else {
@@ -726,32 +994,25 @@ pub fn update_layout(
     }
 }
 
-/// Appends new log lines and keeps the log scrolled to the bottom.
-pub fn sync_log(
-    mut commands: Commands,
-    log: Res<LogBook>,
-    view: Single<(Entity, Option<&Children>, &mut ScrollPosition), With<LogView>>,
-    mut shown: Local<usize>,
-    mut generation: Local<u64>,
-) {
-    if !log.is_changed() {
-        return;
-    }
-    let (entity, children, mut scroll) = view.into_inner();
-    if *generation != log.generation {
-        *generation = log.generation;
-        commands.entity(entity).despawn_related::<Children>();
-        *shown = 0;
-    }
-    let _ = children;
-    if log.lines.len() > *shown {
-        commands.entity(entity).with_children(|p| {
-            for (line, tone) in &log.lines[*shown..] {
-                p.spawn((text(line.clone(), 12.5, tone_color(*tone)), Node { flex_shrink: 0.0, ..default() }));
-            }
-        });
-        *shown = log.lines.len();
-        scroll.0.y = 1.0e7;
+/// Appends new log lines to every log view and keeps it scrolled to the
+/// bottom.
+pub fn sync_log(mut commands: Commands, log: Res<LogBook>, mut views: Query<(Entity, &mut LogView, &mut ScrollPosition)>) {
+    for (entity, mut view, mut scroll) in &mut views {
+        if view.generation != log.generation {
+            view.generation = log.generation;
+            commands.entity(entity).despawn_related::<Children>();
+            view.shown = 0;
+        }
+        if log.lines.len() > view.shown {
+            let start = view.shown.max(log.lines.len().saturating_sub(300));
+            commands.entity(entity).with_children(|p| {
+                for (line, tone) in &log.lines[start..] {
+                    p.spawn((text(line.clone(), 12.5, tone_color(*tone)), Node { flex_shrink: 0.0, ..default() }));
+                }
+            });
+            view.shown = log.lines.len();
+            scroll.0.y = 1.0e7;
+        }
     }
 }
 
@@ -761,7 +1022,7 @@ pub fn scroll(
     touches: Res<Touches>,
     model: Res<UiModel>,
     mut menu: Query<&mut ScrollPosition, (With<MenuScreen>, Without<SidePanel>, Without<LogView>)>,
-    mut panel: Query<(&mut ScrollPosition, &RelativeCursorPosition), (With<SidePanel>, Without<MenuScreen>, Without<LogView>)>,
+    mut panel: Query<(&mut ScrollPosition, &RelativeCursorPosition, &Node), (With<SidePanel>, Without<MenuScreen>, Without<LogView>)>,
     mut log: Query<(&mut ScrollPosition, &RelativeCursorPosition), (With<LogView>, Without<MenuScreen>, Without<SidePanel>)>,
 ) {
     let mut dy = 0.0;
@@ -779,22 +1040,16 @@ pub fn scroll(
         return;
     }
     if dy != 0.0 {
-        if let Ok((mut s, cursor)) = log.single_mut()
-            && cursor.cursor_over()
-        {
-            s.0.y = (s.0.y - dy).max(0.0);
-            return;
-        }
-        if let Ok((mut s, cursor)) = panel.single_mut()
-            && cursor.cursor_over()
-        {
-            s.0.y = (s.0.y - dy).max(0.0);
+        for (mut s, cursor) in &mut log {
+            if cursor.cursor_over() {
+                s.0.y = (s.0.y - dy).max(0.0);
+                return;
+            }
         }
     }
-    if touch_dy != 0.0
-        && let Ok((mut s, cursor)) = panel.single_mut()
-        && cursor.cursor_over()
-    {
-        s.0.y = (s.0.y - touch_dy).max(0.0);
+    for (mut s, cursor, node) in &mut panel {
+        if node.display != Display::None && cursor.cursor_over() {
+            s.0.y = (s.0.y - dy - touch_dy).max(0.0);
+        }
     }
 }

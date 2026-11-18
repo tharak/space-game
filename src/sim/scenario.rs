@@ -3,13 +3,14 @@
 
 use bevy::prelude::*;
 
-use super::battle::{Battle, SimSettings, Tuning};
+use super::battle::{Battle, Force, MIN_FORCE, SideMods, SimSettings, Tuning};
 use super::components::*;
 use super::formation::{self, Formation};
 use super::rng::Rng;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum FleetShape {
+    #[default]
     Line,
     Arrow,
     Crescent,
@@ -18,6 +19,8 @@ pub enum FleetShape {
 }
 
 impl FleetShape {
+    pub const ALL: [FleetShape; 5] = [FleetShape::Line, FleetShape::Arrow, FleetShape::Crescent, FleetShape::Echelon, FleetShape::Columns];
+
     pub fn name(self) -> &'static str {
         match self {
             FleetShape::Line => "Line",
@@ -174,8 +177,23 @@ pub fn spawn_battle(world: &mut World) {
     let settings = *world.resource::<SimSettings>();
     let tuning = world.resource::<Tuning>().clone();
     let scenario = SCENARIOS[settings.scenario.min(SCENARIOS.len() - 1)];
-    let shapes = if settings.mirror { [scenario.fleets[1], scenario.fleets[0]] } else { scenario.fleets };
     let low_supply_side = if settings.mirror { 0 } else { 1 };
+    // Each side's ships, damaged ships, shape and modifiers: from the
+    // campaign forces when given, otherwise from the scenario.
+    let forces: [Force; 2] = match settings.forces {
+        Some(f) => f.map(|f| Force { ships: f.ships.max(MIN_FORCE), damaged: f.damaged.min(f.ships), ..f }),
+        None => {
+            let shapes = if settings.mirror { [scenario.fleets[1], scenario.fleets[0]] } else { scenario.fleets };
+            std::array::from_fn(|side| {
+                let mut mods = SideMods::default();
+                if scenario.low_supply && side == low_supply_side {
+                    mods.fire_rate = tuning.low_supply_fire;
+                    mods.morale = tuning.k_supply;
+                }
+                Force { ships: settings.ships as u32, damaged: 0, shape: shapes[side], mods }
+            })
+        }
+    };
 
     let mut widest: f32 = 0.0;
     let mut start = [0u32; 2];
@@ -183,7 +201,10 @@ pub fn spawn_battle(world: &mut World) {
         let facing = home_facing(side);
         let centre = Vec2::new(if side == 0 { -START_X } else { START_X }, 0.0);
         let rot = Vec2::from_angle(facing);
-        let layout = fleet_layout(shapes[side], settings.ships, tuning.spacing);
+        let layout = fleet_layout(forces[side].shape, forces[side].ships as usize, tuning.spacing);
+        // Damaged ships are spread evenly through the fleet.
+        let (total, damaged) = (forces[side].ships, forces[side].damaged);
+        let mut spawned = 0u32;
         for (i, spec) in layout.iter().enumerate() {
             let slots = formation::layout(spec.formation, spec.ships, tuning.spacing);
             let (depth, half_width) = formation::extent(&slots);
@@ -221,9 +242,12 @@ pub fn spawn_battle(world: &mut World) {
                     (rng.range(-1.5, 1.5), rng.range(-1.5, 1.5), rng.range(0.0, tuning.cooldown))
                 };
                 let flagship = flag_slot == Some(k);
-                let hull = if flagship { tuning.flagship_hull } else { tuning.hull };
+                let max_hull = if flagship { tuning.flagship_hull } else { tuning.hull };
+                let is_damaged = !flagship && (spawned as u64 * damaged as u64 / total.max(1) as u64) != ((spawned as u64 + 1) * damaged as u64 / total.max(1) as u64);
+                spawned += 1;
+                let hull = if is_damaged { (max_hull * 0.5).ceil() } else { max_hull };
                 let mut ship = world.spawn((
-                    Ship { hull, max_hull: hull },
+                    Ship { hull, max_hull },
                     Side(side),
                     Pos(anchor + div_rot.rotate(*slot) + Vec2::new(jx, jy)),
                     Vel::default(),
@@ -241,16 +265,9 @@ pub fn spawn_battle(world: &mut World) {
     }
 
     let half_h = (widest + 500.0).max(1300.0);
-    let fire_rate = if scenario.low_supply {
-        let mut f = [1.0; 2];
-        f[low_supply_side] = tuning.low_supply_fire;
-        f
-    } else {
-        [1.0; 2]
-    };
     *world.resource_mut::<Battle>() = Battle {
         start,
-        fire_rate,
+        mods: forces.map(|f| f.mods),
         bounds: Rect::new(-1800.0, -half_h, 1800.0, half_h),
         ..default()
     };

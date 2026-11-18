@@ -4,6 +4,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub mod autoplay;
 pub mod camera;
+pub mod campaign_ui;
 pub mod flow;
 pub mod input;
 pub mod model;
@@ -59,19 +60,24 @@ impl Plugin for GamePlugin {
             .init_resource::<input::MoveDrag>()
             .init_resource::<view::Fx>()
             .init_resource::<ui::CribOpen>()
+            .init_resource::<campaign_ui::CampaignState>()
+            .insert_resource(ui::SaveExists(crate::campaign::save::load().is_some()))
             .add_message::<SimEvent>()
             .add_message::<Command>()
             .add_message::<flow::AppRequest>()
             .add_schedule(build_schedule())
             .init_gizmo_group::<view::ThinGizmos>()
             .configure_sets(Update, (Stage::Input, Stage::Apply, Stage::Model, Stage::Present).chain())
-            .add_systems(Startup, (camera::setup_camera, view::setup_view, ui::setup_ui))
+            .add_systems(
+                Startup,
+                (camera::setup_camera, view::setup_view, ui::setup_ui, ui::setup_campaign_ui, campaign_ui::setup_campaign_map),
+            )
             .add_systems(FixedUpdate, flow::run_sim)
             .add_systems(
                 Update,
                 (
-                    (ui::handle_buttons, input::keyboard, input::pointer, ui::scroll).in_set(Stage::Input),
-                    flow::apply_requests.in_set(Stage::Apply),
+                    (ui::handle_buttons, input::keyboard, input::pointer, campaign_ui::campaign_pointer, ui::scroll).in_set(Stage::Input),
+                    (flow::apply_requests, campaign_ui::process_turn, campaign_ui::tick_resolving).chain().in_set(Stage::Apply),
                     model::build_model.in_set(Stage::Model),
                     (
                         flow::log_events,
@@ -87,6 +93,8 @@ impl Plugin for GamePlugin {
                         view::sync_labels,
                         view::draw_fx,
                         view::draw_overlays,
+                        campaign_ui::sync_campaign_visuals,
+                        campaign_ui::draw_campaign,
                     )
                         .chain()
                         .in_set(Stage::Present),

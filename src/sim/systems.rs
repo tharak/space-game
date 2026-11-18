@@ -59,7 +59,7 @@ pub fn home_dir(side: usize) -> Vec2 {
 
 /// Moves each division's anchor and wheels its facing according to its
 /// order and morale.
-pub fn steer_divisions(mut divs: Query<(Entity, &mut Division)>, hash: Res<SpatialHash>, tuning: Res<Tuning>) {
+pub fn steer_divisions(mut divs: Query<(Entity, &mut Division)>, hash: Res<SpatialHash>, tuning: Res<Tuning>, battle: Res<Battle>) {
     let mut targets: Vec<(Entity, Option<Vec2>)> = Vec::new();
     let mut fighting: Vec<(Entity, usize, Vec2)> = Vec::new();
     for (e, d) in &divs {
@@ -88,7 +88,8 @@ pub fn steer_divisions(mut divs: Query<(Entity, &mut Division)>, hash: Res<Spati
                 d.order = Order::Engage(*t);
             }
         }
-        let base = tuning.anchor_speed;
+        let m = battle.mods[d.side];
+        let base = tuning.anchor_speed * m.speed;
         let ahead = |d: &Division| d.anchor + d.forward() * 100.0;
         let (goal, facing, speed) = if d.morale == Morale::Routed {
             let home = home_dir(d.side);
@@ -138,7 +139,7 @@ pub fn steer_divisions(mut divs: Query<(Entity, &mut Division)>, hash: Res<Spati
                 Order::Withdraw => (Some(d.anchor + home_dir(d.side) * 200.0), d.facing, base * 0.7),
             }
         };
-        d.facing = turn_toward(d.facing, facing, tuning.div_turn_rate * DT);
+        d.facing = turn_toward(d.facing, facing, tuning.div_turn_rate * m.turn * DT);
         if let Some(goal) = goal {
             let to = goal - d.anchor;
             let dist = to.length();
@@ -159,15 +160,17 @@ pub fn steer_ships(
     mut ships: Query<(&mut Vel, &mut Heading, &Pos, &Slot, &InDivision, &Weapon)>,
     divs: Query<&Division>,
     tuning: Res<Tuning>,
+    battle: Res<Battle>,
 ) {
     for (mut vel, mut heading, pos, slot, div, weapon) in &mut ships {
         let Ok(d) = divs.get(div.0) else { continue };
+        let speed = battle.mods[d.side].speed;
         let target = d.to_world(slot.0);
         let to = target - pos.0;
         let max = match (d.morale, d.order) {
             (Morale::Routed, _) => tuning.rout_speed,
-            (_, Order::Charge) => tuning.ship_speed * tuning.charge_mult,
-            _ => tuning.ship_speed,
+            (_, Order::Charge) => tuning.ship_speed * tuning.charge_mult * speed,
+            _ => tuning.ship_speed * speed,
         };
         let len = to.length();
         let desired = if len > 0.5 { to / len * (len * 0.8).min(max) } else { Vec2::ZERO };
@@ -304,7 +307,7 @@ pub fn fire(
         let arc = incoming_arc(target.pos, target.heading, p);
         let hit = rng.chance(hit_chance(&tuning, arc, dist));
         let slow = if d.morale == Morale::Shaken { tuning.shaken_cooldown } else { 1.0 };
-        weapon.cooldown = tuning.cooldown * slow / battle.fire_rate[s].max(0.1) * rng.range(0.85, 1.15);
+        weapon.cooldown = tuning.cooldown * slow / battle.mods[s].fire_rate.max(0.1) * rng.range(0.85, 1.15);
         weapon.aim = Some(target.pos - p);
         events.write(SimEvent::Shot { from: p, to: target.pos, side: s, hit });
         contact.push(div.0);
@@ -474,7 +477,7 @@ pub fn morale(
 
     let flag_pos: Vec<(Vec2, usize)> = flagships.iter().map(|(p, s)| (p.0, s.0)).collect();
     let flag_lost = battle.flag_lost;
-    let fire_rate = battle.fire_rate;
+    let mods = battle.mods;
     for (e, mut d) in &mut divs {
         if d.morale == Morale::Routed || d.alive == 0 {
             continue;
@@ -486,7 +489,7 @@ pub fn morale(
         let stress = d.shock * tuning.k_shock
             + lost * tuning.k_lost
             + if flag_lost[d.side] { tuning.k_flag_lost } else { 0.0 }
-            + if fire_rate[d.side] < 1.0 { tuning.k_supply } else { 0.0 }
+            + mods[d.side].morale
             - if in_command { tuning.k_command } else { 0.0 }
             + rng.range(-tuning.noise, tuning.noise);
         let next = match d.morale {

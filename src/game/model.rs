@@ -45,6 +45,10 @@ pub struct UiModel {
     pub move_mode: bool,
     pub formation: Option<crate::sim::formation::Formation>,
     pub result: Option<ResultView>,
+    pub campaign: super::campaign_ui::CampaignModel,
+    /// The battle on screen belongs to the campaign.
+    pub campaign_battle: bool,
+    pub has_save: bool,
 }
 
 fn span(s: impl Into<String>, c: Color) -> (String, Color) {
@@ -65,9 +69,23 @@ pub fn build_model(world: &mut World) {
         mult: speed.mult,
         ..default()
     };
+    m.has_save = world.resource::<super::ui::SaveExists>().0;
     if phase == Phase::Menu {
         *world.resource_mut::<UiModel>() = m;
         return;
+    }
+    let campaign_title = {
+        let st = world.resource::<super::campaign_ui::CampaignState>();
+        st.battle.is_some().then(|| st.resolving_name.clone())
+    };
+    {
+        let st = world.resource::<super::campaign_ui::CampaignState>();
+        m.campaign_battle = st.battle.is_some();
+        if super::campaign_ui::in_campaign(phase) {
+            m.campaign = super::campaign_ui::build_campaign_model(st, phase);
+            *world.resource_mut::<UiModel>() = m;
+            return;
+        }
     }
     let mut divs: Vec<(Entity, Division)> = world.query::<(Entity, &Division)>().iter(world).map(|(e, d)| (e, d.clone())).collect();
     divs.sort_by_key(|(_, d)| (d.side, d.number));
@@ -77,6 +95,7 @@ pub fn build_model(world: &mut World) {
 
     // Status: the clock and each fleet's strength.
     let scenario = SCENARIOS[settings.scenario];
+    let title: String = campaign_title.clone().unwrap_or_else(|| scenario.title.to_string());
     let state = if phase == Phase::Over {
         "ended"
     } else if speed.paused {
@@ -85,7 +104,7 @@ pub fn build_model(world: &mut World) {
         ""
     };
     m.status.push(vec![
-        span(format!("{}  ", scenario.title), GOLD),
+        span(format!("{title}  "), GOLD),
         span(clock(battle.time), TEXT),
         span(format!("  ×{} {state}", speed.mult), DIM),
     ]);
@@ -178,7 +197,7 @@ pub fn build_model(world: &mut World) {
         };
         let line = format!(
             "{} | ctrl={} | ships={} | ai={} | winner={} | time={} | lost {}-{} | destroyed {}-{}",
-            scenario.title,
+            title,
             settings.control.tag(),
             settings.ships,
             settings.ai[0].tag(),

@@ -160,7 +160,7 @@ pub fn sync_labels(
             continue;
         };
         have.push(label.0);
-        let shown = *phase != Phase::Menu && d.alive > 0;
+        let shown = phase.in_battle() && d.alive > 0;
         vis.set_if_neq(if shown { Visibility::Inherited } else { Visibility::Hidden });
         if !shown {
             continue;
@@ -212,7 +212,7 @@ pub fn collect_fx(mut events: MessageReader<SimEvent>, mut fx: ResMut<Fx>) {
 }
 
 pub fn draw_fx(time: Res<Time>, phase: Res<Phase>, mut fx: ResMut<Fx>, mut gizmos: Gizmos<ThinGizmos>) {
-    if *phase == Phase::Menu {
+    if !phase.in_battle() {
         fx.lasers.clear();
         fx.booms.clear();
         return;
@@ -272,7 +272,7 @@ pub fn draw_overlays(
     mut gizmos: Gizmos,
     mut thin: Gizmos<ThinGizmos>,
 ) {
-    if *phase == Phase::Menu {
+    if !phase.in_battle() {
         return;
     }
     // Backdrop grid and the edge of the battle area.

@@ -49,6 +49,39 @@ impl AiKind {
     }
 }
 
+/// Per-side battle modifiers: supply, admiral traits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SideMods {
+    /// Fire-rate multiplier (supply, gunnery).
+    pub fire_rate: f32,
+    /// Added to morale stress every check (positive = shakier).
+    pub morale: f32,
+    /// Multiplier on movement speed.
+    pub speed: f32,
+    /// Multiplier on how fast divisions wheel.
+    pub turn: f32,
+}
+
+impl Default for SideMods {
+    fn default() -> Self {
+        Self { fire_rate: 1.0, morale: 0.0, speed: 1.0, turn: 1.0 }
+    }
+}
+
+/// One side of a campaign battle: how many ships, in what shape, and how
+/// they fight.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Force {
+    pub ships: u32,
+    /// Of `ships`, how many start damaged (half hull).
+    pub damaged: u32,
+    pub shape: super::scenario::FleetShape,
+    pub mods: SideMods,
+}
+
+/// Fewest ships a side can field in a battle.
+pub const MIN_FORCE: u32 = 12;
+
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct SimSettings {
     pub scenario: usize,
@@ -58,11 +91,13 @@ pub struct SimSettings {
     pub ai: [AiKind; 2],
     /// Swap which fleet each side gets (for seat-balanced sims).
     pub mirror: bool,
+    /// A campaign battle: replaces the scenario's fleets when set.
+    pub forces: Option<[Force; 2]>,
 }
 
 impl Default for SimSettings {
     fn default() -> Self {
-        Self { scenario: 0, ships: 240, control: Control::PlayBlue, ai: [AiKind::Commander; 2], mirror: false }
+        Self { scenario: 0, ships: 240, control: Control::PlayBlue, ai: [AiKind::Commander; 2], mirror: false, forces: None }
     }
 }
 
@@ -170,8 +205,8 @@ pub struct Battle {
     pub destroyed: [u32; 2],
     pub fled: [u32; 2],
     pub flag_lost: [bool; 2],
-    /// Fire-rate multiplier per side (supply).
-    pub fire_rate: [f32; 2],
+    /// Per-side modifiers (supply, admirals).
+    pub mods: [SideMods; 2],
     pub bounds: Rect,
     pub result: Option<Outcome>,
     pub first_contact: Option<f32>,
