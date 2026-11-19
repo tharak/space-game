@@ -427,7 +427,7 @@ pub fn setup_ui(mut commands: Commands) {
                     for (line, color) in [
                         ("Hit chance by the target's arc you fire into:", GOLD),
                         ("  front 12% · flank 25% · rear 40%  (less at long range)", TEXT),
-                        ("Guns fire in a 60° cone ahead. Ships can only turn a little away from their division's facing, so a division hit from behind must wheel to answer.", DIM),
+                        ("Guns fire in a 60° cone ahead. Ships can only turn a little away from their division's facing, so a division hit from behind must wheel to answer. Ships shoot the nearest enemy they can reach, except in Arrow and Crescent fleets, which all shoot the reachable enemy closest to their fleet's centre (concentrated fire).", DIM),
                         ("Enemy ships block movement: to get through a line you must destroy the ships in the way. Deep formations (wedge, column) close ranks as they lose ships; a line keeps its holes.", DIM),
                         ("Morale: recent losses, total losses, a lost flagship and being broken through push a division to Shaken (slower fire, won't advance) and then Routed (flees, counts as lost). Staying within the flagship's command radius steadies it.", DIM),
                         ("There is no break point. The more of a fleet is destroyed or routed, the shakier all its divisions get, until they rout one by one; the battle ends when a side has nothing left fighting. Destroying the flagship shocks every division at once and keeps them shakier: kill it to turn a battle. After 10 minutes the fleet with more hull in the fight wins.", DIM),

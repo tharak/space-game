@@ -220,6 +220,8 @@ pub struct Battle {
     pub flag_lost: [bool; 2],
     /// Per-side modifiers (supply, admirals).
     pub mods: [SideMods; 2],
+    /// Each side's fleet formation (decides how its ships pick targets).
+    pub shapes: [super::scenario::FleetShape; 2],
     pub bounds: Rect,
     pub result: Option<Outcome>,
     pub first_contact: Option<f32>,

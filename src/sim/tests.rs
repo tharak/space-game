@@ -197,3 +197,34 @@ fn auto_resolve_matches_simulate() {
     };
     assert_eq!((r.winner, r.time, r.survivors), (full.winner, full.time, full.survivors));
 }
+
+#[test]
+fn arrow_concentrates_fire_on_the_enemy_nearest_its_centre() {
+    use super::scenario::FleetShape;
+    let forces = [
+        Force { ships: 120, damaged: 0, shape: FleetShape::Arrow, mods: SideMods::default() },
+        Force { ships: 120, damaged: 0, shape: FleetShape::Line, mods: SideMods::default() },
+    ];
+    let mut world = World::new();
+    init_world(&mut world, SimSettings { forces: Some(forces), control: Control::Spectate, ai: [AiKind::Advance; 2], ..default() }, 9);
+    assert!(super::systems::focus_fire(world.resource::<Battle>().shapes[0]));
+    assert!(!super::systems::focus_fire(world.resource::<Battle>().shapes[1]));
+    // Run into contact, then compare where each side's shots land.
+    let (mut arrow, mut line) = (Vec::new(), Vec::new());
+    while world.resource::<Battle>().time < 90.0 && !world.resource::<Battle>().over() {
+        step(&mut world);
+        for ev in world.resource_mut::<Messages<SimEvent>>().drain() {
+            if let SimEvent::Shot { from, to, side, .. } = ev {
+                if side == 0 { arrow.push((from, to)) } else { line.push((from, to)) }
+            }
+        }
+    }
+    assert!(!arrow.is_empty() && !line.is_empty());
+    // Arrow fire converges: its shots land in a much tighter spread across
+    // the front than the Line's nearest-target fire does.
+    let spread = |v: &[(Vec2, Vec2)]| {
+        let m = v.iter().map(|(_, t)| t.y).sum::<f32>() / v.len() as f32;
+        (v.iter().map(|(_, t)| (t.y - m).powi(2)).sum::<f32>() / v.len() as f32).sqrt()
+    };
+    assert!(spread(&arrow) < spread(&line), "arrow spread {} vs line {}", spread(&arrow), spread(&line));
+}

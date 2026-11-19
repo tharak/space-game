@@ -268,6 +268,7 @@ pub fn spawn_battle(world: &mut World) {
     *world.resource_mut::<Battle>() = Battle {
         start,
         mods: forces.map(|f| f.mods),
+        shapes: forces.map(|f| f.shape),
         bounds: Rect::new(-1800.0, -half_h, 1800.0, half_h),
         ..default()
     };

@@ -27,7 +27,9 @@ Formations are Line (2 ranks), Wedge, Crescent, Echelon left/right, and Column. 
 
 * Range is 150. Guns fire in a 60° cone ahead of the ship.
 * A ship can turn up to about 34° away from its division's facing to aim. So a division attacked from behind cannot answer until it wheels.
-* Each ship fires about every 4 s at the nearest enemy in its cone.
+* Each ship fires about every 4 s at an enemy in its cone:
+  * In a **Line, Echelon or Columns** fleet, it shoots the nearest one.
+  * In an **Arrow or Crescent** fleet, it shoots the one closest to its *fleet's centre*. The whole arrow concentrates on whatever is at its point; a crescent concentrates on whatever has come into its cup.
 * The hit chance depends on which arc of the target the shot comes from:
 
 | Into the target's | front (±60°) | flank | rear |

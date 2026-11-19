@@ -233,6 +233,11 @@ pub fn integrate(
     }
 }
 
+/// Formations that concentrate fire on the enemy nearest the fleet's centre.
+pub fn focus_fire(shape: super::scenario::FleetShape) -> bool {
+    matches!(shape, super::scenario::FleetShape::Arrow | super::scenario::FleetShape::Crescent)
+}
+
 /// Which arc of a target (facing `heading`) a shot from `from` lands in:
 /// 0 front, 1 flank, 2 rear.
 pub fn incoming_arc(target: Vec2, heading: f32, from: Vec2) -> usize {
@@ -269,6 +274,24 @@ pub fn fire(
     let mut shock: Vec<(Entity, f32)> = Vec::new();
     let mut closest: Vec<(Entity, f32)> = Vec::new();
     let mut flag_down: Vec<usize> = Vec::new();
+    // Arrow and Crescent fleets concentrate: each ship shoots, of the enemies
+    // it can reach, the one closest to its whole fleet's centre.
+    let focus: [Option<Vec2>; 2] = std::array::from_fn(|side| {
+        if !focus_fire(battle.shapes[side]) {
+            return None;
+        }
+        let (mut sum, mut n) = (Vec2::ZERO, 0.0);
+        let mut ids: Vec<Entity> = hash.divisions.keys().copied().collect();
+        ids.sort();
+        for (e, d) in ids.into_iter().filter_map(|e| divs.get(e).ok().map(|d| (e, d))) {
+            if d.side == side && d.morale != Morale::Routed && d.alive > 0 {
+                let c = hash.centroid(e).unwrap_or(d.anchor);
+                sum += c * d.alive as f32;
+                n += d.alive as f32;
+            }
+        }
+        (n > 0.0).then(|| sum / n)
+    });
     // Iterate in the hash's stable order so a seed always replays the same.
     for i in 0..hash.entries.len() {
         let me = hash.entries[i];
@@ -284,7 +307,7 @@ pub fn fire(
         }
         let (p, h, s) = (pos.0, heading.0, side.0);
         let mut nearest: Option<(Entry, f32)> = None;
-        let mut in_arc: Option<(Entry, f32)> = None;
+        let mut in_arc: Option<(Entry, f32, f32)> = None;
         hash.for_each_within(p, tuning.range, |o, d2| {
             if o.side == s {
                 return;
@@ -293,14 +316,17 @@ pub fn fire(
                 nearest = Some((*o, d2));
             }
             let bearing = (o.pos - p).to_angle();
-            if angle_diff(h, bearing).abs() <= tuning.fire_arc && in_arc.is_none_or(|n| d2 < n.1) {
-                in_arc = Some((*o, d2));
+            if angle_diff(h, bearing).abs() <= tuning.fire_arc {
+                let score = focus[s].map_or(d2, |c| o.pos.distance_squared(c));
+                if in_arc.is_none_or(|n| score < n.2) {
+                    in_arc = Some((*o, d2, score));
+                }
             }
         });
         if let Some((_, n2)) = nearest {
             closest.push((div.0, n2.sqrt()));
         }
-        let Some((target, d2)) = in_arc else {
+        let Some((target, d2, _)) = in_arc else {
             weapon.aim = nearest.map(|(n, _)| n.pos - p);
             continue;
         };

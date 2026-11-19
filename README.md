@@ -40,6 +40,7 @@ Pick a side, a fleet size (120/240/480 ships a side), an opponent and a scenario
 
 The breakthrough is not a scripted rule. It comes out of the simulation:
 
+1. **Concentrated fire.** Every ship in an Arrow (or Crescent) fleet shoots the reachable enemy closest to its fleet's centre, so the whole arrow pours its fire onto the few ships at its point. Other formations shoot whatever is nearest.
 1. **Short range.** Guns have a short range and fire only in a forward cone. Only the part of a line facing the arrow's tip can shoot at it; the rest of the line is out of the fight until it wheels.
 2. **Depth.** A wedge closes ranks as it loses ships, so it always has a full front. A two-rank line keeps its holes.
 3. **Blocking.** Ships stop a quarter of weapon range short of any enemy and never push through, so the arrow grinds into the line by destroying the ships in its way.
