@@ -6,6 +6,22 @@ A real-time fleet battle with hundreds of ships a side, in Rust with [Bevy 0.19]
 
 ## Campaign
 
+## Voronoi labs
+
+The app opens on a start page. A shared **Config** at the top (seed, site count, distance metric, Lloyd rounds) feeds nine labs after the gamegeniuslab tutorial *Voronoi diagrams in game development*:
+
+1. grow the seeds;
+2. nearest site;
+3. owner map;
+4. Delaunay & exact cells;
+5. Lloyd relaxation;
+6. biome island;
+7. faction territories;
+8. cell noise;
+9. paint the island.
+
+The code is in `src/voronoi/`. It's pure functions with its own tests (`cargo test voronoi`). `cargo run --release --example voronoi_dump -- <dir> [seed] [sites]` writes each lab as a PPM. **Fleet battle & campaign →** opens the game menu.
+
 **New campaign** on the menu starts a turn-based war over a galaxy split by an impassable nebula. Two corridors cross it: a fortress in the north, a neutral trade world in the south ([docs/campaign-rules.md](docs/campaign-rules.md)).
 
 * You command the Meridian Compact's fleets, each under an admiral, against the AI Hesper Throne.

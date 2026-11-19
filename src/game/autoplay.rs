@@ -1,5 +1,5 @@
 //! Scripted smoke run for development: `SG_AUTOPLAY=<dir> cargo run`
-//! drives the real app through the menu, one spectated battle per fleet
+//! drives the real app through the start page, two Voronoi labs, the menu, one spectated battle per fleet
 //! shape (each must end with a winner) and the campaign map, saving
 //! screenshots to <dir> and exiting. Not compiled for the web.
 
@@ -9,6 +9,7 @@ use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use super::camera::CameraRig;
 use super::flow::{AppRequest, Phase, SeedSource, Speed};
 use crate::sim::battle::{Battle, Control, SimSettings, Skirmish};
+use crate::voronoi::labs::LabId;
 use crate::sim::components::Division;
 use crate::sim::scenario::SHOWCASE;
 use crate::sim::spatial::SpatialHash;
@@ -65,8 +66,35 @@ pub fn autoplay(
     let name = format!("{:02}-{}-vs-{}", auto.battle + 2, shapes[0].name(), shapes[1].name()).to_lowercase();
     match auto.step {
         0 if f == 40 => {
-            shot(&mut commands, "01-menu");
+            shot(&mut commands, "00-start");
+            auto.step = 99;
+            auto.wait_from = f;
+        }
+        // Screenshots land a frame late, so each page change waits a beat.
+        99 if since == 10 => {
+            requests.write(AppRequest::OpenLab(LabId::Delaunay));
             next(&mut auto);
+        }
+        100 if since == 20 => {
+            shot(&mut commands, "00-lab-delaunay");
+            next(&mut auto);
+        }
+        101 if since == 10 => {
+            requests.write(AppRequest::OpenLab(LabId::Island));
+            next(&mut auto);
+        }
+        102 if since == 20 => {
+            shot(&mut commands, "00-lab-island");
+            next(&mut auto);
+        }
+        103 if since == 10 => {
+            requests.write(AppRequest::Menu);
+            next(&mut auto);
+        }
+        104 if since == 20 => {
+            shot(&mut commands, "01-menu");
+            auto.step = 1;
+            auto.wait_from = f;
         }
         1 if since == 5 => {
             let k = Skirmish { shapes, ..default() };

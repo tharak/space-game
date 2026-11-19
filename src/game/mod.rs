@@ -7,6 +7,7 @@ pub mod camera;
 pub mod campaign_ui;
 pub mod flow;
 pub mod input;
+pub mod lab_ui;
 pub mod model;
 pub mod theme;
 pub mod ui;
@@ -57,6 +58,8 @@ impl Plugin for GamePlugin {
             .init_resource::<model::UiModel>()
             .init_resource::<camera::CameraRig>()
             .init_resource::<ui::SkirmishSetup>()
+            .init_resource::<lab_ui::LabsConfig>()
+            .init_resource::<lab_ui::ActiveSlider>()
             .init_resource::<input::Selection>()
             .init_resource::<input::MoveDrag>()
             .init_resource::<view::Fx>()
@@ -71,7 +74,7 @@ impl Plugin for GamePlugin {
             .configure_sets(Update, (Stage::Input, Stage::Apply, Stage::Model, Stage::Present).chain())
             .add_systems(
                 Startup,
-                (camera::setup_camera, view::setup_view, ui::setup_ui, ui::setup_campaign_ui, campaign_ui::setup_campaign_map),
+                (camera::setup_camera, view::setup_view, ui::setup_ui, lab_ui::setup_labs, ui::setup_campaign_ui, campaign_ui::setup_campaign_map),
             )
             .add_systems(FixedUpdate, flow::run_sim)
             .add_systems(
@@ -80,6 +83,9 @@ impl Plugin for GamePlugin {
                     (ui::handle_buttons, input::keyboard, input::pointer, campaign_ui::campaign_pointer, ui::scroll).in_set(Stage::Input),
                     (flow::apply_requests, campaign_ui::process_turn, campaign_ui::tick_resolving).chain().in_set(Stage::Apply),
                     model::build_model.in_set(Stage::Model),
+                    (lab_ui::handle_lab_buttons, lab_ui::drag_sliders, lab_ui::lab_pointer, lab_ui::scroll_labs).chain().in_set(Stage::Input),
+                    lab_ui::animate_labs.in_set(Stage::Apply),
+                    (lab_ui::render_lab, lab_ui::update_lab_ui, lab_ui::lab_button_state).chain().in_set(Stage::Present).before(ui::style_buttons),
                     (
                         flow::log_events,
                         view::collect_fx,
@@ -109,7 +115,7 @@ impl Plugin for GamePlugin {
 }
 
 /// A little entropy for battle seeds: wall-clock time where available.
-fn random_seed() -> u32 {
+pub(crate) fn random_seed() -> u32 {
     #[cfg(target_arch = "wasm32")]
     {
         (js_now() * 1000.0) as u64 as u32

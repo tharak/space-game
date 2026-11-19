@@ -10,4 +10,5 @@
 pub mod campaign;
 pub mod game;
 pub mod sim;
+pub mod voronoi;
 

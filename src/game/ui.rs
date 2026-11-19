@@ -85,6 +85,16 @@ pub struct Selected(pub bool);
 #[derive(Component)]
 pub struct BtnLabel(Vec<Entity>);
 
+impl BtnLabel {
+    pub fn new(labels: Vec<Entity>) -> Self {
+        Self(labels)
+    }
+
+    pub fn first(&self) -> Option<Entity> {
+        self.0.first().copied()
+    }
+}
+
 #[derive(Component)]
 /// A column of lines, each made of coloured spans.
 pub struct RichText {
@@ -164,11 +174,11 @@ pub struct SkirmishSummary;
 // Builders
 // ---------------------------------------------------------------------------
 
-fn text(s: impl Into<String>, size: f32, color: Color) -> impl Bundle {
+pub(super) fn text(s: impl Into<String>, size: f32, color: Color) -> impl Bundle {
     (Text::new(s), TextFont::from_font_size(size), TextColor(color))
 }
 
-fn panel() -> impl Bundle {
+pub(super) fn panel() -> impl Bundle {
     (
         Node {
             flex_direction: FlexDirection::Column,
@@ -185,11 +195,16 @@ fn panel() -> impl Bundle {
     )
 }
 
-fn row() -> Node {
+pub(super) fn row() -> Node {
     Node { flex_direction: FlexDirection::Row, flex_wrap: FlexWrap::Wrap, column_gap: Val::Px(6.0), row_gap: Val::Px(6.0), ..default() }
 }
 
 fn button(parent: &mut ChildSpawnerCommands, label: &str, action: UiAction, kind: BtnKind) -> Entity {
+    button_for(parent, label, action, kind)
+}
+
+/// A styled button carrying any action component.
+pub(super) fn button_for<A: Component>(parent: &mut ChildSpawnerCommands, label: &str, action: A, kind: BtnKind) -> Entity {
     let mut labels = Vec::new();
     let mut entity = parent.spawn((
         Button,
@@ -237,19 +252,19 @@ fn list_button(parent: &mut ChildSpawnerCommands, action: UiAction) {
 }
 
 /// A labelled row of choice buttons inside a card.
-fn choice_row(parent: &mut ChildSpawnerCommands, title: &str, choices: &[(String, UiAction)]) {
+pub(super) fn choice_row<A: Component + Copy>(parent: &mut ChildSpawnerCommands, title: &str, choices: &[(String, A)]) {
     parent.spawn(Node { align_items: AlignItems::Center, ..row() }).with_children(|r| {
         r.spawn((
             text(title, 13.5, GOLD),
             Node { width: Val::Px(160.0), margin: UiRect::right(Val::Px(6.0)), align_self: AlignSelf::Center, ..default() },
         ));
         for (label, action) in choices {
-            button(r, label, *action, BtnKind::Choice);
+            button_for(r, label, *action, BtnKind::Choice);
         }
     });
 }
 
-fn card_title(parent: &mut ChildSpawnerCommands, title: &str, note: &str) {
+pub(super) fn card_title(parent: &mut ChildSpawnerCommands, title: &str, note: &str) {
     parent.spawn(text(title, 17.0, TEXT));
     parent.spawn(text(note, 13.0, DIM));
 }
@@ -284,6 +299,9 @@ pub fn setup_ui(mut commands: Commands) {
                 ..default()
             })
             .with_children(|c| {
+                c.spawn(row()).with_children(|r| {
+                    button_for(r, "← Labs", super::lab_ui::LabAction::Back, BtnKind::Normal);
+                });
                 c.spawn(text("Successor Stars", 26.0, TEXT));
                 c.spawn((
                     text("Fleets of hundreds of ships, commanded by squadron in real time (pause any time).", 14.0, DIM),
