@@ -1,11 +1,11 @@
 //! prototype01 — Fleet dominion. Space is split into Voronoi regions; some
 //! of them hold a planet. Every planet starts as its own independent
 //! faction that only defends itself. Blue and Red fleets project influence
-//! like growing seeds: each reaches a radius proportional to its ships, and
-//! where patches meet the border sits at distance ÷ ships. At the end of
-//! each turn a planet joins the side of the fleet dominating it if that
-//! fleet has more ships than the planet's defence, and every planet pays
-//! its owner. Contested planets (the other side within 10%) don't change
+//! like growing seeds. A fleet's weight is ships × weight-per-ship; it
+//! reaches reach-per-weight × weight, and where patches meet the border sits
+//! at distance ÷ weight. At the end of each turn a planet joins the side of
+//! the fleet dominating it if that fleet outweighs the planet, and every
+//! planet pays its owner. The three numbers live in [`Tuning`]. Contested planets (the other side within 10%) don't change
 //! hands.
 
 use crate::voronoi::Vec2;
@@ -23,13 +23,23 @@ pub const MIN_SHIPS: u32 = 10;
 pub const MAX_SHIPS: u32 = 200;
 pub const REINFORCE_COST: u32 = 10;
 pub const REINFORCE_SHIPS: u32 = 25;
-/// Planet defence range, in ships.
-pub const MIN_DEFENCE: u32 = 25;
-pub const MAX_DEFENCE: u32 = 150;
-/// Ships that count as influence weight 1.
-pub const SHIPS_PER_WEIGHT: f32 = 50.0;
-/// How far a fleet of weight 1 (50 ships) reaches, in map pixels.
-pub const REACH: f32 = 70.0;
+/// The numbers that shape the prototype, set from sliders.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tuning {
+    /// Influence weight each ship adds.
+    pub weight_per_ship: f32,
+    /// Pixels of reach per point of weight.
+    pub reach_per_weight: f32,
+    /// Every planet's weight: a fleet must outweigh it to take the planet.
+    pub planet_weight: f32,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        // 50 ships = weight 5, reaching 70 px; a starting fleet outweighs a planet.
+        Self { weight_per_ship: 0.1, reach_per_weight: 14.0, planet_weight: 4.0 }
+    }
+}
 /// The other side's best fleet within this fraction contests the ground.
 pub const CONTEST_MARGIN: f32 = 0.10;
 pub const SIDE_NAMES: [&str; 2] = ["Blue", "Red"];
@@ -52,8 +62,8 @@ pub struct Planet {
     pub pos: Vec2,
     /// Resources a turn, 1 (poor) to 3 (rich).
     pub value: u32,
-    /// A fleet needs more ships than this to take the planet.
-    pub defence: u32,
+    /// A fleet must outweigh this to take the planet.
+    pub weight: f32,
     pub owner: Owner,
 }
 
@@ -66,13 +76,13 @@ pub struct FleetToken {
 
 impl FleetToken {
     /// Influence weight: distance ÷ weight decides who dominates.
-    pub fn weight(&self) -> f32 {
-        self.ships as f32 / SHIPS_PER_WEIGHT
+    pub fn weight(&self, t: &Tuning) -> f32 {
+        self.ships as f32 * t.weight_per_ship
     }
 
     /// How far its patch can grow.
-    pub fn reach(&self) -> f32 {
-        REACH * self.weight()
+    pub fn reach(&self, t: &Tuning) -> f32 {
+        t.reach_per_weight * self.weight(t)
     }
 }
 
@@ -93,8 +103,8 @@ pub enum Pressure {
     Contested,
     /// The dominating side already owns it.
     Held(usize),
-    /// The dominating fleet has more ships than the defence: it falls at
-    /// the end of the turn.
+    /// The dominating fleet outweighs the planet: it falls at the end of
+    /// the turn.
     Falls(usize),
     /// The dominating fleet is too weak to take it.
     Resists(usize),
@@ -103,6 +113,7 @@ pub enum Pressure {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Dominion {
     pub cfg: VoronoiConfig,
+    pub tuning: Tuning,
     pub sites: Vec<Vec2>,
     /// Which site owns each pixel.
     pub regions: OwnerGrid,
@@ -119,7 +130,7 @@ pub struct Dominion {
 impl Dominion {
     /// `planets` of the config's sites get a planet (inland regions first,
     /// picked at random from the seed); each side gets `fleets` fleets.
-    pub fn new(cfg: &VoronoiConfig, planets: usize, fleets: usize) -> Self {
+    pub fn new(cfg: &VoronoiConfig, planets: usize, fleets: usize, tuning: Tuning) -> Self {
         let sites = cfg.relaxed_sites();
         let regions = voronoi_grid(&sites, cfg.w, cfg.h, cfg.metric);
         let edge = regions.edge_owners();
@@ -141,10 +152,8 @@ impl Dominion {
             } else {
                 1
             };
-            // Rounded to 5 ships.
-            let defence = ((MIN_DEFENCE as f32 + rng.next_float() * (MAX_DEFENCE - MIN_DEFENCE) as f32) / 5.0).round() as u32 * 5;
             planet_at[site] = Some(list.len());
-            list.push(Planet { site, pos: sites[site], value, defence, owner: Owner::Independent(list.len()) });
+            list.push(Planet { site, pos: sites[site], value, weight: tuning.planet_weight, owner: Owner::Independent(list.len()) });
         }
         // Blue starts in the left third; Red mirrors it.
         let (w, h) = (cfg.w as f32, cfg.h as f32);
@@ -159,7 +168,15 @@ impl Dominion {
                 })
             })
             .collect();
-        Self { cfg: *cfg, sites, regions, planet_at, planets: list, fleets, stock: [0; 2], turn: 1, last_turn: String::new() }
+        Self { cfg: *cfg, tuning, sites, regions, planet_at, planets: list, fleets, stock: [0; 2], turn: 1, last_turn: String::new() }
+    }
+
+    /// New tuning; every planet takes the planet weight (all the same for now).
+    pub fn set_tuning(&mut self, t: Tuning) {
+        self.tuning = t;
+        for p in &mut self.planets {
+            p.weight = t.planet_weight;
+        }
     }
 
     /// Which side's fleets dominate point `p`.
@@ -178,7 +195,7 @@ impl Dominion {
                 (Control::Side(s), fleet) => {
                     if pl.owner == Owner::Side(s) {
                         Pressure::Held(s)
-                    } else if fleet.is_some_and(|f| self.fleets[f].ships > pl.defence) {
+                    } else if fleet.is_some_and(|f| self.fleets[f].weight(&self.tuning) > pl.weight) {
                         Pressure::Falls(s)
                     } else {
                         Pressure::Resists(s)
@@ -258,6 +275,7 @@ impl Dominion {
 
 /// The fleets as weighted influence bases, built once per batch of queries.
 pub struct Influence {
+    reach: f32,
     bases: Vec<Vec2>,
     weights: Vec<f32>,
     sides: Vec<usize>,
@@ -267,16 +285,17 @@ pub struct Influence {
 impl Influence {
     pub fn new(d: &Dominion) -> Self {
         Self {
+            reach: d.tuning.reach_per_weight,
             bases: d.fleets.iter().map(|f| f.pos).collect(),
-            weights: d.fleets.iter().map(|f| f.weight()).collect(),
+            weights: d.fleets.iter().map(|f| f.weight(&d.tuning)).collect(),
             sides: d.fleets.iter().map(|f| f.side).collect(),
             metric: d.cfg.metric,
         }
     }
 
     /// The controlling side at `p` and the fleet that dominates it. Like
-    /// growing seeds, a fleet only reaches `REACH × weight`: a score
-    /// (distance ÷ weight) above `REACH` is out of reach.
+    /// growing seeds, a fleet only reaches reach-per-weight × weight: a
+    /// score (distance ÷ weight) above reach-per-weight is out of reach.
     pub fn at(&self, p: Vec2) -> (Control, Option<usize>) {
         let (ctrl, fleet, _) = self.at_scored(p);
         (ctrl, fleet)
@@ -285,7 +304,7 @@ impl Influence {
     /// Like [`Influence::at`], plus the dominating fleet's score.
     pub fn at_scored(&self, p: Vec2) -> (Control, Option<usize>, f32) {
         let inf = weighted_scores(&self.bases, &self.weights, p, self.metric);
-        let Some(best) = inf.owner.filter(|_| inf.best <= REACH) else { return (Control::Neutral, None, inf.best) };
+        let Some(best) = inf.owner.filter(|_| inf.best <= self.reach) else { return (Control::Neutral, None, inf.best) };
         let side = self.sides[best];
         // The other side's best score, if that fleet reaches here too.
         let rival = self
@@ -296,7 +315,7 @@ impl Influence {
             .filter(|((_, w), s)| **s != side && **w > 0.0)
             .map(|((b, w), _)| distance(*b, p, self.metric) / w)
             .fold(f32::INFINITY, f32::min);
-        let ctrl = if rival <= REACH && rival <= inf.best * (1.0 + CONTEST_MARGIN) { Control::Contested } else { Control::Side(side) };
+        let ctrl = if rival <= self.reach && rival <= inf.best * (1.0 + CONTEST_MARGIN) { Control::Contested } else { Control::Side(side) };
         (ctrl, Some(best), inf.best)
     }
 }
@@ -362,7 +381,7 @@ pub fn render(d: &Dominion, opts: DrawOptions) -> Canvas {
             let p = Vec2::new((gx * step) as f32 + step as f32 * 0.5, (gy * step) as f32 + step as f32 * 0.5);
             let (ctrl, fleet, score) = inf.at_scored(p);
             // The last ~1.5 px of a patch's reach.
-            let front = fleet.is_some_and(|f| (REACH - score) * d.fleets[f].weight() < 1.5 * step as f32);
+            let front = fleet.is_some_and(|f| (d.tuning.reach_per_weight - score) * d.fleets[f].weight(&d.tuning) < 1.5 * step as f32);
             cells[(gy * gw + gx) as usize] = (ctrl, fleet, front);
         }
     }
@@ -407,7 +426,7 @@ pub fn render(d: &Dominion, opts: DrawOptions) -> Canvas {
     // at the end of this turn.
     for (p, pr) in d.planets.iter().zip(d.pressure()) {
         let r = 1.5 + 1.3 * p.value as f32;
-        let ring = r + 2.0 + p.defence as f32 / 25.0;
+        let ring = r + 2.0 + (p.weight * 0.8).min(14.0);
         c.circle(p.pos, ring, [170, 170, 180], 0.7);
         match pr {
             Pressure::Falls(s) => {
@@ -442,7 +461,14 @@ pub fn status(d: &Dominion, selected: Option<usize>) -> String {
     let sel = match selected.filter(|i| *i < d.fleets.len()) {
         Some(i) => {
             let f = &d.fleets[i];
-            format!("Selected: {} fleet {}, {} ships, reach {:.0} px.", SIDE_NAMES[f.side], d.fleet_number(i), f.ships, f.reach())
+            format!(
+                "Selected: {} fleet {}, {} ships, weight {:.2}, reach {:.0} px.",
+                SIDE_NAMES[f.side],
+                d.fleet_number(i),
+                f.ships,
+                f.weight(&d.tuning),
+                f.reach(&d.tuning)
+            )
         }
         None => "Click a fleet to select it.".into(),
     };

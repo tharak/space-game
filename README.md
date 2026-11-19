@@ -11,9 +11,9 @@ A real-time fleet battle with hundreds of ships a side, in Rust with [Bevy 0.19]
 The first card on the start page, built from the labs in `src/prototypes/`.
 
 - **Planets:** some of the Voronoi regions hold one (Sites and Planets sliders), worth 1–3 resources a turn.
-- **Independent factions:** every planet starts as its own faction, with a defence of 0.5–3 and no fleet; it only defends.
-- **Fleets:** Blue and Red each get 1–8 fleets (Fleets slider). Each fleet grows a patch like the seeds in lab 1, in its own tone of its side's colour. It reaches 70 px per 50 ships, and where patches meet, the border sits at distance ÷ ships.
-- **Conquest:** at the end of a turn, a planet joins the side whose fleet dominates it if that fleet has more ships than the planet's defence (25–150 ships). Contested planets don't change hands, and captured planets keep their defence against the other side.
+- **Independent factions:** every planet starts as its own faction with no fleet; it only defends. All planets share one weight (Planet weight slider).
+- **Fleets:** Blue and Red each get 1–8 fleets (Fleets slider). A fleet weighs ships × weight per ship (slider, 0.01 steps, default 0.1). Each fleet grows a patch like the seeds in lab 1, in its own tone of its side's colour. It reaches reach-per-weight × weight (slider, 1 px steps, default 14), and where patches meet, the border sits at distance ÷ weight.
+- **Conquest:** at the end of a turn, a planet joins the side whose fleet dominates it if that fleet outweighs the planet. Contested planets don't change hands, and captured planets keep their weight against the other side.
 - **Economy:** owned planets pay every turn, and 10 buys 25 ships.
 
 Drag fleets to move them. Tests: `cargo test prototypes`.

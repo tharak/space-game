@@ -13,7 +13,7 @@ use bevy::ui::RelativeCursorPosition;
 use super::flow::{AppRequest, Phase};
 use super::theme::*;
 use super::ui::{BtnKind, BtnLabel, Enabled, Selected, button_for, card_title, choice_row, panel, row, text};
-use crate::prototypes::dominion::{self, DrawOptions, Dominion, MAX_FLEETS_PER_SIDE, MAX_SHIPS, MIN_SHIPS};
+use crate::prototypes::dominion::{self, DrawOptions, Dominion, MAX_FLEETS_PER_SIDE, MAX_SHIPS, MIN_SHIPS, Tuning};
 use crate::voronoi::Vec2 as MapVec;
 use crate::voronoi::labs::{FACTIONS, LabId, LabState, render, site_at, status, zoom_inset};
 use crate::voronoi::metric::Metric;
@@ -85,6 +85,8 @@ pub enum LabAction {
     NewSeed,
     Metric(Metric),
     Relax(u32),
+    /// −/+ on a slider: one step down or up.
+    Nudge(SliderParam, i8),
     // prototype01
     EndTurn,
     Reinforce,
@@ -117,6 +119,9 @@ pub enum SliderParam {
     Planets,
     Fleets,
     FleetShips,
+    WeightPerShip,
+    ReachPerWeight,
+    PlanetWeight,
     GrowRadius,
     Crack,
     Weight(usize),
@@ -129,6 +134,9 @@ impl SliderParam {
             SliderParam::Planets => (1.0, cfg.sites as f32, 1.0),
             SliderParam::Fleets => (1.0, MAX_FLEETS_PER_SIDE as f32, 1.0),
             SliderParam::FleetShips => (MIN_SHIPS as f32, MAX_SHIPS as f32, 5.0),
+            SliderParam::WeightPerShip => (0.01, 1.0, 0.01),
+            SliderParam::ReachPerWeight => (1.0, 100.0, 1.0),
+            SliderParam::PlanetWeight => (0.0, 50.0, 0.1),
             SliderParam::GrowRadius => (0.0, LabState::grow_max(cfg), 1.0),
             SliderParam::Crack => (0.5, 10.0, 0.1),
             SliderParam::Weight(_) => (0.2, 4.0, 0.1),
@@ -141,6 +149,9 @@ impl SliderParam {
             SliderParam::Planets => proto.planets.min(cfg.sites) as f32,
             SliderParam::Fleets => proto.fleets as f32,
             SliderParam::FleetShips => proto.selected.and_then(|i| proto.d.fleets.get(i)).map_or(MIN_SHIPS as f32, |f| f.ships as f32),
+            SliderParam::WeightPerShip => proto.d.tuning.weight_per_ship,
+            SliderParam::ReachPerWeight => proto.d.tuning.reach_per_weight,
+            SliderParam::PlanetWeight => proto.d.tuning.planet_weight,
             SliderParam::GrowRadius => st.grow_radius,
             SliderParam::Crack => st.crack,
             SliderParam::Weight(i) => st.weights[i],
@@ -153,6 +164,9 @@ impl SliderParam {
             SliderParam::Planets => format!("{v:.0}"),
             SliderParam::Fleets => format!("{v:.0} a side"),
             SliderParam::FleetShips => format!("{v:.0} ships"),
+            SliderParam::WeightPerShip => format!("{v:.2} a ship"),
+            SliderParam::ReachPerWeight => format!("{v:.0} px × weight"),
+            SliderParam::PlanetWeight => format!("{v:.1}"),
             SliderParam::GrowRadius => format!("{v:.0} px"),
             SliderParam::Crack => format!("{v:.1}"),
             SliderParam::Weight(_) => format!("{v:.1}×"),
@@ -235,8 +249,65 @@ fn slider_sized(parent: &mut ChildSpawnerCommands, title: &str, param: SliderPar
         .with_children(|t| {
             t.spawn((SliderFill(param), Node { width: Val::Percent(0.0), height: Val::Percent(100.0), ..default() }, BackgroundColor(PRIMARY_BG)));
         });
+        button_for(r, "−", LabAction::Nudge(param, -1), BtnKind::Normal);
+        button_for(r, "+", LabAction::Nudge(param, 1), BtnKind::Normal);
         r.spawn((SliderValue(param), text("", 13.5, TEXT)));
     });
+}
+
+/// Sets a slider's value (already snapped to its step).
+fn set_slider(param: SliderParam, v: f32, cfg: &mut VoronoiConfig, labs: &mut Labs) {
+    let (lo, hi, _) = param.range(cfg);
+    let v = v.clamp(lo, hi);
+    let proto = &mut labs.proto;
+    match param {
+        SliderParam::Sites => {
+            let n = v.round() as usize;
+            if cfg.sites != n {
+                cfg.sites = n;
+            }
+        }
+        SliderParam::Planets => {
+            let n = (v.round() as usize).clamp(1, cfg.sites);
+            if proto.planets != n {
+                proto.planets = n;
+                proto.d = Dominion::new(cfg, n, proto.fleets, proto.d.tuning);
+                proto.selected = None;
+            }
+        }
+        SliderParam::Fleets => {
+            let n = (v.round() as usize).clamp(1, MAX_FLEETS_PER_SIDE);
+            if proto.fleets != n {
+                proto.fleets = n;
+                proto.d = Dominion::new(cfg, proto.planets, n, proto.d.tuning);
+                proto.selected = None;
+            }
+        }
+        SliderParam::FleetShips => {
+            if let Some(i) = proto.selected
+                && let Some(f) = proto.d.fleets.get_mut(i)
+            {
+                f.ships = v.round() as u32;
+            }
+        }
+        SliderParam::WeightPerShip => proto.d.set_tuning(Tuning { weight_per_ship: v, ..proto.d.tuning }),
+        SliderParam::ReachPerWeight => proto.d.set_tuning(Tuning { reach_per_weight: v, ..proto.d.tuning }),
+        SliderParam::PlanetWeight => proto.d.set_tuning(Tuning { planet_weight: v, ..proto.d.tuning }),
+        SliderParam::GrowRadius => {
+            labs.state.grow_radius = v;
+            if labs.playing == Some(LabId::Grow) {
+                labs.playing = None;
+            }
+        }
+        SliderParam::Crack => labs.state.crack = v,
+        SliderParam::Weight(i) => labs.state.weights[i] = v,
+    }
+}
+
+/// Snaps to the slider's step without float drift (0.01 steps stay exact).
+fn snap(v: f32, lo: f32, step: f32) -> f32 {
+    let n = ((v - lo) / step).round();
+    ((lo + n * step) * 1000.0).round() / 1000.0
 }
 
 pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg: Res<LabsConfig>) {
@@ -254,7 +325,7 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
     let proto_image = images.add(blank_image(&cfg.0));
     let (planets, fleets) = (20, 3);
     let proto = Proto {
-        d: Dominion::new(&cfg.0, planets, fleets),
+        d: Dominion::new(&cfg.0, planets, fleets, Tuning::default()),
         planets,
         fleets,
         selected: None,
@@ -330,11 +401,12 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                         p,
                         "prototype01 — Fleet dominion",
                         "Some Voronoi regions hold a planet worth 1–3 resources a turn. Every planet starts as its own \
-                         independent faction that only defends (grey ring = defence in ships). Each fleet grows a patch \
-                         like the seeds in lab 1, in its own tone of its side's colour: reach is 70 px per 50 ships, and \
-                         where patches meet the border sits at distance ÷ ships. At the end of the turn a planet joins the \
-                         side whose fleet dominates it if that fleet has more ships than its defence (gold ring = falls \
-                         this turn). Contested planets don't change hands. Owned planets pay every turn; 10 buys 25 ships.",
+                         independent faction that only defends (grey ring = its weight). A fleet weighs ships × weight per \
+                         ship and grows a patch like the seeds in lab 1, in its own tone of its side's colour: reach is \
+                         reach-per-weight × weight, and where patches meet the border sits at distance ÷ weight. At the end \
+                         of the turn a planet joins the side whose fleet dominates it if that fleet outweighs the planet \
+                         (gold ring = falls this turn). Contested planets don't change hands. Owned planets pay every turn; \
+                         10 buys 25 ships.",
                     );
                     p.spawn(row()).with_children(|r| {
                         button_for(r, "End turn", LabAction::EndTurn, BtnKind::Primary);
@@ -347,6 +419,9 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                     slider(p, "Planets", SliderParam::Planets);
                     slider(p, "Fleets", SliderParam::Fleets);
                     slider(p, "Selected ships", SliderParam::FleetShips);
+                    slider(p, "Weight per ship", SliderParam::WeightPerShip);
+                    slider(p, "Reach per weight", SliderParam::ReachPerWeight);
+                    slider(p, "Planet weight", SliderParam::PlanetWeight);
                     p.spawn(text("Drag a fleet to move it · click a fleet to select it.", 12.5, DIM));
                     p.spawn((LabText::Proto, text("", 13.0, GREEN)));
                     p.spawn((
@@ -518,6 +593,11 @@ pub fn handle_lab_buttons(
             LabAction::NewSeed => cfg.0.seed = super::random_seed() % 2_000_000_000 + 1,
             LabAction::Metric(m) => cfg.0.metric = m,
             LabAction::Relax(n) => cfg.0.relax = n,
+            LabAction::Nudge(param, dir) => {
+                let (lo, _, step) = param.range(&cfg.0);
+                let v = snap(param.get(&cfg.0, &labs.state, &labs.proto) + step * dir as f32, lo, step);
+                set_slider(param, v, &mut cfg.0, labs);
+            }
             LabAction::EndTurn => labs.proto.d.end_turn(),
             LabAction::Reinforce => {
                 if let Some(i) = labs.proto.selected {
@@ -525,7 +605,7 @@ pub fn handle_lab_buttons(
                 }
             }
             LabAction::ProtoReset => {
-                labs.proto.d = Dominion::new(&cfg.0, labs.proto.planets, labs.proto.fleets);
+                labs.proto.d = Dominion::new(&cfg.0, labs.proto.planets, labs.proto.fleets, labs.proto.d.tuning);
                 labs.proto.selected = None;
             }
             LabAction::ProtoRegions => labs.proto.regions = !labs.proto.regions,
@@ -596,7 +676,7 @@ pub fn handle_lab_buttons(
         let c = cfg.0;
         labs.state.reseed(&c);
         labs.proto.planets = labs.proto.planets.min(c.sites);
-        labs.proto.d = Dominion::new(&c, labs.proto.planets, labs.proto.fleets);
+        labs.proto.d = Dominion::new(&c, labs.proto.planets, labs.proto.fleets, labs.proto.d.tuning);
         labs.proto.selected = None;
         labs.last_cfg = c;
     }
@@ -623,45 +703,9 @@ pub fn drag_sliders(
         let Some(n) = cursor.normalized else { continue };
         let (lo, hi, step) = track.0.range(&cfg.0);
         let t = (n.x + 0.5).clamp(0.0, 1.0);
-        let v = ((lo + (hi - lo) * t) / step).round() * step;
-        match track.0 {
-            SliderParam::Sites => {
-                let n = v as usize;
-                if cfg.0.sites != n {
-                    cfg.0.sites = n;
-                }
-            }
-            SliderParam::Planets => {
-                let n = (v as usize).clamp(1, cfg.0.sites);
-                if labs.proto.planets != n {
-                    labs.proto.planets = n;
-                    labs.proto.d = Dominion::new(&cfg.0, n, labs.proto.fleets);
-                    labs.proto.selected = None;
-                }
-            }
-            SliderParam::Fleets => {
-                let n = (v as usize).clamp(1, MAX_FLEETS_PER_SIDE);
-                if labs.proto.fleets != n {
-                    labs.proto.fleets = n;
-                    labs.proto.d = Dominion::new(&cfg.0, labs.proto.planets, n);
-                    labs.proto.selected = None;
-                }
-            }
-            SliderParam::FleetShips => {
-                if let Some(i) = labs.proto.selected
-                    && let Some(f) = labs.proto.d.fleets.get_mut(i)
-                {
-                    f.ships = v as u32;
-                }
-            }
-            SliderParam::GrowRadius => {
-                labs.state.grow_radius = v;
-                if labs.playing == Some(LabId::Grow) {
-                    labs.playing = None;
-                }
-            }
-            SliderParam::Crack => labs.state.crack = v,
-            SliderParam::Weight(i) => labs.state.weights[i] = v,
+        let v = snap(lo + (hi - lo) * t, lo, step);
+        if (v - track.0.get(&cfg.0, &labs.state, &labs.proto)).abs() > step * 0.25 {
+            set_slider(track.0, v, &mut cfg.0, &mut labs);
         }
     }
 }
@@ -827,7 +871,7 @@ pub fn render_labs(
             selected: proto.selected,
             step: if proto.drag.is_some() { 3 } else { 1 },
         };
-        let key = format!("{:?}|{:?}|{:?}|{:?}|{}", proto.d.cfg, proto.d.fleets, opts, proto.d.turn, proto.d.planets.len());
+        let key = format!("{:?}|{:?}|{:?}|{:?}|{}|{:?}", proto.d.cfg, proto.d.fleets, opts, proto.d.turn, proto.d.planets.len(), proto.d.tuning);
         if key != proto.view.key {
             let rgba = dominion::render(&proto.d, opts).to_rgba();
             if let Some(mut img) = images.get_mut(&proto.view.image) {
