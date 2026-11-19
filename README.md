@@ -12,7 +12,7 @@ The first card on the start page, built from the labs in `src/prototypes/`.
 
 - **Planets:** some of the Voronoi regions hold one (Sites and Planets sliders), worth 1–3 resources a turn.
 - **Independent factions:** every planet starts as its own faction with no fleet; it only defends. All planets share one weight (Planet weight slider).
-- **Fleets:** Blue and Red each get 1–8 fleets (Fleets slider). A fleet weighs ships × weight per ship (slider, 0.01 steps, default 0.1). Each fleet grows a patch like the seeds in lab 1, in its own tone of its side's colour. It reaches reach-per-weight × weight (slider, 1 px steps, default 14), and where patches meet, the border sits at distance ÷ weight.
+- **Fleets:** Blue and Red each get 1–8 fleets (Fleets slider). A fleet weighs ships × weight per ship (slider, 0.01 steps, default 0.1). Each fleet grows a patch like the seeds in lab 1, in its own tone of its side's colour. It reaches reach-per-weight × weight (slider, 1 px steps, default 14, measured on a 720-wide map and scaled with the map size), and where patches meet, the border sits at distance ÷ weight.
 - **Conquest:** at the end of a turn, a planet joins the side whose fleet dominates it if that fleet outweighs the planet. Contested planets don't change hands, and captured planets keep their weight against the other side.
 - **Economy:** owned planets pay every turn, and 10 buys 25 ships.
 
@@ -20,7 +20,7 @@ Drag fleets to move them. Tests: `cargo test prototypes`.
 
 ## Voronoi labs
 
-The app opens on a start page that shows every lab with its controls and image. A shared **Config** at the top (seed, site count, distance metric, Lloyd rounds) feeds all nine labs, after the gamegeniuslab tutorial *Voronoi diagrams in game development*:
+The **Voronoi labs →** button on the start page opens a separate page with every lab, its controls and its image. Labs only render while that page is open. A shared **Config** at the top (seed, site count, distance metric, Lloyd rounds) feeds all nine labs, after the gamegeniuslab tutorial *Voronoi diagrams in game development*:
 
 1. grow the seeds;
 2. nearest site;

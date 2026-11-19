@@ -300,7 +300,7 @@ pub fn setup_ui(mut commands: Commands) {
             })
             .with_children(|c| {
                 c.spawn(row()).with_children(|r| {
-                    button_for(r, "← Labs", super::lab_ui::LabAction::Back, BtnKind::Normal);
+                    button_for(r, "← Home", super::lab_ui::LabAction::Back, BtnKind::Normal);
                 });
                 c.spawn(text("Successor Stars", 26.0, TEXT));
                 c.spawn((

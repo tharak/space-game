@@ -72,6 +72,10 @@ fn ranks(n: usize, per_row: usize, spacing: f32) -> Vec<Vec2> {
     out
 }
 
+/// The ship silhouette (a dart pointing along +x), shared by the battle
+/// view and the prototype maps.
+pub const SHIP_DART: [Vec2; 4] = [Vec2::new(6.0, 0.0), Vec2::new(-4.5, 3.6), Vec2::new(-2.5, 0.0), Vec2::new(-4.5, -3.6)];
+
 pub fn layout(formation: Formation, n: usize, spacing: f32) -> Vec<Vec2> {
     if n == 0 {
         return Vec::new();

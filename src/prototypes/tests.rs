@@ -83,7 +83,8 @@ fn a_captured_planet_defends_against_the_other_side() {
 #[test]
 fn a_faction_can_hold_many_planets() {
     let mut d = Dominion::new(&cfg(), 10, 3, Tuning::default());
-    d.set_tuning(Tuning { planet_weight: 1.0, ..Tuning::default() });
+    // Light planets, and enough reach to cover this small map.
+    d.set_tuning(Tuning { planet_weight: 1.0, reach_per_weight: 40.0, ..Tuning::default() });
     // One huge Blue fleet in the middle reaches everything.
     d.fleets = vec![FleetToken { side: 0, pos: Vec2::new(150.0, 90.0), ships: MAX_SHIPS }];
     d.end_turn();
@@ -117,9 +118,10 @@ fn renders_deterministically() {
 fn fleets_only_reach_as_far_as_their_ships_allow() {
     let mut d = duel(2.5, 50);
     let p = d.planets[0].pos;
-    // 50 ships × 0.1 = weight 5, × 14 px = 70 px of reach.
-    let reach = d.fleets[0].reach(&d.tuning);
-    assert_eq!(reach, 70.0);
+    // 50 ships × 0.1 = weight 5, × 14 px = 70 px on a 720-wide map,
+    // scaled to this 300-wide one.
+    let reach = d.fleets[0].reach(&d.tuning, map_scale(&d.cfg));
+    assert!((reach - 70.0 * 300.0 / 720.0).abs() < 1e-3, "{reach}");
     d.fleets[0].pos = p + Vec2::new(reach - 2.0, 0.0);
     assert_eq!(d.pressure()[0], Pressure::Falls(0));
     d.fleets[0].pos = p + Vec2::new(reach + 2.0, 0.0);
@@ -160,4 +162,29 @@ fn tuning_sets_weights() {
     d.set_tuning(Tuning { planet_weight: 6.0, ..d.tuning });
     assert_eq!(d.planets[0].weight, 6.0);
     assert_eq!(d.pressure()[0], Pressure::Resists(0));
+}
+
+#[test]
+fn fleets_are_drawn_as_battle_ships() {
+    assert_eq!(ship_icons(1), 1);
+    assert_eq!(ship_icons(50), 10);
+    assert_eq!(ship_icons(51), 11);
+    assert_eq!(ship_icons(10_000), 40);
+    let slots = fleet_slots(10);
+    assert_eq!(slots.len(), 10);
+    // Centred on the fleet, flagship in the middle.
+    let centre = slots.iter().copied().sum::<Vec2>() / 10.0;
+    assert!(centre.length() < 1e-3);
+    assert!(slots.iter().all(|s| s.length() >= slots[0].length()));
+}
+
+#[test]
+fn reach_scales_with_the_map_not_the_sites() {
+    let t = Tuning::default();
+    let fleet = FleetToken { side: 0, pos: Vec2::ZERO, ships: 50 };
+    let small = VoronoiConfig { w: 720, h: 400, ..Default::default() };
+    let big = VoronoiConfig { w: 1440, h: 800, sites: 200, ..Default::default() };
+    assert_eq!(fleet.reach(&t, map_scale(&small)), 70.0);
+    // Twice the map, twice the reach: the same share of the map.
+    assert_eq!(fleet.reach(&t, map_scale(&big)), 140.0);
 }

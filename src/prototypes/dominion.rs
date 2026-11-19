@@ -28,7 +28,8 @@ pub const REINFORCE_SHIPS: u32 = 25;
 pub struct Tuning {
     /// Influence weight each ship adds.
     pub weight_per_ship: f32,
-    /// Pixels of reach per point of weight.
+    /// Reach per point of weight, in pixels of a 720-wide map: it scales
+    /// with the map, so bigger maps don't shrink the fleets' share.
     pub reach_per_weight: f32,
     /// Every planet's weight: a fleet must outweigh it to take the planet.
     pub planet_weight: f32,
@@ -80,10 +81,18 @@ impl FleetToken {
         self.ships as f32 * t.weight_per_ship
     }
 
-    /// How far its patch can grow.
-    pub fn reach(&self, t: &Tuning) -> f32 {
-        t.reach_per_weight * self.weight(t)
+    /// How far its patch can grow, in map pixels.
+    pub fn reach(&self, t: &Tuning, map_scale: f32) -> f32 {
+        t.reach_per_weight * map_scale * self.weight(t)
     }
+}
+
+/// Map width the reach slider is measured against.
+pub const REFERENCE_WIDTH: f32 = 720.0;
+
+/// How much bigger than the reference this map is.
+pub fn map_scale(cfg: &VoronoiConfig) -> f32 {
+    cfg.w as f32 / REFERENCE_WIDTH
 }
 
 /// Which side's fleets dominate a point of space.
@@ -275,7 +284,8 @@ impl Dominion {
 
 /// The fleets as weighted influence bases, built once per batch of queries.
 pub struct Influence {
-    reach: f32,
+    /// Score (distance ÷ weight) beyond which a fleet doesn't reach.
+    pub reach: f32,
     bases: Vec<Vec2>,
     weights: Vec<f32>,
     sides: Vec<usize>,
@@ -285,7 +295,7 @@ pub struct Influence {
 impl Influence {
     pub fn new(d: &Dominion) -> Self {
         Self {
-            reach: d.tuning.reach_per_weight,
+            reach: d.tuning.reach_per_weight * map_scale(&d.cfg),
             bases: d.fleets.iter().map(|f| f.pos).collect(),
             weights: d.fleets.iter().map(|f| f.weight(&d.tuning)).collect(),
             sides: d.fleets.iter().map(|f| f.side).collect(),
@@ -381,7 +391,7 @@ pub fn render(d: &Dominion, opts: DrawOptions) -> Canvas {
             let p = Vec2::new((gx * step) as f32 + step as f32 * 0.5, (gy * step) as f32 + step as f32 * 0.5);
             let (ctrl, fleet, score) = inf.at_scored(p);
             // The last ~1.5 px of a patch's reach.
-            let front = fleet.is_some_and(|f| (d.tuning.reach_per_weight - score) * d.fleets[f].weight(&d.tuning) < 1.5 * step as f32);
+            let front = fleet.is_some_and(|f| (inf.reach - score) * d.fleets[f].weight(&d.tuning) < 1.5 * step as f32);
             cells[(gy * gw + gx) as usize] = (ctrl, fleet, front);
         }
     }
@@ -439,17 +449,60 @@ pub fn render(d: &Dominion, opts: DrawOptions) -> Canvas {
         c.disc(p.pos, r + 1.0, INK, 1.0);
         c.disc(p.pos, r, [230, 220, 170], 1.0);
     }
-    // Fleets, in their own tone.
+    // Fleets: the battle map's ships in a wedge, in the fleet's own tone,
+    // facing the nearest enemy fleet.
     for (i, f) in d.fleets.iter().enumerate() {
+        let facing = d
+            .fleets
+            .iter()
+            .filter(|g| g.side != f.side)
+            .map(|g| g.pos - f.pos)
+            .min_by(|a, b| a.length_squared().total_cmp(&b.length_squared()))
+            .and_then(|v| v.try_normalize())
+            .unwrap_or(if f.side == 0 { Vec2::X } else { Vec2::NEG_X });
+        let slots = fleet_slots(ship_icons(f.ships));
         if opts.selected == Some(i) {
-            c.circle(f.pos, 12.0, GOLD, 1.0);
-            c.disc(f.pos, 10.0, GOLD, 1.0);
+            let r = slots.iter().map(|s| s.length()).fold(0.0, f32::max) + 8.0;
+            c.circle(f.pos, r, GOLD, 1.0);
+            c.circle(f.pos, r + 1.0, GOLD, 1.0);
         }
-        c.disc(f.pos, 8.0, INK, 1.0);
-        c.disc(f.pos, 6.5, tones[i], 1.0);
-        c.disc(f.pos, 2.0, WHITE, 1.0);
+        for (k, slot) in slots.iter().enumerate() {
+            let (scale, col) = if k == 0 { (1.1, WHITE) } else { (0.6, tones[i]) };
+            draw_ship(&mut c, f.pos + facing.rotate(*slot), facing, scale, col);
+        }
     }
     c
+}
+
+/// Ships per dart on the map.
+pub const SHIPS_PER_ICON: u32 = 5;
+const MAX_ICONS: usize = 40;
+
+/// How many darts a fleet of `ships` shows (at least one, the flagship).
+pub fn ship_icons(ships: u32) -> usize {
+    (ships.div_ceil(SHIPS_PER_ICON) as usize).clamp(1, MAX_ICONS)
+}
+
+/// Dart positions around the fleet's centre (+x = facing): the battle's
+/// wedge, centred, with the flagship (slot 0) in the middle.
+pub fn fleet_slots(icons: usize) -> Vec<Vec2> {
+    let mut slots = crate::sim::formation::layout(crate::sim::formation::Formation::Wedge, icons, 6.0);
+    let centre = slots.iter().copied().sum::<Vec2>() / slots.len().max(1) as f32;
+    for s in &mut slots {
+        *s -= centre;
+    }
+    // The ship nearest the centre is the flagship (slot 0).
+    if let Some(k) = (0..slots.len()).min_by(|a, b| slots[*a].length_squared().total_cmp(&slots[*b].length_squared())) {
+        slots.swap(0, k);
+    }
+    slots
+}
+
+fn draw_ship(c: &mut Canvas, at: Vec2, facing: Vec2, scale: f32, col: Rgb) {
+    let dart = |k: f32| -> Vec<Vec2> { crate::sim::formation::SHIP_DART.iter().map(|p| at + facing.rotate(*p * scale * k)).collect() };
+    // A dark outline, then the ship a little lighter than its patch.
+    c.polygon_fill(&dart(1.45), INK, 1.0);
+    c.polygon_fill(&dart(1.0), mix(col, WHITE, 0.3), 1.0);
 }
 
 /// The status lines for the page.
@@ -467,7 +520,7 @@ pub fn status(d: &Dominion, selected: Option<usize>) -> String {
                 d.fleet_number(i),
                 f.ships,
                 f.weight(&d.tuning),
-                f.reach(&d.tuning)
+                f.reach(&d.tuning, map_scale(&d.cfg))
             )
         }
         None => "Click a fleet to select it.".into(),

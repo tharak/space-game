@@ -1,5 +1,5 @@
 //! Scripted smoke run for development: `SG_AUTOPLAY=<dir> cargo run`
-//! drives the real app through the start page (top and scrolled to the labs), the menu, one spectated battle per fleet
+//! drives the real app through the start page, the labs page, the menu, one spectated battle per fleet
 //! shape (each must end with a winner) and the campaign map, saving
 //! screenshots to <dir> and exiting. Not compiled for the web.
 
@@ -47,7 +47,6 @@ pub fn autoplay(
     phase: Res<Phase>,
     battle: Res<Battle>,
     divs: Query<(Entity, &Division)>,
-    mut start_scroll: Query<&mut ScrollPosition, With<super::lab_ui::StartPage>>,
 ) {
     auto.frame += 1;
     let f = auto.frame;
@@ -72,13 +71,11 @@ pub fn autoplay(
         }
         // Screenshots land a frame late, so each page change waits a beat.
         99 if since == 10 => {
-            if let Ok(mut s) = start_scroll.single_mut() {
-                s.0.y = 900.0;
-            }
+            requests.write(AppRequest::LabsPage);
             next(&mut auto);
         }
-        100 if since == 20 => {
-            shot(&mut commands, "00-start-labs");
+        100 if since == 40 => {
+            shot(&mut commands, "00-labs");
             auto.step = 103;
             auto.wait_from = f;
         }

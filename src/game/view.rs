@@ -79,7 +79,7 @@ pub fn setup_view(
     config.line.width = 2.0;
     let (config, _) = gizmo_store.config_mut::<ThinGizmos>();
     config.line.width = 1.0;
-    let dart = [Vec2::new(6.0, 0.0), Vec2::new(-4.5, 3.6), Vec2::new(-2.5, 0.0), Vec2::new(-4.5, -3.6)];
+    let dart = crate::sim::formation::SHIP_DART;
     let mut mat = |c: Color| materials.add(ColorMaterial::from_color(c));
     let mats = std::array::from_fn(|side| {
         [mat(SHIP[side][0]), mat(SHIP[side][1]), mat(SHIP[side][2]), mat(SHIP_SELECTED[side])]
