@@ -146,6 +146,16 @@ pub struct Tuning {
     pub time_limit: f32,
     /// Seconds without a shot (after contact) before the fleets disengage.
     pub disengage_after: f32,
+    /// A friendly ship closer than this to the line of fire blocks the shot.
+    pub los_clearance: f32,
+    /// Seconds a ship waits before looking again when every shot is blocked.
+    pub blocked_retry: f32,
+    /// Morale shock per hit taken into the front, and into a flank or rear
+    /// (as a fraction of the division's size).
+    pub hit_shock: [f32; 2],
+    /// Arrow/Crescent divisions concentrate fire only within this distance
+    /// of their fleet's centre; divisions further out shoot what's nearest.
+    pub focus_radius: f32,
     /// Morale stress per fraction of the whole fleet out of the fight: as a
     /// fleet wears down, all its divisions waver (no hard break point).
     pub k_fleet_lost: f32,
@@ -167,7 +177,7 @@ impl Default for Tuning {
             range: 150.0,
             stop_distance: 37.5,
             fire_arc: 1.05,
-            cooldown: 4.0,
+            cooldown: 3.0,
             hit: [0.12, 0.25, 0.4],
             range_falloff: 0.5,
             hull: 5.0,
@@ -190,6 +200,10 @@ impl Default for Tuning {
             time_limit: 600.0,
             disengage_after: 45.0,
             k_fleet_lost: 0.8,
+            los_clearance: 5.0,
+            blocked_retry: 0.5,
+            hit_shock: [0.1, 0.15],
+            focus_radius: 300.0,
             flag_shock: 0.3,
         }
     }

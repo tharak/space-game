@@ -61,7 +61,10 @@ fn ranks(n: usize, per_row: usize, spacing: f32) -> Vec<Vec2> {
     while out.len() < n {
         let count = per_row.min(n - out.len());
         for i in 0..count {
-            let y = (i as f32 - (count - 1) as f32 / 2.0) * spacing;
+            // Every second rank is staggered half a space, so it can fire
+            // through the gaps in the rank ahead.
+            let stagger = if row % 2 == 1 { 0.5 * spacing } else { 0.0 };
+            let y = (i as f32 - (count - 1) as f32 / 2.0) * spacing + stagger;
             out.push(Vec2::new(-(row as f32) * spacing, y));
         }
         row += 1;

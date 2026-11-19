@@ -27,9 +27,12 @@ Formations are Line (2 ranks), Wedge, Crescent, Echelon left/right, and Column. 
 
 * Range is 150. Guns fire in a 60° cone ahead of the ship.
 * A ship can turn up to about 34° away from its division's facing to aim. So a division attacked from behind cannot answer until it wheels.
-* Each ship fires about every 4 s at an enemy in its cone:
+* Each ship fires about every 3 s at an enemy in its cone:
   * In a **Line, Echelon or Columns** fleet, it shoots the nearest one.
-  * In an **Arrow or Crescent** fleet, it shoots the one closest to its *fleet's centre*. The whole arrow concentrates on whatever is at its point; a crescent concentrates on whatever has come into its cup.
+  * In an **Arrow or Crescent** fleet, it shoots the one closest to its *fleet's centre*. The whole arrow concentrates on whatever is at its point; a crescent concentrates on whatever has come into its cup. Only divisions within 300 of the fleet's centre do this; divisions sent wide shoot what's nearest.
+* **Line of fire:** a ship can't shoot through its own fleet. If a friendly ship sits within 5 units of the line to the target, it tries its next-best target, and if every shot is masked it waits half a second and looks again.
+  * Lines are two ranks, with the second staggered half a space, so both ranks fire through the gaps.
+  * In deep formations (wedge, column) most of the rows behind the front are masked. Depth buys staying power, not firepower.
 * The hit chance depends on which arc of the target the shot comes from:
 
 | Into the target's | front (±60°) | flank | rear |
@@ -48,7 +51,7 @@ Deep formations (Wedge, Column) close ranks every 3 s, so rear ships step into t
 
 Each division has a stress level, checked every second:
 
-* **Raised by:** shock from recent losses and hits (with a 15 s half-life, and flank and rear hits count more), total losses, the fleet's flagship being lost, and being broken through.
+* **Raised by:** shock from recent losses and hits (with a 15 s half-life, and flank and rear hits count 1.5× a frontal hit), total losses, the fleet's flagship being lost, and being broken through.
 * **Lowered by:** being within 600 of the flagship (in command).
 
 Stress moves a division from Steady → Shaken, then Shaken → Routed. A Shaken division can rally back to Steady.

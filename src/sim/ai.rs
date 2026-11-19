@@ -100,8 +100,8 @@ fn plan(side: usize, views: &[View], tuning: &Tuning) -> Vec<(Entity, Order)> {
         };
         let dist = d.centroid.distance(t.centroid);
         let bearing = (t.centroid - d.centroid).normalize_or(toward);
-        let order = if d.formation == Formation::Wedge && d.morale == Morale::Steady {
-            // The spearhead drives straight through whatever is nearest and
+        let order = if matches!(d.formation, Formation::Wedge | Formation::Column) && d.morale == Morale::Steady {
+            // Deep formations (wedge, column) drive straight through whatever is nearest and
             // comes about on the far side.
             Order::MoveTo { to: t.centroid + bearing * 350.0, facing: bearing.to_angle() }
         } else if d.morale == Morale::Shaken {

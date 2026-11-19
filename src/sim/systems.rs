@@ -233,6 +233,29 @@ pub fn integrate(
     }
 }
 
+/// No friendly ship (other than the shooter) sits within `clearance` of the
+/// line of fire between `from` and `to`.
+pub fn line_clear(hash: &SpatialHash, from: Vec2, to: Vec2, side: usize, me: Entity, clearance: f32) -> bool {
+    let v = to - from;
+    let dist = v.length();
+    if dist < 1e-3 {
+        return true;
+    }
+    let dir = v / dist;
+    let mut clear = true;
+    hash.for_each_within(from + v * 0.5, dist * 0.5 + clearance, |o, _| {
+        if !clear || o.side != side || o.entity == me {
+            return;
+        }
+        let rel = o.pos - from;
+        let t = rel.dot(dir);
+        if t > 0.0 && t < dist && rel.perp_dot(dir).abs() < clearance {
+            clear = false;
+        }
+    });
+    clear
+}
+
 /// Formations that concentrate fire on the enemy nearest the fleet's centre.
 pub fn focus_fire(shape: super::scenario::FleetShape) -> bool {
     matches!(shape, super::scenario::FleetShape::Arrow | super::scenario::FleetShape::Crescent)
@@ -306,8 +329,10 @@ pub fn fire(
             continue;
         }
         let (p, h, s) = (pos.0, heading.0, side.0);
+        // Concentrate only if this division is near its fleet's centre.
+        let centre = focus[s].filter(|c| hash.centroid(div.0).is_some_and(|dc| dc.distance(*c) <= tuning.focus_radius));
         let mut nearest: Option<(Entry, f32)> = None;
-        let mut in_arc: Option<(Entry, f32, f32)> = None;
+        let mut candidates: Vec<(Entry, f32, f32)> = Vec::new();
         hash.for_each_within(p, tuning.range, |o, d2| {
             if o.side == s {
                 return;
@@ -317,17 +342,25 @@ pub fn fire(
             }
             let bearing = (o.pos - p).to_angle();
             if angle_diff(h, bearing).abs() <= tuning.fire_arc {
-                let score = focus[s].map_or(d2, |c| o.pos.distance_squared(c));
-                if in_arc.is_none_or(|n| score < n.2) {
-                    in_arc = Some((*o, d2, score));
-                }
+                let score = centre.map_or(d2, |c| o.pos.distance_squared(c));
+                candidates.push((*o, d2, score));
             }
         });
         if let Some((_, n2)) = nearest {
             closest.push((div.0, n2.sqrt()));
         }
-        let Some((target, d2, _)) = in_arc else {
+        if candidates.is_empty() {
             weapon.aim = nearest.map(|(n, _)| n.pos - p);
+            continue;
+        }
+        // Best target first; take the first one no friendly ship is in front of.
+        candidates.sort_by(|a, b| a.2.total_cmp(&b.2).then(a.0.entity.cmp(&b.0.entity)));
+        let clear = candidates.iter().take(6).find(|(t, _, _)| line_clear(&hash, p, t.pos, s, me.entity, tuning.los_clearance)).copied();
+        let Some((target, d2, _)) = clear else {
+            // Every shot is masked by friends: turn toward the best target
+            // and look again shortly.
+            weapon.aim = Some(candidates[0].0.pos - p);
+            weapon.cooldown = tuning.blocked_retry;
             continue;
         };
         let dist = d2.sqrt();
@@ -341,7 +374,7 @@ pub fn fire(
         contact.push(target.division);
         if hit {
             hits.push((target, 1.0));
-            shock.push((target.division, if arc == 0 { 0.1 } else { 0.25 }));
+            shock.push((target.division, tuning.hit_shock[usize::from(arc != 0)]));
         }
         battle.last_shot = battle.time;
         if battle.first_contact.is_none() {

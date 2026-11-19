@@ -228,3 +228,30 @@ fn arrow_concentrates_fire_on_the_enemy_nearest_its_centre() {
     };
     assert!(spread(&arrow) < spread(&line), "arrow spread {} vs line {}", spread(&arrow), spread(&line));
 }
+
+#[test]
+fn friendly_ships_block_the_line_of_fire() {
+    let mut hash = SpatialHash::new(110.0);
+    let e = |i| Entity::from_raw_u32(i).unwrap();
+    let d = e(999);
+    let me = Entry { entity: e(1), pos: Vec2::ZERO, heading: 0.0, side: 0, division: d };
+    let friend = Entry { entity: e(2), pos: Vec2::new(50.0, 2.0), heading: 0.0, side: 0, division: d };
+    let enemy = Entry { entity: e(3), pos: Vec2::new(50.0, -2.0), heading: 0.0, side: 1, division: d };
+    hash.rebuild([me, friend, enemy].into_iter());
+    let t = Tuning::default();
+    // A friend 2 units off the line, halfway: blocked.
+    assert!(!super::systems::line_clear(&hash, Vec2::ZERO, Vec2::new(100.0, 0.0), 0, e(1), t.los_clearance));
+    // Enemies never block, and a friend well off the line doesn't either.
+    assert!(super::systems::line_clear(&hash, Vec2::ZERO, Vec2::new(100.0, 0.0), 1, e(3), t.los_clearance));
+    assert!(super::systems::line_clear(&hash, Vec2::ZERO, Vec2::new(100.0, 40.0), 0, e(1), t.los_clearance));
+    // A staggered second rank fires through the gap in the first.
+    let line = formation::layout(Formation::Line, 20, 14.0);
+    let front: Vec<Vec2> = line.iter().copied().filter(|p| p.x > -1.0).collect();
+    let back = line.iter().copied().find(|p| p.x < -1.0).unwrap();
+    let gap_clear = front.iter().all(|f| {
+        let v = Vec2::X;
+        let rel = *f - back;
+        rel.perp_dot(v).abs() >= t.los_clearance || rel.dot(v) <= 0.0
+    });
+    assert!(gap_clear, "second rank should be staggered between first-rank ships");
+}

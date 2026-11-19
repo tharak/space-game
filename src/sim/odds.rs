@@ -16,32 +16,32 @@ pub const SHIPS: usize = 240;
 pub const ODDS: [[Odds; 2]; 6] = [
     // Arrow vs Line
     [
-        Odds { win: 64.0, draw: 0.0, minutes: 3.2 },
-        Odds { win: 100.0, draw: 0.0, minutes: 1.5 },
+        Odds { win: 20.0, draw: 4.0, minutes: 4.3 },
+        Odds { win: 96.0, draw: 0.0, minutes: 3.2 },
     ],
     // Line vs Line
     [
-        Odds { win: 50.0, draw: 4.0, minutes: 4.5 },
-        Odds { win: 46.0, draw: 0.0, minutes: 4.1 },
+        Odds { win: 42.0, draw: 6.0, minutes: 4.2 },
+        Odds { win: 58.0, draw: 0.0, minutes: 3.8 },
     ],
     // Crescent vs Arrow
     [
-        Odds { win: 8.0, draw: 2.0, minutes: 3.4 },
-        Odds { win: 50.0, draw: 0.0, minutes: 1.9 },
+        Odds { win: 96.0, draw: 2.0, minutes: 3.3 },
+        Odds { win: 66.0, draw: 0.0, minutes: 3.7 },
     ],
     // Echelon vs Line
     [
-        Odds { win: 46.0, draw: 2.0, minutes: 4.3 },
-        Odds { win: 12.0, draw: 0.0, minutes: 4.4 },
+        Odds { win: 46.0, draw: 0.0, minutes: 4.0 },
+        Odds { win: 56.0, draw: 0.0, minutes: 4.7 },
     ],
     // Columns vs Line
     [
-        Odds { win: 84.0, draw: 0.0, minutes: 3.2 },
-        Odds { win: 94.0, draw: 0.0, minutes: 4.9 },
+        Odds { win: 16.0, draw: 6.0, minutes: 4.5 },
+        Odds { win: 18.0, draw: 0.0, minutes: 5.8 },
     ],
     // Low supply
     [
-        Odds { win: 70.0, draw: 2.0, minutes: 4.7 },
-        Odds { win: 94.0, draw: 0.0, minutes: 3.9 },
+        Odds { win: 72.0, draw: 6.0, minutes: 4.0 },
+        Odds { win: 88.0, draw: 0.0, minutes: 3.6 },
     ],
 ];
