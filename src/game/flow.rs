@@ -14,11 +14,9 @@ use crate::sim::{Command, apply_command, init_world, step};
 
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum Phase {
-    /// The start page: shared Voronoi config and the list of labs.
+    /// The start page: shared Voronoi config and every lab.
     #[default]
     Start,
-    /// One Voronoi lab.
-    Lab(crate::voronoi::labs::LabId),
     /// The fleet battle and campaign menu.
     Menu,
     Battle,
@@ -55,7 +53,6 @@ pub enum AppRequest {
     Start,
     /// Back to the start page.
     Labs,
-    OpenLab(crate::voronoi::labs::LabId),
     Menu,
     NewCampaign,
     ContinueCampaign,
@@ -105,7 +102,6 @@ pub fn apply_requests(world: &mut World) {
                 start_battle(world)
             }
             AppRequest::Labs => *world.resource_mut::<Phase>() = Phase::Start,
-            AppRequest::OpenLab(lab) => *world.resource_mut::<Phase>() = Phase::Lab(lab),
             AppRequest::Menu => {
                 *world.resource_mut::<Phase>() = Phase::Menu;
                 world.resource_mut::<super::ui::SaveExists>().0 = crate::campaign::save::load().is_some();

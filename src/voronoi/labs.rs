@@ -156,6 +156,25 @@ impl LabState {
         self.grow_radius = self.grow_radius.min(LabState::grow_max(cfg));
     }
 
+    /// Everything a lab's image depends on besides the config, so a change
+    /// to one lab doesn't redraw the others.
+    pub fn key_for(&self, lab: LabId) -> String {
+        match lab {
+            LabId::Grow => format!("{} {}", self.grow_radius, self.grow_fronts),
+            LabId::Nearest => format!("{:?} {}", self.probe, self.distance_lines),
+            LabId::OwnerMap => format!("{}", self.owner_borders),
+            LabId::Delaunay => format!(
+                "{} {} {} {:?} {:?}",
+                self.show_cells, self.show_triangles, self.show_circles, self.selected, self.edited
+            ),
+            LabId::Lloyd => format!("{:?} {}", self.lloyd, self.show_centroids),
+            LabId::Biomes => format!("{} {}", self.biome_borders, self.biome_sites),
+            LabId::Influence => format!("{:?} {:?} {:?} {}", self.bases, self.weights, self.alive, self.use_weights),
+            LabId::CellNoise => format!("{:?} {:?} {}", self.noise_mode, self.preset, self.crack),
+            LabId::Island => format!("{}", self.world),
+        }
+    }
+
     /// The sites a lab works on.
     pub fn sites(&self, cfg: &VoronoiConfig, lab: LabId) -> Vec<Vec2> {
         match lab {

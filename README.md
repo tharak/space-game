@@ -8,7 +8,7 @@ A real-time fleet battle with hundreds of ships a side, in Rust with [Bevy 0.19]
 
 ## Voronoi labs
 
-The app opens on a start page. A shared **Config** at the top (seed, site count, distance metric, Lloyd rounds) feeds nine labs after the gamegeniuslab tutorial *Voronoi diagrams in game development*:
+The app opens on a start page that shows every lab with its controls and image. A shared **Config** at the top (seed, site count, distance metric, Lloyd rounds) feeds all nine labs, after the gamegeniuslab tutorial *Voronoi diagrams in game development*:
 
 1. grow the seeds;
 2. nearest site;

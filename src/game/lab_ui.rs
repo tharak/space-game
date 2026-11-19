@@ -1,7 +1,8 @@
-//! The start page (shared Voronoi config + the list of labs) and the lab
-//! page: the lab's controls, a status line and its image. Every frame of
-//! the image comes from [`crate::voronoi::labs::render`]; this module only
-//! turns clicks, drags and sliders into config and lab-state changes.
+//! The start page: the shared Voronoi config, then every lab as a card
+//! with its controls, a status line and its image, then a link to the
+//! fleet battle. Every image comes from [`crate::voronoi::labs::render`];
+//! this module only turns clicks, drags and sliders into config and
+//! lab-state changes.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::ImageSampler;
@@ -19,6 +20,11 @@ use crate::voronoi::noise::{NoiseMode, NoisePreset};
 use crate::voronoi::raster::Canvas;
 use crate::voronoi::sites::VoronoiConfig;
 
+const LABS: usize = LabId::ALL.len();
+/// Full-quality lab renders per frame, so a config change doesn't freeze
+/// the page while all nine redraw.
+const RENDERS_PER_FRAME: usize = 2;
+
 /// The config every lab reads.
 #[derive(Resource, Default, Clone, Copy, PartialEq)]
 pub struct LabsConfig(pub VoronoiConfig);
@@ -30,28 +36,33 @@ enum Drag {
     Base(usize),
 }
 
-/// Lab state plus what the page needs to redraw only on change.
-#[derive(Resource)]
-pub struct Labs {
-    pub state: LabState,
+/// One lab's image and what it was drawn from.
+struct LabView {
     image: Handle<Image>,
     /// What the cached base image was rendered from.
     key: String,
     base: Option<Canvas>,
     /// What the texture currently shows (base key + hover).
     shown: String,
-    hover: Option<MapVec>,
-    drag: Option<Drag>,
-    playing: bool,
+}
+
+/// Lab state plus each lab's cached image.
+#[derive(Resource)]
+pub struct Labs {
+    pub state: LabState,
+    views: Vec<LabView>,
+    hover: Option<(LabId, MapVec)>,
+    drag: Option<(LabId, Drag)>,
+    playing: Option<LabId>,
     timer: f32,
     last_cfg: VoronoiConfig,
 }
 
 #[derive(Component, Clone, Copy, PartialEq, Debug)]
 pub enum LabAction {
-    // Navigation
-    Open(LabId),
+    /// Back to the start page (from the game menu).
     Back,
+    /// To the fleet battle and campaign menu.
     Game,
     // Shared config
     SeedDelta(i32),
@@ -59,14 +70,14 @@ pub enum LabAction {
     Metric(Metric),
     Relax(u32),
     // Per lab
-    Play,
+    Play(LabId),
+    Reset(LabId),
     GrowFronts,
     DistanceLines,
     OwnerBorders,
     Cells,
     Triangles,
     Circles,
-    ResetLab,
     LloydStep,
     Centroids,
     BiomeBorders,
@@ -129,21 +140,13 @@ pub struct ActiveSlider(Option<SliderParam>);
 #[derive(Component, Clone, Copy, PartialEq)]
 pub enum LabText {
     Seed,
-    Title,
-    Blurb,
-    Config,
-    Status,
+    Status(LabId),
 }
 
 #[derive(Component)]
 pub struct StartPage;
 #[derive(Component)]
-pub struct LabPage;
-/// A lab's own controls, shown on its page only.
-#[derive(Component)]
-pub struct LabControls(LabId);
-#[derive(Component)]
-pub struct LabImage;
+pub struct LabImage(LabId);
 
 const MAP_W: f32 = 720.0;
 const MAP_H: f32 = 400.0;
@@ -158,30 +161,6 @@ fn blank_image(cfg: &VoronoiConfig) -> Image {
     );
     img.sampler = ImageSampler::nearest();
     img
-}
-
-fn page_node() -> Node {
-    Node {
-        position_type: PositionType::Absolute,
-        width: Val::Percent(100.0),
-        height: Val::Percent(100.0),
-        overflow: Overflow::scroll_y(),
-        flex_direction: FlexDirection::Column,
-        align_items: AlignItems::Center,
-        ..default()
-    }
-}
-
-fn column() -> Node {
-    Node {
-        flex_direction: FlexDirection::Column,
-        width: Val::Percent(100.0),
-        max_width: Val::Px(980.0),
-        padding: UiRect::all(Val::Px(16.0)),
-        row_gap: Val::Px(4.0),
-        flex_shrink: 0.0,
-        ..default()
-    }
 }
 
 fn toggle(parent: &mut ChildSpawnerCommands, label: &str, action: LabAction) {
@@ -214,108 +193,85 @@ fn slider(parent: &mut ChildSpawnerCommands, title: &str, param: SliderParam) {
     });
 }
 
-/// A full-width row button with a gold title and a dim note.
-fn lab_row(parent: &mut ChildSpawnerCommands, lab: LabId, n: usize) {
-    let mut labels = Vec::new();
-    let mut e = parent.spawn((
-        Button,
-        Node {
-            flex_direction: FlexDirection::Column,
-            width: Val::Percent(100.0),
-            padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
-            margin: UiRect::vertical(Val::Px(3.0)),
-            border: UiRect::all(Val::Px(1.0)),
-            border_radius: BorderRadius::all(Val::Px(6.0)),
-            row_gap: Val::Px(2.0),
-            ..default()
-        },
-        BackgroundColor(PANEL2),
-        BorderColor::all(LINE),
-        LabAction::Open(lab),
-        BtnKind::Choice,
-        Enabled(true),
-        Selected(false),
-    ));
-    e.with_children(|b| {
-        labels.push(b.spawn(text(format!("{n}. {}", lab.title()), 15.0, GOLD)).id());
-        labels.push(b.spawn(text(lab.blurb(), 13.0, DIM)).id());
-    });
-    e.insert(BtnLabel::new(labels));
-}
-
 pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg: Res<LabsConfig>) {
-    let image = images.add(blank_image(&cfg.0));
-    commands.insert_resource(Labs {
-        state: LabState::new(&cfg.0),
-        image: image.clone(),
-        key: String::new(),
-        base: None,
-        shown: String::new(),
-        hover: None,
-        drag: None,
-        playing: false,
-        timer: 0.0,
-        last_cfg: cfg.0,
-    });
+    let views: Vec<LabView> = LabId::ALL
+        .iter()
+        .map(|_| LabView { image: images.add(blank_image(&cfg.0)), key: String::new(), base: None, shown: String::new() })
+        .collect();
+    let handles: Vec<Handle<Image>> = views.iter().map(|v| v.image.clone()).collect();
+    commands.insert_resource(Labs { state: LabState::new(&cfg.0), views, hover: None, drag: None, playing: None, timer: 0.0, last_cfg: cfg.0 });
 
-    // --- Start page ---
-    commands.spawn((StartPage, page_node(), BackgroundColor(BG), ScrollPosition::default(), GlobalZIndex(10))).with_children(|m| {
-        m.spawn(column()).with_children(|c| {
-            c.spawn(text("Successor Stars", 26.0, TEXT));
-            c.spawn((
-                text("Voronoi labs for procedural maps, territories and effects — and the fleet battle.", 14.0, DIM),
-                Node { margin: UiRect::bottom(Val::Px(10.0)), ..default() },
-            ));
-            c.spawn(panel()).with_children(|p| {
-                card_title(p, "Config", "Shared by every lab below: change it here and each lab redraws from it.");
-                p.spawn(Node { align_items: AlignItems::Center, ..row() }).with_children(|r| {
-                    r.spawn((text("Seed", 13.5, GOLD), Node { width: Val::Px(160.0), ..default() }));
-                    r.spawn((LabText::Seed, text("", 14.0, TEXT), Node { width: Val::Px(110.0), ..default() }));
-                    button_for(r, "−1", LabAction::SeedDelta(-1), BtnKind::Normal);
-                    button_for(r, "+1", LabAction::SeedDelta(1), BtnKind::Normal);
-                    button_for(r, "New seed", LabAction::NewSeed, BtnKind::Primary);
+    commands
+        .spawn((
+            StartPage,
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                overflow: Overflow::scroll_y(),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(BG),
+            ScrollPosition::default(),
+            GlobalZIndex(10),
+        ))
+        .with_children(|m| {
+            m.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                width: Val::Percent(100.0),
+                max_width: Val::Px(980.0),
+                padding: UiRect::all(Val::Px(16.0)),
+                row_gap: Val::Px(4.0),
+                flex_shrink: 0.0,
+                ..default()
+            })
+            .with_children(|c| {
+                c.spawn(Node { align_items: AlignItems::Center, column_gap: Val::Px(16.0), ..row() }).with_children(|r| {
+                    r.spawn(text("Successor Stars", 26.0, TEXT));
+                    button_for(r, "Fleet battle & campaign →", LabAction::Game, BtnKind::Primary);
                 });
-                slider(p, "Sites", SliderParam::Sites);
-                metric_row(p);
-                let relax: Vec<(String, LabAction)> = (0..=5).map(|n| (n.to_string(), LabAction::Relax(n))).collect();
-                choice_row(p, "Lloyd rounds", &relax);
-                p.spawn(text("Map 720 × 400. Lloyd rounds apply to the biome island and the painted island.", 12.5, DIM));
-            });
-            for (i, lab) in LabId::ALL.iter().enumerate() {
-                lab_row(c, *lab, i + 1);
-            }
-            c.spawn(Node { height: Val::Px(8.0), ..default() });
-            c.spawn(row()).with_children(|r| {
-                button_for(r, "Fleet battle & campaign →", LabAction::Game, BtnKind::Primary);
-            });
-        });
-    });
-
-    // --- Lab page ---
-    commands.spawn((LabPage, page_node(), BackgroundColor(BG), ScrollPosition::default(), GlobalZIndex(10))).with_children(|m| {
-        m.spawn(column()).with_children(|c| {
-            c.spawn(Node { align_items: AlignItems::Center, column_gap: Val::Px(12.0), ..row() }).with_children(|r| {
-                button_for(r, "← Labs", LabAction::Back, BtnKind::Normal);
-                r.spawn((LabText::Title, text("", 20.0, TEXT)));
-            });
-            c.spawn((LabText::Blurb, text("", 13.0, DIM)));
-            c.spawn((LabText::Config, text("", 12.5, DIM)));
-            c.spawn(panel()).with_children(|p| {
-                for lab in LabId::ALL {
-                    p.spawn((LabControls(lab), Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(6.0), ..default() }))
-                        .with_children(|l| lab_controls(l, lab));
+                c.spawn((
+                    text("Voronoi labs for procedural maps, territories and effects.", 14.0, DIM),
+                    Node { margin: UiRect::bottom(Val::Px(10.0)), ..default() },
+                ));
+                c.spawn(panel()).with_children(|p| {
+                    card_title(p, "Config", "Shared by every lab below: change it here and each lab redraws from it.");
+                    p.spawn(Node { align_items: AlignItems::Center, ..row() }).with_children(|r| {
+                        r.spawn((text("Seed", 13.5, GOLD), Node { width: Val::Px(160.0), ..default() }));
+                        r.spawn((LabText::Seed, text("", 14.0, TEXT), Node { width: Val::Px(110.0), ..default() }));
+                        button_for(r, "−1", LabAction::SeedDelta(-1), BtnKind::Normal);
+                        button_for(r, "+1", LabAction::SeedDelta(1), BtnKind::Normal);
+                        button_for(r, "New seed", LabAction::NewSeed, BtnKind::Primary);
+                    });
+                    slider(p, "Sites", SliderParam::Sites);
+                    metric_row(p);
+                    let relax: Vec<(String, LabAction)> = (0..=5).map(|n| (n.to_string(), LabAction::Relax(n))).collect();
+                    choice_row(p, "Lloyd rounds", &relax);
+                    p.spawn(text("Map 720 × 400. Lloyd rounds apply to the biome island and the painted island.", 12.5, DIM));
+                });
+                for (i, lab) in LabId::ALL.iter().enumerate() {
+                    c.spawn(panel()).with_children(|p| {
+                        card_title(p, &format!("{}. {}", i + 1, lab.title()), lab.blurb());
+                        lab_controls(p, *lab);
+                        p.spawn((LabText::Status(*lab), text("", 13.0, GREEN)));
+                        p.spawn((
+                            LabImage(*lab),
+                            ImageNode::new(handles[i].clone()),
+                            RelativeCursorPosition::default(),
+                            Node {
+                                width: Val::Px(MAP_W),
+                                max_width: Val::Percent(100.0),
+                                aspect_ratio: Some(MAP_W / MAP_H),
+                                flex_shrink: 0.0,
+                                ..default()
+                            },
+                        ));
+                    });
                 }
-                p.spawn((LabText::Status, text("", 13.0, GREEN)));
             });
-            c.spawn((
-                LabImage,
-                ImageNode::new(image),
-                RelativeCursorPosition::default(),
-                Interaction::default(),
-                Node { width: Val::Px(MAP_W), max_width: Val::Percent(100.0), aspect_ratio: Some(MAP_W / MAP_H), flex_shrink: 0.0, ..default() },
-            ));
         });
-    });
 }
 
 fn metric_row(p: &mut ChildSpawnerCommands) {
@@ -328,7 +284,7 @@ fn lab_controls(l: &mut ChildSpawnerCommands, lab: LabId) {
         LabId::Grow => {
             slider(l, "Grow radius", SliderParam::GrowRadius);
             l.spawn(row()).with_children(|r| {
-                button_for(r, "▶ Play", LabAction::Play, BtnKind::Primary);
+                button_for(r, "▶ Play", LabAction::Play(lab), BtnKind::Primary);
                 toggle(r, "Growth fronts", LabAction::GrowFronts);
             });
         }
@@ -338,7 +294,6 @@ fn lab_controls(l: &mut ChildSpawnerCommands, lab: LabId) {
             l.spawn(text("Drag anywhere on the map to move the probe.", 12.5, DIM));
         }
         LabId::OwnerMap => {
-            metric_row(l);
             l.spawn(row()).with_children(|r| toggle(r, "Borders", LabAction::OwnerBorders));
         }
         LabId::Delaunay => {
@@ -346,15 +301,15 @@ fn lab_controls(l: &mut ChildSpawnerCommands, lab: LabId) {
                 toggle(r, "Voronoi cells", LabAction::Cells);
                 toggle(r, "Delaunay triangles", LabAction::Triangles);
                 toggle(r, "Circumcircles", LabAction::Circles);
-                button_for(r, "Reset", LabAction::ResetLab, BtnKind::Normal);
+                button_for(r, "Reset", LabAction::Reset(lab), BtnKind::Normal);
             });
             l.spawn(text("Click a site to select it and show its neighbours · drag a site to move it · click empty space to add one.", 12.5, DIM));
         }
         LabId::Lloyd => {
             l.spawn(row()).with_children(|r| {
                 button_for(r, "Step", LabAction::LloydStep, BtnKind::Normal);
-                button_for(r, "▶ Play", LabAction::Play, BtnKind::Primary);
-                button_for(r, "Reset", LabAction::ResetLab, BtnKind::Normal);
+                button_for(r, "▶ Play", LabAction::Play(lab), BtnKind::Primary);
+                button_for(r, "Reset", LabAction::Reset(lab), BtnKind::Normal);
                 toggle(r, "Show centroids", LabAction::Centroids);
             });
         }
@@ -375,7 +330,7 @@ fn lab_controls(l: &mut ChildSpawnerCommands, lab: LabId) {
             });
             l.spawn(row()).with_children(|r| {
                 toggle(r, "Use weights", LabAction::UseWeights);
-                button_for(r, "Reset", LabAction::ResetLab, BtnKind::Normal);
+                button_for(r, "Reset", LabAction::Reset(lab), BtnKind::Normal);
             });
             l.spawn(text("Drag a base to move it. Hatched ground is contested (runner-up within 6%).", 12.5, DIM));
         }
@@ -396,11 +351,8 @@ fn lab_controls(l: &mut ChildSpawnerCommands, lab: LabId) {
     }
 }
 
-fn current_lab(phase: Phase) -> Option<LabId> {
-    match phase {
-        Phase::Lab(l) => Some(l),
-        _ => None,
-    }
+fn on_start(phase: &Phase) -> bool {
+    *phase == Phase::Start
 }
 
 pub fn handle_lab_buttons(
@@ -408,59 +360,56 @@ pub fn handle_lab_buttons(
     mut cfg: ResMut<LabsConfig>,
     mut labs: ResMut<Labs>,
     mut requests: MessageWriter<AppRequest>,
-    phase: Res<Phase>,
 ) {
-    let lab = current_lab(*phase);
+    let labs = &mut *labs;
     for (interaction, action, enabled) in &buttons {
         if *interaction != Interaction::Pressed || !enabled.0 {
             continue;
         }
         let st = &mut labs.state;
         match *action {
-            LabAction::Open(l) => {
-                requests.write(AppRequest::OpenLab(l));
-                labs.playing = false;
-            }
             LabAction::Back => {
                 requests.write(AppRequest::Labs);
-                labs.playing = false;
             }
             LabAction::Game => {
+                labs.playing = None;
                 requests.write(AppRequest::Menu);
             }
             LabAction::SeedDelta(d) => cfg.0.seed = cfg.0.seed.saturating_add_signed(d).max(1),
             LabAction::NewSeed => cfg.0.seed = super::random_seed() % 2_000_000_000 + 1,
             LabAction::Metric(m) => cfg.0.metric = m,
             LabAction::Relax(n) => cfg.0.relax = n,
-            LabAction::Play => {
-                if lab == Some(LabId::Grow) && st.grow_radius >= LabState::grow_max(&cfg.0) {
-                    st.grow_radius = 0.0;
-                }
-                if lab == Some(LabId::Lloyd) && st.lloyd_settled() {
-                    *st = LabState { lloyd: None, lloyd_round: 0, lloyd_moved: f32::INFINITY, ..st.clone() };
-                }
-                labs.playing = !labs.playing;
-            }
-            LabAction::GrowFronts => st.grow_fronts = !st.grow_fronts,
-            LabAction::DistanceLines => st.distance_lines = !st.distance_lines,
-            LabAction::OwnerBorders => st.owner_borders = !st.owner_borders,
-            LabAction::Cells => st.show_cells = !st.show_cells,
-            LabAction::Triangles => st.show_triangles = !st.show_triangles,
-            LabAction::Circles => st.show_circles = !st.show_circles,
-            LabAction::ResetLab => {
-                let fresh = LabState::new(&cfg.0);
-                match lab {
-                    Some(LabId::Delaunay) => {
-                        st.edited = None;
-                        st.selected = None;
+            LabAction::Play(lab) => {
+                if labs.playing == Some(lab) {
+                    labs.playing = None;
+                } else {
+                    if lab == LabId::Grow && st.grow_radius >= LabState::grow_max(&cfg.0) {
+                        st.grow_radius = 0.0;
                     }
-                    Some(LabId::Lloyd) => {
+                    if lab == LabId::Lloyd && st.lloyd_settled() {
                         st.lloyd = None;
                         st.lloyd_round = 0;
                         st.lloyd_moved = f32::INFINITY;
-                        labs.playing = false;
                     }
-                    Some(LabId::Influence) => {
+                    labs.playing = Some(lab);
+                }
+            }
+            LabAction::Reset(lab) => {
+                let fresh = LabState::new(&cfg.0);
+                match lab {
+                    LabId::Delaunay => {
+                        st.edited = None;
+                        st.selected = None;
+                    }
+                    LabId::Lloyd => {
+                        st.lloyd = None;
+                        st.lloyd_round = 0;
+                        st.lloyd_moved = f32::INFINITY;
+                        if labs.playing == Some(lab) {
+                            labs.playing = None;
+                        }
+                    }
+                    LabId::Influence => {
                         st.bases = fresh.bases;
                         st.weights = fresh.weights;
                         st.alive = fresh.alive;
@@ -469,9 +418,17 @@ pub fn handle_lab_buttons(
                     _ => {}
                 }
             }
+            LabAction::GrowFronts => st.grow_fronts = !st.grow_fronts,
+            LabAction::DistanceLines => st.distance_lines = !st.distance_lines,
+            LabAction::OwnerBorders => st.owner_borders = !st.owner_borders,
+            LabAction::Cells => st.show_cells = !st.show_cells,
+            LabAction::Triangles => st.show_triangles = !st.show_triangles,
+            LabAction::Circles => st.show_circles = !st.show_circles,
             LabAction::LloydStep => {
                 st.lloyd_step(&cfg.0);
-                labs.playing = false;
+                if labs.playing == Some(LabId::Lloyd) {
+                    labs.playing = None;
+                }
             }
             LabAction::Centroids => st.show_centroids = !st.show_centroids,
             LabAction::BiomeBorders => st.biome_borders = !st.biome_borders,
@@ -522,7 +479,9 @@ pub fn drag_sliders(
             }
             SliderParam::GrowRadius => {
                 labs.state.grow_radius = v;
-                labs.playing = false;
+                if labs.playing == Some(LabId::Grow) {
+                    labs.playing = None;
+                }
             }
             SliderParam::Crack => labs.state.crack = v,
             SliderParam::Weight(i) => labs.state.weights[i] = v,
@@ -530,45 +489,52 @@ pub fn drag_sliders(
     }
 }
 
-/// Clicks and drags on the lab image.
+/// Clicks and drags on the lab images.
 pub fn lab_pointer(
     mouse: Res<ButtonInput<MouseButton>>,
-    image: Query<&RelativeCursorPosition, With<LabImage>>,
+    images: Query<(&LabImage, &RelativeCursorPosition)>,
     phase: Res<Phase>,
     cfg: Res<LabsConfig>,
     mut labs: ResMut<Labs>,
 ) {
-    let Some(lab) = current_lab(*phase) else {
+    if !on_start(&phase) {
         labs.drag = None;
+        labs.hover = None;
         return;
-    };
-    let Ok(cursor) = image.single() else { return };
+    }
     let cfg = cfg.0;
-    let p = cursor.normalized.map(|n| MapVec::new((n.x + 0.5) * cfg.w as f32, (n.y + 0.5) * cfg.h as f32));
-    let over = cursor.cursor_over();
-    let hover = if over && lab == LabId::Island { p } else { None };
+    let to_map = |n: Vec2| MapVec::new((n.x + 0.5) * cfg.w as f32, (n.y + 0.5) * cfg.h as f32);
+    let clamp = |p: MapVec| p.clamp(MapVec::ZERO, MapVec::new(cfg.w as f32 - 0.5, cfg.h as f32 - 0.5));
+
+    // Hover zoom on the painted island.
+    let hover = images
+        .iter()
+        .find(|(img, c)| img.0 == LabId::Island && c.cursor_over())
+        .and_then(|(_, c)| c.normalized.map(|n| (LabId::Island, to_map(n))));
     if labs.hover != hover {
         labs.hover = hover;
     }
-    let Some(p) = p else { return };
-    let clamped = p.clamp(MapVec::ZERO, MapVec::new(cfg.w as f32 - 0.5, cfg.h as f32 - 0.5));
-    if mouse.just_pressed(MouseButton::Left) && over {
+
+    if mouse.just_pressed(MouseButton::Left) {
+        let Some((lab, p)) = images.iter().find(|(_, c)| c.cursor_over()).and_then(|(img, c)| c.normalized.map(|n| (img.0, to_map(n))))
+        else {
+            return;
+        };
         let st = &mut labs.state;
         let drag = match lab {
             LabId::Nearest => {
-                st.probe = clamped;
+                st.probe = clamp(p);
                 Some(Drag::Probe)
             }
             LabId::Delaunay => {
-                let sites = st.sites(&cfg, lab);
+                let mut sites = st.sites(&cfg, lab);
                 match site_at(&sites, p, 9.0) {
                     Some(i) => {
                         st.selected = Some(i);
                         Some(Drag::Site(i))
                     }
                     None => {
-                        let mut sites = sites;
-                        sites.push(clamped);
+                        sites.push(clamp(p));
                         st.selected = Some(sites.len() - 1);
                         st.edited = Some(sites);
                         None
@@ -578,21 +544,24 @@ pub fn lab_pointer(
             LabId::Influence => site_at(&st.bases, p, 12.0).map(Drag::Base),
             _ => None,
         };
-        labs.drag = drag;
+        labs.drag = drag.map(|d| (lab, d));
     } else if mouse.pressed(MouseButton::Left)
-        && let Some(drag) = labs.drag
+        && let Some((lab, drag)) = labs.drag
     {
+        // Keep following the pointer even when it leaves the image.
+        let Some(p) = images.iter().find(|(img, _)| img.0 == lab).and_then(|(_, c)| c.normalized).map(to_map) else { return };
+        let p = clamp(p);
         let st = &mut labs.state;
         match drag {
-            Drag::Probe => st.probe = clamped,
+            Drag::Probe => st.probe = p,
             Drag::Site(i) => {
                 let mut sites = st.sites(&cfg, LabId::Delaunay);
-                if i < sites.len() && sites[i] != clamped {
-                    sites[i] = clamped;
+                if i < sites.len() && sites[i] != p {
+                    sites[i] = p;
                     st.edited = Some(sites);
                 }
             }
-            Drag::Base(i) => st.bases[i] = clamped,
+            Drag::Base(i) => st.bases[i] = p,
         }
     } else if !mouse.pressed(MouseButton::Left) {
         labs.drag = None;
@@ -601,16 +570,16 @@ pub fn lab_pointer(
 
 /// Play: grow the seeds, or run Lloyd rounds until nothing moves.
 pub fn animate_labs(time: Res<Time>, phase: Res<Phase>, cfg: Res<LabsConfig>, mut labs: ResMut<Labs>) {
-    if !labs.playing {
-        return;
+    if !on_start(&phase) {
+        labs.playing = None;
     }
     let dt = time.delta_secs();
-    match current_lab(*phase) {
+    match labs.playing {
         Some(LabId::Grow) => {
             let max = LabState::grow_max(&cfg.0);
             labs.state.grow_radius = (labs.state.grow_radius + 90.0 * dt).min(max);
             if labs.state.grow_radius >= max {
-                labs.playing = false;
+                labs.playing = None;
             }
         }
         Some(LabId::Lloyd) => {
@@ -619,87 +588,87 @@ pub fn animate_labs(time: Res<Time>, phase: Res<Phase>, cfg: Res<LabsConfig>, mu
                 labs.timer = 0.0;
                 labs.state.lloyd_step(&cfg.0);
                 if labs.state.lloyd_settled() {
-                    labs.playing = false;
+                    labs.playing = None;
                 }
             }
         }
-        _ => labs.playing = false,
+        _ => {}
     }
 }
 
-/// Re-renders the lab image when its inputs change.
-pub fn render_lab(phase: Res<Phase>, cfg: Res<LabsConfig>, mut labs: ResMut<Labs>, mut images: ResMut<Assets<Image>>) {
-    let Some(lab) = current_lab(*phase) else { return };
-    // Coarse previews while something is being dragged or animated.
-    let quick = labs.drag.is_some() || (labs.playing && lab == LabId::Grow);
-    let step = if quick { 2 } else { 1 };
-    let key = format!("{:?}|{:?}|{:?}|{step}", cfg.0, lab, labs.state);
-    if key != labs.key || labs.base.is_none() {
-        let canvas = render(&cfg.0, lab, &labs.state, step);
-        labs.base = Some(canvas);
-        labs.key = key;
-    }
-    let shown = format!("{}|{:?}", labs.key, labs.hover.map(|h| (h.x as i32, h.y as i32)));
-    if shown == labs.shown {
+/// Re-renders the lab images whose inputs changed: the lab being dragged,
+/// animated or hovered first, then at most a couple of others per frame.
+pub fn render_labs(
+    phase: Res<Phase>,
+    cfg: Res<LabsConfig>,
+    slider: Res<ActiveSlider>,
+    mut labs: ResMut<Labs>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if !on_start(&phase) {
         return;
     }
-    let Some(base) = labs.base.as_ref() else { return };
-    let rgba = match labs.hover {
-        Some(h) if lab == LabId::Island => zoom_inset(base, h).to_rgba(),
-        _ => base.to_rgba(),
-    };
-    let handle = labs.image.clone();
-    if let Some(mut img) = images.get_mut(&handle) {
-        img.data = Some(rgba);
+    let labs = &mut *labs;
+    let busy = labs.drag.map(|d| d.0).or(labs.playing);
+    let sliding_config = slider.0 == Some(SliderParam::Sites);
+    let mut budget = RENDERS_PER_FRAME;
+    let mut order: Vec<usize> = (0..LABS).collect();
+    if let Some(b) = busy {
+        order.sort_by_key(|i| LabId::ALL[*i] != b);
     }
-    labs.shown = shown;
+    for i in order {
+        let lab = LabId::ALL[i];
+        // Coarse previews while dragging, animating or sliding the site count.
+        let quick = busy == Some(lab) || sliding_config;
+        let step = if quick { 2 } else { 1 };
+        let key = format!("{:?}|{}|{step}", cfg.0, labs.state.key_for(lab));
+        let view = &mut labs.views[i];
+        if key != view.key || view.base.is_none() {
+            if budget == 0 && busy != Some(lab) {
+                continue;
+            }
+            budget = budget.saturating_sub(1);
+            view.base = Some(render(&cfg.0, lab, &labs.state, step));
+            view.key = key;
+        }
+        let hover = labs.hover.filter(|h| h.0 == lab).map(|h| h.1);
+        let shown = format!("{}|{:?}", view.key, hover.map(|h| (h.x as i32, h.y as i32)));
+        if shown == view.shown {
+            continue;
+        }
+        let Some(base) = view.base.as_ref() else { continue };
+        let rgba = match hover {
+            Some(h) => zoom_inset(base, h).to_rgba(),
+            None => base.to_rgba(),
+        };
+        if let Some(mut img) = images.get_mut(&view.image) {
+            img.data = Some(rgba);
+        }
+        view.shown = shown;
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn update_lab_ui(
     phase: Res<Phase>,
     cfg: Res<LabsConfig>,
     labs: Res<Labs>,
     mut texts: Query<(&LabText, &mut Text)>,
-    mut fills: Query<(&SliderFill, &mut Node), (Without<SliderValue>, Without<LabControls>, Without<StartPage>, Without<LabPage>)>,
+    mut fills: Query<(&SliderFill, &mut Node), Without<StartPage>>,
     mut values: Query<(&SliderValue, &mut Text), Without<LabText>>,
-    mut controls: Query<(&LabControls, &mut Node), (Without<SliderFill>, Without<StartPage>, Without<LabPage>)>,
-    mut start: Query<&mut Node, (With<StartPage>, Without<LabPage>, Without<SliderFill>, Without<LabControls>)>,
-    mut page: Query<&mut Node, (With<LabPage>, Without<StartPage>, Without<SliderFill>, Without<LabControls>)>,
+    mut start: Query<&mut Node, (With<StartPage>, Without<SliderFill>)>,
 ) {
-    let lab = current_lab(*phase);
-    let show = |node: &mut Node, on: bool| {
-        let d = if on { Display::Flex } else { Display::None };
-        if node.display != d {
-            node.display = d;
-        }
-    };
     for mut n in &mut start {
-        show(&mut n, *phase == Phase::Start);
-    }
-    for mut n in &mut page {
-        show(&mut n, lab.is_some());
-    }
-    for (c, mut n) in &mut controls {
-        show(&mut n, lab == Some(c.0));
+        let d = if on_start(&phase) { Display::Flex } else { Display::None };
+        if n.display != d {
+            n.display = d;
+        }
     }
     let c = cfg.0;
     let st = &labs.state;
     for (which, mut t) in &mut texts {
         let s = match which {
             LabText::Seed => c.seed.to_string(),
-            LabText::Title => lab.map_or(String::new(), |l| l.title().to_string()),
-            LabText::Blurb => lab.map_or(String::new(), |l| l.blurb().to_string()),
-            LabText::Config => format!(
-                "Config: seed {} · {} sites · {} · {} Lloyd round(s) · {}×{}  (change it on the labs page)",
-                c.seed,
-                c.sites,
-                c.metric.name(),
-                c.relax,
-                c.w,
-                c.h
-            ),
-            LabText::Status => lab.map_or(String::new(), |l| status(&c, l, st)),
+            LabText::Status(l) => status(&c, *l, st),
         };
         if t.0 != s {
             t.0 = s;
@@ -721,13 +690,7 @@ pub fn update_lab_ui(
 }
 
 /// Selected/label state of the lab buttons.
-pub fn lab_button_state(
-    phase: Res<Phase>,
-    cfg: Res<LabsConfig>,
-    labs: Res<Labs>,
-    mut buttons: Query<(&LabAction, &mut Selected, &BtnLabel)>,
-    mut texts: Query<&mut Text>,
-) {
+pub fn lab_button_state(cfg: Res<LabsConfig>, labs: Res<Labs>, mut buttons: Query<(&LabAction, &mut Selected, &BtnLabel)>, mut texts: Query<&mut Text>) {
     let st = &labs.state;
     let c = cfg.0;
     for (action, mut sel, labels) in &mut buttons {
@@ -746,14 +709,13 @@ pub fn lab_button_state(
             LabAction::UseWeights => st.use_weights,
             LabAction::Mode(m) => st.noise_mode == m,
             LabAction::Preset(p) => st.preset == p,
-            LabAction::Open(l) => *phase == Phase::Lab(l),
             _ => false,
         };
         if sel.0 != on {
             sel.0 = on;
         }
         let label = match *action {
-            LabAction::Play => Some(if labs.playing { "⏸ Pause".to_string() } else { "▶ Play".to_string() }),
+            LabAction::Play(l) => Some(if labs.playing == Some(l) { "⏸ Pause".to_string() } else { "▶ Play".to_string() }),
             LabAction::Destroy(i) => Some(if st.alive[i] { format!("Destroy {}", FACTIONS[i].0) } else { format!("Rebuild {}", FACTIONS[i].0) }),
             _ => None,
         };
@@ -767,12 +729,11 @@ pub fn lab_button_state(
     }
 }
 
-/// Wheel scrolling for the start and lab pages.
+/// Wheel scrolling for the start page.
 pub fn scroll_labs(
     mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
     phase: Res<Phase>,
-    mut start: Query<&mut ScrollPosition, (With<StartPage>, Without<LabPage>)>,
-    mut page: Query<&mut ScrollPosition, (With<LabPage>, Without<StartPage>)>,
+    mut start: Query<&mut ScrollPosition, With<StartPage>>,
 ) {
     let dy: f32 = wheel
         .read()
@@ -781,15 +742,10 @@ pub fn scroll_labs(
             bevy::input::mouse::MouseScrollUnit::Pixel => ev.y,
         })
         .sum();
-    if dy == 0.0 {
+    if dy == 0.0 || !on_start(&phase) {
         return;
     }
-    let target = match *phase {
-        Phase::Start => start.single_mut().ok(),
-        Phase::Lab(_) => page.single_mut().ok(),
-        _ => None,
-    };
-    if let Some(mut s) = target {
+    if let Ok(mut s) = start.single_mut() {
         s.0.y = (s.0.y - dy).max(0.0);
     }
 }

@@ -1,5 +1,5 @@
 //! Scripted smoke run for development: `SG_AUTOPLAY=<dir> cargo run`
-//! drives the real app through the start page, two Voronoi labs, the menu, one spectated battle per fleet
+//! drives the real app through the start page (top and scrolled to the labs), the menu, one spectated battle per fleet
 //! shape (each must end with a winner) and the campaign map, saving
 //! screenshots to <dir> and exiting. Not compiled for the web.
 
@@ -9,7 +9,6 @@ use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use super::camera::CameraRig;
 use super::flow::{AppRequest, Phase, SeedSource, Speed};
 use crate::sim::battle::{Battle, Control, SimSettings, Skirmish};
-use crate::voronoi::labs::LabId;
 use crate::sim::components::Division;
 use crate::sim::scenario::SHOWCASE;
 use crate::sim::spatial::SpatialHash;
@@ -48,6 +47,7 @@ pub fn autoplay(
     phase: Res<Phase>,
     battle: Res<Battle>,
     divs: Query<(Entity, &Division)>,
+    mut start_scroll: Query<&mut ScrollPosition, With<super::lab_ui::StartPage>>,
 ) {
     auto.frame += 1;
     let f = auto.frame;
@@ -72,20 +72,15 @@ pub fn autoplay(
         }
         // Screenshots land a frame late, so each page change waits a beat.
         99 if since == 10 => {
-            requests.write(AppRequest::OpenLab(LabId::Delaunay));
+            if let Ok(mut s) = start_scroll.single_mut() {
+                s.0.y = 2400.0;
+            }
             next(&mut auto);
         }
         100 if since == 20 => {
-            shot(&mut commands, "00-lab-delaunay");
-            next(&mut auto);
-        }
-        101 if since == 10 => {
-            requests.write(AppRequest::OpenLab(LabId::Island));
-            next(&mut auto);
-        }
-        102 if since == 20 => {
-            shot(&mut commands, "00-lab-island");
-            next(&mut auto);
+            shot(&mut commands, "00-start-labs");
+            auto.step = 103;
+            auto.wait_from = f;
         }
         103 if since == 10 => {
             requests.write(AppRequest::Menu);

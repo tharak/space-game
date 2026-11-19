@@ -85,7 +85,7 @@ impl Plugin for GamePlugin {
                     model::build_model.in_set(Stage::Model),
                     (lab_ui::handle_lab_buttons, lab_ui::drag_sliders, lab_ui::lab_pointer, lab_ui::scroll_labs).chain().in_set(Stage::Input),
                     lab_ui::animate_labs.in_set(Stage::Apply),
-                    (lab_ui::render_lab, lab_ui::update_lab_ui, lab_ui::lab_button_state).chain().in_set(Stage::Present).before(ui::style_buttons),
+                    (lab_ui::render_labs, lab_ui::update_lab_ui, lab_ui::lab_button_state).chain().in_set(Stage::Present).before(ui::style_buttons),
                     (
                         flow::log_events,
                         view::collect_fx,
