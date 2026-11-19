@@ -151,10 +151,10 @@ pub struct CribOpen(pub bool);
 pub struct SkirmishSetup(pub Skirmish);
 
 /// Squadron counts and sizes offered on the menu.
-pub const SQUADRON_CHOICES: [usize; 4] = [3, 5, 7, 9];
-pub const SHIP_CHOICES: [usize; 4] = [20, 40, 60, 80];
+pub const SQUADRON_CHOICES: [usize; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+pub const SHIP_CHOICES: [usize; 10] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
 /// Most divisions a side can have (fighting squadrons + the flagship's).
-pub const MAX_DIVISIONS: usize = 10;
+pub const MAX_DIVISIONS: usize = 11;
 
 /// Shows the skirmish's fleet sizes on the menu.
 #[derive(Component)]

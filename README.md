@@ -20,7 +20,7 @@ This started as a port of the [BattleStars](https://github.com/tharak/BattleStar
 
 ## How to play
 
-For a single battle, set up a **Skirmish** on the menu: which side you command (or spectate), each side's formation, the number of squadrons (3–9, plus the flagship's squadron), the ships in each squadron (20–80), and the enemy AI. When you command a fleet, the battle starts paused so you can give orders first.
+For a single battle, set up a **Skirmish** on the menu: which side you command (or spectate), each side's formation, the number of squadrons (1–10, plus the flagship's squadron), the ships in each squadron (10–100), and the enemy AI. When you command a fleet, the battle starts paused so you can give orders first.
 
 | Input | Action |
 | --- | --- |

@@ -269,7 +269,7 @@ fn every_fleet_shape_fights_to_a_decision() {
 #[test]
 fn squadron_layouts_spawn_every_ship() {
     for shape in super::scenario::FleetShape::ALL {
-        for (squadrons, per) in [(1, 20), (2, 20), (3, 20), (4, 60), (9, 80)] {
+        for (squadrons, per) in [(1, 10), (2, 20), (3, 20), (4, 60), (6, 40), (10, 100)] {
             let k = Skirmish { shapes: [shape, shape], squadrons, per_squadron: per };
             let mut world = World::new();
             init_world(&mut world, SimSettings { skirmish: Some(k), control: Control::Spectate, ..default() }, 1);
@@ -278,4 +278,15 @@ fn squadron_layouts_spawn_every_ship() {
             assert_eq!(divs, 2 * (squadrons + 1), "{shape:?} {squadrons}x{per}");
         }
     }
+}
+
+/// Not run by default: `cargo test --release -- --ignored biggest`.
+#[test]
+#[ignore]
+fn biggest_skirmish_timing() {
+    let k = Skirmish { shapes: [super::scenario::FleetShape::Arrow, super::scenario::FleetShape::Line], squadrons: 10, per_squadron: 100 };
+    let t = std::time::Instant::now();
+    let r = simulate(SimSettings { skirmish: Some(k), ships: k.ships(), ..default() }, 3, None);
+    let wall = t.elapsed().as_secs_f32();
+    println!("10x100: {:?} after {:.0}s battle time, {:.1}s wall, {:.2} ms/step", r.winner, r.time, wall, wall * 1000.0 / (r.time / DT));
 }
