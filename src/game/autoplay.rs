@@ -1,19 +1,17 @@
 //! Scripted smoke run for development: `SG_AUTOPLAY=<dir> cargo run`
-//! drives the real app through the menu, a commanded battle and a
-//! spectated one, saving screenshots to <dir> and exiting. Not compiled for
-//! the web.
+//! drives the real app through the menu, one spectated battle per fleet
+//! shape (each must end with a winner) and the campaign map, saving
+//! screenshots to <dir> and exiting. Not compiled for the web.
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 
 use super::camera::CameraRig;
 use super::flow::{AppRequest, Phase, SeedSource, Speed};
-use super::input::Selection;
-use crate::sim::Command;
-use crate::sim::battle::{Battle, Control, SimSettings};
-use crate::sim::components::{Division, Order};
+use crate::sim::battle::{Battle, Control, SimSettings, Skirmish};
+use crate::sim::components::Division;
+use crate::sim::scenario::SHOWCASE;
 use crate::sim::spatial::SpatialHash;
-use crate::campaign::map::{FORTRESS, HUB};
 
 #[derive(Resource)]
 pub struct Autoplay {
@@ -21,16 +19,16 @@ pub struct Autoplay {
     frame: u32,
     step: u32,
     wait_from: u32,
-    prebattles: u32,
-    shot_campaign_battle: bool,
-    last_phase: Phase,
+    /// Which `SHOWCASE` battle is on.
+    battle: usize,
+    shot_fight: bool,
 }
 
 impl Autoplay {
     pub fn from_env() -> Option<Self> {
         std::env::var("SG_AUTOPLAY").ok().map(|dir| {
             std::fs::create_dir_all(&dir).ok();
-            Self { dir, frame: 0, step: 0, wait_from: 0, prebattles: 0, shot_campaign_battle: false, last_phase: Phase::Menu }
+            Self { dir, frame: 0, step: 0, wait_from: 0, battle: 0, shot_fight: false }
         })
     }
 }
@@ -42,16 +40,13 @@ pub fn autoplay(
     mut settings: ResMut<SimSettings>,
     mut seed: ResMut<SeedSource>,
     mut requests: MessageWriter<AppRequest>,
-    mut orders: MessageWriter<Command>,
     mut speed: ResMut<Speed>,
-    mut sel: ResMut<Selection>,
     mut exit: MessageWriter<AppExit>,
     rig: Res<CameraRig>,
     hash: Res<SpatialHash>,
     phase: Res<Phase>,
     battle: Res<Battle>,
     divs: Query<(Entity, &Division)>,
-    mut camp: ResMut<super::campaign_ui::CampaignState>,
 ) {
     auto.frame += 1;
     let f = auto.frame;
@@ -61,148 +56,74 @@ pub fn autoplay(
         info!("autoplay screenshot {path}");
         commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
     };
-    let find = |side: usize, number: usize| divs.iter().find(|(_, d)| d.side == side && d.number == number).map(|(e, _)| e);
     let since = f - auto.wait_from;
     let next = |auto: &mut Autoplay| {
         auto.step += 1;
         auto.wait_from = f;
     };
+    let shapes = SHOWCASE[auto.battle.min(SHOWCASE.len() - 1)];
+    let name = format!("{:02}-{}-vs-{}", auto.battle + 2, shapes[0].name(), shapes[1].name()).to_lowercase();
     match auto.step {
         0 if f == 40 => {
             shot(&mut commands, "01-menu");
             next(&mut auto);
         }
         1 if since == 5 => {
-            *settings = SimSettings { scenario: 0, ships: 240, control: Control::PlayBlue, ..default() };
+            let k = Skirmish { shapes, ..default() };
+            *settings = SimSettings { skirmish: Some(k), ships: k.ships(), control: Control::Spectate, ..default() };
             seed.0 = 7;
+            auto.shot_fight = false;
             requests.write(AppRequest::Start);
             next(&mut auto);
         }
-        2 if since == 40 => {
-            shot(&mut commands, "02-battle-start");
-            // Click the spearhead's ship the way a player would.
-            let tip = find(0, 3).expect("B3 exists");
-            let ship = hash.divisions.get(&tip).and_then(|d| d.members.first()).map(|i| hash.entries[*i as usize].pos);
-            let screen = rig.world_to_screen(ship.expect("B3 has ships"));
-            let world = rig.screen_to_world(screen);
-            let picked = super::input::pick_division(&hash, world, rig.scale);
-            assert_eq!(picked.map(|p| p.0), Some(tip), "screen/world pick round-trip failed");
-            sel.division = Some(tip);
-            next(&mut auto);
-        }
-        3 if since == 20 => {
-            shot(&mut commands, "03-selected");
-            // Swing the reserve out to the left as a flank guard, then go.
-            let reserve = find(0, 6).expect("B6 exists");
-            orders.write(Command::Order { division: reserve, order: Order::MoveTo { to: Vec2::new(-700.0, 500.0), facing: 0.0 } });
+        2 if since == 30 => {
+            shot(&mut commands, &format!("{name}-a-start"));
+            // A ship picked on screen must map back to its division.
+            if let Some((e, _)) = divs.iter().find(|(_, d)| d.side == 0 && d.number == 1) {
+                let ship = hash.divisions.get(&e).and_then(|d| d.members.first()).map(|i| hash.entries[*i as usize].pos);
+                let world = rig.screen_to_world(rig.world_to_screen(ship.expect("B1 has ships")));
+                let picked = super::input::pick_division(&hash, world, rig.scale);
+                assert_eq!(picked.map(|p| p.0), Some(e), "screen/world pick round-trip failed");
+            }
             speed.paused = false;
             speed.mult = 8;
             next(&mut auto);
         }
-        4 if battle.time > 52.0 => {
-            shot(&mut commands, "04-contact");
-            next(&mut auto);
+        3 => {
+            if battle.time > 70.0 && !auto.shot_fight {
+                auto.shot_fight = true;
+                shot(&mut commands, &format!("{name}-b-fight"));
+            }
+            if *phase == Phase::Over {
+                let winner = battle.result.as_ref().and_then(|r| r.winner);
+                assert!(winner.is_some(), "{} vs {} ended in a draw", shapes[0].name(), shapes[1].name());
+                next(&mut auto);
+            }
         }
-        5 if battle.time > 95.0 => {
-            shot(&mut commands, "05-breakthrough");
-            next(&mut auto);
+        4 if since == 10 => {
+            shot(&mut commands, &format!("{name}-c-result"));
+            auto.battle += 1;
+            if auto.battle < SHOWCASE.len() {
+                auto.step = 1;
+                auto.wait_from = f;
+            } else {
+                next(&mut auto);
+            }
         }
-        6 if *phase == Phase::Over => {
-            shot(&mut commands, "06-result");
-            next(&mut auto);
-        }
-        7 if since == 20 => {
-            *settings = SimSettings { scenario: 2, ships: 480, control: Control::Spectate, ..default() };
-            requests.write(AppRequest::Start);
-            next(&mut auto);
-        }
-        8 if since >= 5 => {
-            speed.mult = 8;
-            next(&mut auto);
-        }
-        9 if battle.time > 80.0 => {
-            shot(&mut commands, "07-spectate-480");
-            next(&mut auto);
-        }
-        10 if *phase == Phase::Over => {
-            shot(&mut commands, "08-spectate-result");
-            next(&mut auto);
-        }
-        11 if since == 30 => {
+        5 if since == 20 => {
             requests.write(AppRequest::NewCampaign);
             next(&mut auto);
         }
-        12 if since == 40 => {
-            shot(&mut commands, "09-campaign-map");
-            // Fleet 3 waits at Aster Reach, fleet 4 at Brine: send them
-            // into the two corridors.
-            camp.fleet = Some(3);
-            super::campaign_ui::order_move(&mut camp, FORTRESS);
-            camp.fleet = Some(4);
-            super::campaign_ui::order_move(&mut camp, HUB);
-            camp.system = Some(HUB);
+        6 if since == 40 => {
+            shot(&mut commands, "07-campaign-map");
             next(&mut auto);
         }
-        13 if since == 20 => {
-            shot(&mut commands, "10-campaign-orders");
-            next(&mut auto);
-        }
-        14 => {
-            // Play turns: auto-resolve the first battle, fight the second.
-            if *phase != auto.last_phase {
-                auto.last_phase = *phase;
-                auto.wait_from = f;
-            }
-            let since = f - auto.wait_from;
-            match *phase {
-                Phase::Campaign if !camp.turn_open && since > 10 => {
-                    let turn = camp.c.as_ref().map_or(0, |c| c.turn);
-                    if turn >= 9 || camp.c.as_ref().is_some_and(|c| c.winner.is_some()) {
-                        shot(&mut commands, "14-campaign-later");
-                        next(&mut auto);
-                    } else {
-                        requests.write(AppRequest::EndTurn);
-                        auto.wait_from = f;
-                    }
-                }
-                Phase::PreBattle if since == 10 && auto.prebattles == 0 => {
-                    shot(&mut commands, "11-prebattle");
-                }
-                Phase::PreBattle if since > 25 => {
-                    auto.prebattles += 1;
-                    if auto.prebattles == 1 {
-                        requests.write(AppRequest::AutoResolve);
-                    } else if auto.prebattles == 2 {
-                        requests.write(AppRequest::Fight);
-                    } else {
-                        requests.write(AppRequest::AutoResolve);
-                    }
-                    auto.wait_from = f;
-                }
-                Phase::Battle if since > 10 && (speed.paused || speed.mult != 8) => {
-                    speed.paused = false;
-                    speed.mult = 8;
-                }
-                Phase::Battle if battle.time > 60.0 && !auto.shot_campaign_battle => {
-                    auto.shot_campaign_battle = true;
-                    shot(&mut commands, "12-campaign-battle");
-                }
-                Phase::Over if since == 10 => {
-                    shot(&mut commands, "13-campaign-battle-result");
-                }
-                Phase::Over if since > 25 => {
-                    requests.write(AppRequest::ReturnToCampaign);
-                    auto.wait_from = f;
-                }
-                _ => {}
-            }
-        }
-        15 if since == 30 => {
+        7 if since == 20 => {
             exit.write(AppExit::Success);
         }
         _ => {}
     }
-    if f > 60 * 60 * 20 {
+    if f > 60 * 60 * 15 {
         panic!("autoplay timed out at step {}", auto.step);
     }
 }

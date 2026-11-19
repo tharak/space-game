@@ -20,7 +20,7 @@ This started as a port of the [BattleStars](https://github.com/tharak/BattleStar
 
 ## How to play
 
-Pick a side, a fleet size (120/240/480 ships a side), an opponent and a scenario. When you command a fleet, the battle starts paused so you can give orders first.
+For a single battle, set up a **Skirmish** on the menu: which side you command (or spectate), each side's formation, the number of squadrons (3–9, plus the flagship's squadron), the ships in each squadron (20–80), and the enemy AI. When you command a fleet, the battle starts paused so you can give orders first.
 
 | Input | Action |
 | --- | --- |
@@ -121,10 +121,10 @@ Every ship is an entity, and so is every division. The simulation is ordinary EC
 cargo test --lib                          # sim + campaign tests (formations, blocking, morale, supply, income, battles, saves)
 cargo run                                 # native window
 cargo run --release --bin sim -- 25 240   # battle balance table
-cargo run --release --bin sim -- --rust 25 240   # regenerate src/sim/odds.rs (the win rates shown on the menu)
+cargo run --release --bin sim -- --rust 25 240   # regenerate src/sim/odds.rs (simulated win rates per scenario)
 cargo run --release --bin campaign_sim -- 16   # AI-vs-AI wars
 cargo run --release --example trace -- 0 c 1   # timeline of Arrow vs Line, commander AI, seed 1
-SG_AUTOPLAY=/tmp/shots cargo run          # scripted run, saves PNGs
+SG_AUTOPLAY=/tmp/shots cargo run          # one battle per formation (must not draw) + campaign map, saves PNGs
 ./scripts/build-web.sh                    # wasm bundle into dist/ (python3 -m http.server -d dist)
 ```
 

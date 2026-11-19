@@ -14,10 +14,10 @@ use super::input::{PointerMode, Selection};
 use super::model::{Spans, UiModel};
 use super::theme::*;
 use crate::sim::Command;
-use crate::sim::battle::{AiKind, Control, SimSettings};
+use crate::sim::battle::{AiKind, Control, SimSettings, Skirmish};
 use crate::sim::components::Order;
 use crate::sim::formation::Formation;
-use crate::sim::scenario::{FleetShape, SCENARIOS, Scenario};
+use crate::sim::scenario::FleetShape;
 use super::campaign_ui::{CampaignState, PLAYER};
 use crate::campaign::state::{absorb_garrison, raise_fleet};
 
@@ -41,9 +41,11 @@ pub enum UiAction {
     CloseOverlay,
     ToggleCrib,
     Control(Control),
-    Ships(usize),
     Ai(AiKind),
-    Scenario(usize),
+    SkShape(usize, FleetShape),
+    SkSquadrons(usize),
+    SkShips(usize),
+    StartSkirmish,
     Pause,
     Speed(u32),
     Division(usize, usize),
@@ -70,7 +72,6 @@ pub enum BtnKind {
     Primary,
     Danger,
     Choice,
-    Scenario,
     List,
 }
 
@@ -145,6 +146,20 @@ pub enum OverlayText {
 #[derive(Resource, Default)]
 pub struct CribOpen(pub bool);
 
+/// The skirmish being set up on the menu.
+#[derive(Resource, Default)]
+pub struct SkirmishSetup(pub Skirmish);
+
+/// Squadron counts and sizes offered on the menu.
+pub const SQUADRON_CHOICES: [usize; 4] = [3, 5, 7, 9];
+pub const SHIP_CHOICES: [usize; 4] = [20, 40, 60, 80];
+/// Most divisions a side can have (fighting squadrons + the flagship's).
+pub const MAX_DIVISIONS: usize = 10;
+
+/// Shows the skirmish's fleet sizes on the menu.
+#[derive(Component)]
+pub struct SkirmishSummary;
+
 // ---------------------------------------------------------------------------
 // Builders
 // ---------------------------------------------------------------------------
@@ -198,37 +213,6 @@ fn button(parent: &mut ChildSpawnerCommands, label: &str, action: UiAction, kind
     entity.id()
 }
 
-/// A full-width menu button with a gold title and a dim note.
-fn scenario_button(parent: &mut ChildSpawnerCommands, index: usize, s: &Scenario) {
-    let mut labels = Vec::new();
-    let mut entity = parent.spawn((
-        Button,
-        Node {
-            flex_direction: FlexDirection::Column,
-            width: Val::Percent(100.0),
-            padding: UiRect::axes(Val::Px(14.0), Val::Px(10.0)),
-            margin: UiRect::vertical(Val::Px(4.0)),
-            border: UiRect::all(Val::Px(1.0)),
-            border_radius: BorderRadius::all(Val::Px(6.0)),
-            row_gap: Val::Px(2.0),
-            ..default()
-        },
-        BackgroundColor(PANEL2),
-        BorderColor::all(LINE),
-        UiAction::Scenario(index),
-        BtnKind::Scenario,
-        Enabled(true),
-        Selected(false),
-    ));
-    entity.with_children(|b| {
-        labels.push(b.spawn(text(format!("{}. {}", index + 1, s.title), 15.0, GOLD)).id());
-        labels.push(b.spawn(text(format!("{} vs {}", s.fleets[0].name(), s.fleets[1].name()), 13.0, TEXT)).id());
-        labels.push(b.spawn(text(s.blurb, 13.0, DIM)).id());
-        labels.push(b.spawn(text("", 12.5, GREEN)).id());
-    });
-    entity.insert(BtnLabel(labels));
-}
-
 /// A full-width, left-aligned row button for the division list.
 fn list_button(parent: &mut ChildSpawnerCommands, action: UiAction) {
     let mut labels = Vec::new();
@@ -252,15 +236,22 @@ fn list_button(parent: &mut ChildSpawnerCommands, action: UiAction) {
     entity.insert(BtnLabel(labels));
 }
 
-fn option_group(parent: &mut ChildSpawnerCommands, title: &str, choices: &[(&str, UiAction)]) {
-    parent.spawn(panel()).with_children(|p| {
-        p.spawn(row()).with_children(|r| {
-            r.spawn((text(title, 14.0, GOLD), Node { margin: UiRect::right(Val::Px(6.0)), align_self: AlignSelf::Center, ..default() }));
-            for (label, action) in choices {
-                button(r, label, *action, BtnKind::Choice);
-            }
-        });
+/// A labelled row of choice buttons inside a card.
+fn choice_row(parent: &mut ChildSpawnerCommands, title: &str, choices: &[(String, UiAction)]) {
+    parent.spawn(Node { align_items: AlignItems::Center, ..row() }).with_children(|r| {
+        r.spawn((
+            text(title, 13.5, GOLD),
+            Node { width: Val::Px(160.0), margin: UiRect::right(Val::Px(6.0)), align_self: AlignSelf::Center, ..default() },
+        ));
+        for (label, action) in choices {
+            button(r, label, *action, BtnKind::Choice);
+        }
     });
+}
+
+fn card_title(parent: &mut ChildSpawnerCommands, title: &str, note: &str) {
+    parent.spawn(text(title, 17.0, TEXT));
+    parent.spawn(text(note, 13.0, DIM));
 }
 
 pub fn setup_ui(mut commands: Commands) {
@@ -293,42 +284,44 @@ pub fn setup_ui(mut commands: Commands) {
                 ..default()
             })
             .with_children(|c| {
-                c.spawn(text("Successor Stars — fleet battle", 22.0, TEXT));
-                c.spawn(text(
-                    "Hundreds of ships a side, in divisions you command in real time (pause any time). \
-                     Formation is everything: a deep arrow can tear a hole in a thin line, a crescent can close on an \
-                     arrow's flanks, and shots into a ship's flank or rear hit far more often than shots into its front.",
-                    14.0,
-                    DIM,
+                c.spawn(text("Successor Stars", 26.0, TEXT));
+                c.spawn((
+                    text("Fleets of hundreds of ships, commanded by squadron in real time (pause any time).", 14.0, DIM),
+                    Node { margin: UiRect::bottom(Val::Px(10.0)), ..default() },
                 ));
-                option_group(c, "Campaign:", &[
-                    ("New campaign", UiAction::NewCampaign),
-                    ("Continue", UiAction::ContinueCampaign),
-                ]);
-                c.spawn(text(
-                    "Command the Meridian Compact's fleets across a galaxy split by the Shroud nebula. Take systems for ship \
-                     income, keep your supply lines to the capital, and fight (or auto-resolve) every battle. Or pick a \
-                     single skirmish below.",
-                    13.0,
-                    DIM,
-                ));
-                option_group(c, "Control:", &[
-                    ("Command Blue (left)", UiAction::Control(Control::PlayBlue)),
-                    ("Command Red (right)", UiAction::Control(Control::PlayRed)),
-                    ("Spectate (AI vs AI)", UiAction::Control(Control::Spectate)),
-                ]);
-                option_group(c, "Fleet size:", &[
-                    ("120 ships a side", UiAction::Ships(120)),
-                    ("240 ships a side", UiAction::Ships(240)),
-                    ("480 ships a side", UiAction::Ships(480)),
-                ]);
-                option_group(c, "Opponent:", &[
-                    ("Commander — pins, flanks, keeps a reserve", UiAction::Ai(AiKind::Commander)),
-                    ("Formation only — opening orders, never adapts", UiAction::Ai(AiKind::Advance)),
-                ]);
-                for (i, s) in SCENARIOS.iter().enumerate() {
-                    scenario_button(c, i, s);
-                }
+                c.spawn(panel()).with_children(|p| {
+                    card_title(p, "Campaign", "Lead the Meridian Compact across a galaxy split by the Shroud nebula: take systems, keep supply lines, fight or auto-resolve every battle.");
+                    p.spawn(row()).with_children(|r| {
+                        button(r, "New campaign", UiAction::NewCampaign, BtnKind::Primary);
+                        button(r, "Continue", UiAction::ContinueCampaign, BtnKind::Normal);
+                    });
+                });
+                c.spawn(panel()).with_children(|p| {
+                    card_title(p, "Skirmish", "One battle, set up your way.");
+                    choice_row(p, "You command", &[
+                        ("Blue".into(), UiAction::Control(Control::PlayBlue)),
+                        ("Red".into(), UiAction::Control(Control::PlayRed)),
+                        ("Spectate".into(), UiAction::Control(Control::Spectate)),
+                    ]);
+                    for (side, title) in [(0, "Blue formation"), (1, "Red formation")] {
+                        let choices: Vec<(String, UiAction)> =
+                            FleetShape::ALL.iter().map(|f| (f.name().to_string(), UiAction::SkShape(side, *f))).collect();
+                        choice_row(p, title, &choices);
+                    }
+                    let squads: Vec<(String, UiAction)> =
+                        SQUADRON_CHOICES.iter().map(|n| (n.to_string(), UiAction::SkSquadrons(*n))).collect();
+                    choice_row(p, "Squadrons", &squads);
+                    let ships: Vec<(String, UiAction)> = SHIP_CHOICES.iter().map(|n| (n.to_string(), UiAction::SkShips(*n))).collect();
+                    choice_row(p, "Squadron size", &ships);
+                    choice_row(p, "Enemy AI", &[
+                        ("Commander".into(), UiAction::Ai(AiKind::Commander)),
+                        ("Formation only".into(), UiAction::Ai(AiKind::Advance)),
+                    ]);
+                    p.spawn((SkirmishSummary, text("", 13.0, DIM)));
+                    p.spawn(row()).with_children(|r| {
+                        button(r, "Start battle", UiAction::StartSkirmish, BtnKind::Primary);
+                    });
+                });
             });
         });
 
@@ -366,7 +359,7 @@ pub fn setup_ui(mut commands: Commands) {
             s.spawn(panel()).with_children(|p| {
                 p.spawn(Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(3.0), ..default() }).with_children(|l| {
                     for side in 0..2 {
-                        for number in 1..=6 {
+                        for number in 1..=MAX_DIVISIONS {
                             list_button(l, UiAction::Division(side, number));
                         }
                     }
@@ -620,6 +613,7 @@ pub fn handle_buttons(
     mut crib: ResMut<CribOpen>,
     mut overlay_hidden: ResMut<OverlayHidden>,
     mut camp: ResMut<CampaignState>,
+    mut setup: ResMut<SkirmishSetup>,
     model: Res<UiModel>,
 ) {
     for (interaction, action, enabled) in &buttons {
@@ -642,10 +636,14 @@ pub fn handle_buttons(
             UiAction::CloseOverlay => overlay_hidden.0 = true,
             UiAction::ToggleCrib => crib.0 = !crib.0,
             UiAction::Control(c) => settings.control = c,
-            UiAction::Ships(n) => settings.ships = n,
             UiAction::Ai(a) => settings.ai = [a; 2],
-            UiAction::Scenario(i) => {
-                settings.scenario = i;
+            UiAction::SkShape(side, shape) => setup.0.shapes[side] = shape,
+            UiAction::SkSquadrons(n) => setup.0.squadrons = n,
+            UiAction::SkShips(n) => setup.0.per_squadron = n,
+            UiAction::StartSkirmish => {
+                settings.skirmish = Some(setup.0);
+                settings.forces = None;
+                settings.ships = setup.0.ships();
                 requests.write(AppRequest::Start);
             }
             UiAction::Pause => speed.paused = !speed.paused,
@@ -743,33 +741,6 @@ pub fn handle_buttons(
     }
 }
 
-/// "Simulated: Arrow 64% · Line 36% · ~3.2 min" for the chosen opponent.
-pub fn odds_text(scenario: usize, ai: AiKind) -> String {
-    use crate::sim::odds::{BATTLES, ODDS, SHIPS};
-    let s = &SCENARIOS[scenario];
-    let o = ODDS[scenario][if ai == AiKind::Commander { 0 } else { 1 }];
-    let other = (100.0 - o.win - o.draw).max(0.0);
-    let (a, b) = if s.low_supply {
-        ("Supplied".to_string(), "Low supply".to_string())
-    } else if s.fleets[0] == s.fleets[1] {
-        (format!("{} (A)", s.fleets[0].name()), format!("{} (B)", s.fleets[1].name()))
-    } else {
-        (s.fleets[0].name().to_string(), s.fleets[1].name().to_string())
-    };
-    let who = if ai == AiKind::Commander { "commander AI on both sides" } else { "formation only" };
-    let draws = if o.draw >= 0.5 { format!(" · draws {:.0}%", o.draw) } else { String::new() };
-    format!("Simulated ({who}, {BATTLES} battles at {SHIPS} ships): {a} wins {:.0}% · {b} {:.0}%{draws} · ~{:.1} min", o.win, other, o.minutes)
-}
-
-fn set_label_at(texts: &mut Query<(&mut Text, &mut TextColor)>, labels: &BtnLabel, i: usize, s: &str) {
-    if let Some(t) = labels.0.get(i)
-        && let Ok((mut text, _)) = texts.get_mut(*t)
-        && text.0 != s
-    {
-        text.0 = s.to_string();
-    }
-}
-
 fn campaign_state(action: UiAction, model: &UiModel) -> Option<(bool, bool, bool)> {
     let m = &model.campaign;
     Some(match action {
@@ -787,7 +758,7 @@ fn campaign_state(action: UiAction, model: &UiModel) -> Option<(bool, bool, bool
     })
 }
 
-fn set_label(texts: &mut Query<(&mut Text, &mut TextColor)>, labels: &BtnLabel, s: &str, color: Option<Color>) {
+fn set_label(texts: &mut Query<(&mut Text, &mut TextColor), Without<SkirmishSummary>>, labels: &BtnLabel, s: &str, color: Option<Color>) {
     if let Some(t) = labels.0.first()
         && let Ok((mut text, mut c)) = texts.get_mut(*t)
     {
@@ -806,10 +777,24 @@ fn set_label(texts: &mut Query<(&mut Text, &mut TextColor)>, labels: &BtnLabel, 
 pub fn update_button_state(
     model: Res<UiModel>,
     settings: Res<SimSettings>,
+    setup: Res<SkirmishSetup>,
     crib: Res<CribOpen>,
     mut buttons: Query<(&UiAction, &mut Enabled, &mut Selected, &mut Node, &BtnLabel)>,
-    mut texts: Query<(&mut Text, &mut TextColor)>,
+    mut texts: Query<(&mut Text, &mut TextColor), Without<SkirmishSummary>>,
+    mut summary: Query<&mut Text, With<SkirmishSummary>>,
 ) {
+    if let Ok(mut t) = summary.single_mut() {
+        let k = setup.0;
+        let s = format!(
+            "{} squadrons + the flagship's, {} ships each: {} ships a side.",
+            k.squadrons,
+            k.per_squadron,
+            k.ships()
+        );
+        if t.0 != s {
+            t.0 = s;
+        }
+    }
     for (action, mut enabled, mut selected, mut node, labels) in &mut buttons {
         if let UiAction::CampFleet(i) = *action {
             let (on, sel, visible) = match model.campaign.fleets.get(i) {
@@ -849,12 +834,10 @@ pub fn update_button_state(
             UiAction::Formation(f) => (model.can_order, model.formation == Some(f), true),
             UiAction::Copy => (model.result.is_some(), false, true),
             UiAction::Control(v) => (true, settings.control == v, true),
-            UiAction::Ships(v) => (true, settings.ships == v, true),
             UiAction::Ai(v) => (true, settings.ai[0] == v, true),
-            UiAction::Scenario(i) => {
-                set_label_at(&mut texts, labels, 3, &odds_text(i, settings.ai[0]));
-                (true, false, true)
-            }
+            UiAction::SkShape(side, f) => (true, setup.0.shapes[side] == f, true),
+            UiAction::SkSquadrons(n) => (true, setup.0.squadrons == n, true),
+            UiAction::SkShips(n) => (true, setup.0.per_squadron == n, true),
             _ => (true, false, true),
         } };
         if enabled.0 != on {

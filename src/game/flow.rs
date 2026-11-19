@@ -153,6 +153,13 @@ pub fn start_battle_with(world: &mut World, intro: Option<Vec<String>>) {
         for l in lines {
             log.push(l, Tone::Plain);
         }
+    } else if let Some(k) = settings.skirmish {
+        log.push(format!("{} — {} ships a side", k.title(), start[0]), Tone::Title);
+        log.push(
+            format!("{} squadrons of {} ships each, plus the flagship's squadron in reserve.", k.squadrons, k.per_squadron),
+            Tone::Plain,
+        );
+        log.push(format!("Blue: {} · Red: {}", k.shapes[0].name(), k.shapes[1].name()), Tone::Plain);
     } else {
         log.push(format!("{} — {} ships a side", scenario.title, start[0]), Tone::Title);
         log.push(scenario.blurb, Tone::Plain);

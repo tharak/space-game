@@ -82,6 +82,32 @@ pub struct Force {
 /// Fewest ships a side can field in a battle.
 pub const MIN_FORCE: u32 = 12;
 
+/// A custom skirmish set up on the menu: each side's formation, how many
+/// fighting squadrons it fields (plus the flagship's), and ships in each.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Skirmish {
+    pub shapes: [super::scenario::FleetShape; 2],
+    pub squadrons: usize,
+    pub per_squadron: usize,
+}
+
+impl Default for Skirmish {
+    fn default() -> Self {
+        Self { shapes: [super::scenario::FleetShape::Arrow, super::scenario::FleetShape::Line], squadrons: 5, per_squadron: 40 }
+    }
+}
+
+impl Skirmish {
+    /// Ships a side, flagship squadron included.
+    pub fn ships(&self) -> usize {
+        (self.squadrons + 1) * self.per_squadron
+    }
+
+    pub fn title(&self) -> String {
+        format!("{} vs {}", self.shapes[0].name(), self.shapes[1].name())
+    }
+}
+
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct SimSettings {
     pub scenario: usize,
@@ -93,11 +119,13 @@ pub struct SimSettings {
     pub mirror: bool,
     /// A campaign battle: replaces the scenario's fleets when set.
     pub forces: Option<[Force; 2]>,
+    /// A menu skirmish: replaces the scenario's fleets when set.
+    pub skirmish: Option<Skirmish>,
 }
 
 impl Default for SimSettings {
     fn default() -> Self {
-        Self { scenario: 0, ships: 240, control: Control::PlayBlue, ai: [AiKind::Commander; 2], mirror: false, forces: None }
+        Self { scenario: 0, ships: 240, control: Control::PlayBlue, ai: [AiKind::Commander; 2], mirror: false, forces: None, skirmish: None }
     }
 }
 

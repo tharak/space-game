@@ -15,7 +15,7 @@ fn main() {
     let seed = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
     let ships = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(240);
     let mut world = World::new();
-    let settings = SimSettings { scenario, ships, ai: [ai; 2], control: Control::Spectate, mirror: false, forces: None };
+    let settings = SimSettings { scenario, ships, ai: [ai; 2], control: Control::Spectate, mirror: false, forces: None, skirmish: None };
     init_world(&mut world, settings, seed);
     let shots = std::env::var("TRACE_PPM").ok();
     let mut next_shot = 0.0;

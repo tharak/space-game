@@ -101,7 +101,10 @@ pub fn build_model(world: &mut World) {
 
     // Status: the clock and each fleet's strength.
     let scenario = SCENARIOS[settings.scenario];
-    let title: String = campaign_title.clone().unwrap_or_else(|| scenario.title.to_string());
+    let title: String = campaign_title
+        .clone()
+        .or_else(|| settings.skirmish.map(|k| k.title()))
+        .unwrap_or_else(|| scenario.title.to_string());
     let state = if phase == Phase::Over {
         "ended"
     } else if speed.paused {

@@ -91,59 +91,95 @@ pub struct DivisionSpec {
     pub flagship: bool,
 }
 
-/// Five fighting divisions plus a flagship reserve.
+/// Five fighting divisions plus a flagship reserve, from a fleet's total.
 pub fn fleet_layout(shape: FleetShape, ships: usize, spacing: f32) -> Vec<DivisionSpec> {
     let reserve = ships / 6;
     let line_total = ships - reserve;
     let sizes: Vec<usize> = (0..5).map(|i| line_total / 5 + usize::from(i < line_total % 5)).collect();
-    let d = sizes[0];
+    squadron_layout(shape, &sizes, reserve, spacing)
+}
+
+/// One division per entry of `sizes` in the fleet's shape, plus a flagship
+/// reserve of `reserve` ships behind them.
+pub fn squadron_layout(shape: FleetShape, sizes: &[usize], reserve: usize, spacing: f32) -> Vec<DivisionSpec> {
+    let n = sizes.len().max(1);
+    let d = sizes.first().copied().unwrap_or(1);
     let line_w = formation::frontage(Formation::Line, d, spacing);
     let gap = spacing * 2.0;
+    // Position across the front, centred on 0.
+    let across = |i: usize| i as f32 - (n as f32 - 1.0) / 2.0;
     let spec = |formation, offset, facing, ships, order| DivisionSpec { formation, offset, facing, ships, order, flagship: false };
     let mut divs: Vec<DivisionSpec> = match shape {
-        FleetShape::Line => (0..5)
-            .map(|i| spec(Formation::Line, Vec2::new(0.0, (i as f32 - 2.0) * (line_w + gap)), 0.0, sizes[i], Order::Advance))
+        FleetShape::Line => sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| spec(Formation::Line, Vec2::new(0.0, across(i) * (line_w + gap)), 0.0, s, Order::Advance))
             .collect(),
         FleetShape::Arrow => {
             // The whole fleet on a narrow front: a wedge tip, swept-back
-            // flanks hugging it, and two columns as the shaft behind.
-            let tip = formation::layout(Formation::Wedge, sizes[2], spacing);
+            // flanks hugging it, and the rest in columns as the shaft behind.
+            let tip = formation::layout(Formation::Wedge, sizes[0], spacing);
             let (tip_back, tip_half) = formation::extent(&tip);
-            let sweep = 0.5f32;
-            let flank_w = formation::frontage(Formation::Line, sizes[1], spacing);
-            let (wy, wx) = (flank_w / 2.0 * sweep.cos(), flank_w / 2.0 * sweep.sin());
-            let col_w = formation::frontage(Formation::Column, sizes[0], spacing);
-            let col_depth = -formation::extent(&formation::layout(Formation::Column, sizes[0], spacing)).0;
-            let flank_x = tip_back * 0.5 - wx;
-            let shaft_x = tip_back - col_depth - 2.0 * gap;
-            vec![
-                spec(Formation::Column, Vec2::new(shaft_x, col_w / 2.0 + gap), 0.0, sizes[0], Order::Charge),
-                spec(Formation::EchelonLeft, Vec2::new(flank_x, tip_half + wy + gap * 0.5), 0.0, sizes[1], Order::Charge),
-                spec(Formation::Wedge, Vec2::ZERO, 0.0, sizes[2], Order::Charge),
-                spec(Formation::EchelonRight, Vec2::new(flank_x, -(tip_half + wy + gap * 0.5)), 0.0, sizes[3], Order::Charge),
-                spec(Formation::Column, Vec2::new(shaft_x, -(col_w / 2.0 + gap)), 0.0, sizes[4], Order::Charge),
-            ]
+            let mut out = vec![spec(Formation::Wedge, Vec2::ZERO, 0.0, sizes[0], Order::Charge)];
+            let mut rest = &sizes[1..];
+            if rest.len() >= 2 {
+                let sweep = 0.5f32;
+                for (k, form) in [(0, Formation::EchelonLeft), (1, Formation::EchelonRight)] {
+                    let flank_w = formation::frontage(Formation::Line, rest[k], spacing);
+                    let (wy, wx) = (flank_w / 2.0 * sweep.cos(), flank_w / 2.0 * sweep.sin());
+                    let flank_x = tip_back * 0.5 - wx;
+                    let y = tip_half + wy + gap * 0.5;
+                    out.push(spec(form, Vec2::new(flank_x, if k == 0 { y } else { -y }), 0.0, rest[k], Order::Charge));
+                }
+                rest = &rest[2..];
+            }
+            // Columns in pairs, row after row; an odd one out goes in the middle.
+            let mut x = tip_back - 2.0 * gap;
+            for pair in rest.chunks(2) {
+                let col_w = formation::frontage(Formation::Column, pair[0], spacing);
+                let depth = -formation::extent(&formation::layout(Formation::Column, pair[0], spacing)).0;
+                let row_x = x - depth;
+                if pair.len() == 2 {
+                    out.push(spec(Formation::Column, Vec2::new(row_x, col_w / 2.0 + gap), 0.0, pair[0], Order::Charge));
+                    out.push(spec(Formation::Column, Vec2::new(row_x, -(col_w / 2.0 + gap)), 0.0, pair[1], Order::Charge));
+                } else {
+                    out.push(spec(Formation::Column, Vec2::new(row_x, 0.0), 0.0, pair[0], Order::Charge));
+                }
+                x = row_x - 2.0 * gap;
+            }
+            // Number them left to right, front to back.
+            out.sort_by(|a, b| b.offset.y.total_cmp(&a.offset.y).then(b.offset.x.total_cmp(&a.offset.x)));
+            out
         }
-        FleetShape::Crescent => (0..5)
-            .map(|i| {
-                let t = i as f32 - 2.0;
-                let a = t * 0.38;
-                let r = 2.6 * line_w;
-                let offset = Vec2::new(r * (1.0 - a.cos()) - 60.0, r * a.sin());
-                // The horns face slightly inward to close on the enemy.
-                spec(Formation::Line, offset, -a * 0.5, sizes[i], Order::Advance)
-            })
-            .collect(),
-        FleetShape::Echelon => (0..5)
-            .map(|i| {
-                let offset = Vec2::new(-((4 - i) as f32) * 90.0, (i as f32 - 2.0) * (line_w + gap));
-                spec(Formation::Line, offset, 0.0, sizes[i], Order::Advance)
+        FleetShape::Crescent => {
+            // Five squadrons span ±0.76 rad; more squadrons keep that arc.
+            let step = if n > 1 { 0.38f32.min(1.52 / (n as f32 - 1.0)) } else { 0.38 };
+            let r = 2.6 * line_w * 0.38 / step;
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| {
+                    let a = across(i) * step;
+                    let offset = Vec2::new(r * (1.0 - a.cos()) - 60.0, r * a.sin());
+                    // The horns face slightly inward to close on the enemy.
+                    spec(Formation::Line, offset, -a * 0.5, s, Order::Advance)
+                })
+                .collect()
+        }
+        FleetShape::Echelon => sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                let offset = Vec2::new(-((n - 1 - i) as f32) * 90.0, across(i) * (line_w + gap));
+                spec(Formation::Line, offset, 0.0, s, Order::Advance)
             })
             .collect(),
         FleetShape::Columns => {
             let col_w = formation::frontage(Formation::Column, d, spacing);
-            (0..5)
-                .map(|i| spec(Formation::Column, Vec2::new(0.0, (i as f32 - 2.0) * (col_w + 9.0 * spacing)), 0.0, sizes[i], Order::Advance))
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| spec(Formation::Column, Vec2::new(0.0, across(i) * (col_w + 9.0 * spacing)), 0.0, s, Order::Advance))
                 .collect()
         }
     };
@@ -182,6 +218,10 @@ pub fn spawn_battle(world: &mut World) {
     // campaign forces when given, otherwise from the scenario.
     let forces: [Force; 2] = match settings.forces {
         Some(f) => f.map(|f| Force { ships: f.ships.max(MIN_FORCE), damaged: f.damaged.min(f.ships), ..f }),
+        None if settings.skirmish.is_some() => {
+            let k = settings.skirmish.unwrap();
+            k.shapes.map(|shape| Force { ships: k.ships() as u32, damaged: 0, shape, mods: SideMods::default() })
+        }
         None => {
             let shapes = if settings.mirror { [scenario.fleets[1], scenario.fleets[0]] } else { scenario.fleets };
             std::array::from_fn(|side| {
@@ -201,7 +241,10 @@ pub fn spawn_battle(world: &mut World) {
         let facing = home_facing(side);
         let centre = Vec2::new(if side == 0 { -START_X } else { START_X }, 0.0);
         let rot = Vec2::from_angle(facing);
-        let layout = fleet_layout(forces[side].shape, forces[side].ships as usize, tuning.spacing);
+        let layout = match (settings.forces, settings.skirmish) {
+            (None, Some(k)) => squadron_layout(forces[side].shape, &vec![k.per_squadron; k.squadrons], k.per_squadron, tuning.spacing),
+            _ => fleet_layout(forces[side].shape, forces[side].ships as usize, tuning.spacing),
+        };
         // Damaged ships are spread evenly through the fleet.
         let (total, damaged) = (forces[side].ships, forces[side].damaged);
         let mut spawned = 0u32;
@@ -273,3 +316,13 @@ pub fn spawn_battle(world: &mut World) {
         ..default()
     };
 }
+
+/// One battle per fleet shape (that shape as Blue), used by the autoplay
+/// smoke run and the no-draw test.
+pub const SHOWCASE: [[FleetShape; 2]; 5] = [
+    [FleetShape::Arrow, FleetShape::Line],
+    [FleetShape::Line, FleetShape::Columns],
+    [FleetShape::Crescent, FleetShape::Arrow],
+    [FleetShape::Echelon, FleetShape::Line],
+    [FleetShape::Columns, FleetShape::Line],
+];

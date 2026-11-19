@@ -56,6 +56,7 @@ impl Plugin for GamePlugin {
             .init_resource::<flow::OverlayHidden>()
             .init_resource::<model::UiModel>()
             .init_resource::<camera::CameraRig>()
+            .init_resource::<ui::SkirmishSetup>()
             .init_resource::<input::Selection>()
             .init_resource::<input::MoveDrag>()
             .init_resource::<view::Fx>()

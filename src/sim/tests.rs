@@ -11,7 +11,7 @@ use super::*;
 
 fn world_for(scenario: usize, ships: usize, ai: AiKind, seed: u32) -> World {
     let mut world = World::new();
-    let settings = SimSettings { scenario, ships, ai: [ai; 2], control: Control::Spectate, mirror: false, forces: None };
+    let settings = SimSettings { scenario, ships, ai: [ai; 2], control: Control::Spectate, mirror: false, forces: None, skirmish: None };
     init_world(&mut world, settings, seed);
     world
 }
@@ -254,4 +254,28 @@ fn friendly_ships_block_the_line_of_fire() {
         rel.perp_dot(v).abs() >= t.los_clearance || rel.dot(v) <= 0.0
     });
     assert!(gap_clear, "second rank should be staggered between first-rank ships");
+}
+
+#[test]
+fn every_fleet_shape_fights_to_a_decision() {
+    use super::scenario::SHOWCASE;
+    for shapes in SHOWCASE {
+        let k = Skirmish { shapes, squadrons: 5, per_squadron: 40 };
+        let r = simulate(SimSettings { skirmish: Some(k), ships: k.ships(), ..default() }, 7, None);
+        assert!(r.winner.is_some(), "{} ended in a draw after {:.0}s ({:?})", k.title(), r.time, r.reason);
+    }
+}
+
+#[test]
+fn squadron_layouts_spawn_every_ship() {
+    for shape in super::scenario::FleetShape::ALL {
+        for (squadrons, per) in [(1, 20), (2, 20), (3, 20), (4, 60), (9, 80)] {
+            let k = Skirmish { shapes: [shape, shape], squadrons, per_squadron: per };
+            let mut world = World::new();
+            init_world(&mut world, SimSettings { skirmish: Some(k), control: Control::Spectate, ..default() }, 1);
+            assert_eq!(world.resource::<Battle>().start, [k.ships() as u32; 2], "{shape:?} {squadrons}x{per}");
+            let divs = world.query::<&Division>().iter(&world).count();
+            assert_eq!(divs, 2 * (squadrons + 1), "{shape:?} {squadrons}x{per}");
+        }
+    }
 }
