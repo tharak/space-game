@@ -6,6 +6,7 @@ pub mod ai;
 pub mod battle;
 pub mod components;
 pub mod formation;
+pub mod odds;
 pub mod rng;
 pub mod scenario;
 pub mod spatial;

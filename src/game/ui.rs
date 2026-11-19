@@ -224,6 +224,7 @@ fn scenario_button(parent: &mut ChildSpawnerCommands, index: usize, s: &Scenario
         labels.push(b.spawn(text(format!("{}. {}", index + 1, s.title), 15.0, GOLD)).id());
         labels.push(b.spawn(text(format!("{} vs {}", s.fleets[0].name(), s.fleets[1].name()), 13.0, TEXT)).id());
         labels.push(b.spawn(text(s.blurb, 13.0, DIM)).id());
+        labels.push(b.spawn(text("", 12.5, GREEN)).id());
     });
     entity.insert(BtnLabel(labels));
 }
@@ -742,6 +743,33 @@ pub fn handle_buttons(
     }
 }
 
+/// "Simulated: Arrow 64% · Line 36% · ~3.2 min" for the chosen opponent.
+pub fn odds_text(scenario: usize, ai: AiKind) -> String {
+    use crate::sim::odds::{BATTLES, ODDS, SHIPS};
+    let s = &SCENARIOS[scenario];
+    let o = ODDS[scenario][if ai == AiKind::Commander { 0 } else { 1 }];
+    let other = (100.0 - o.win - o.draw).max(0.0);
+    let (a, b) = if s.low_supply {
+        ("Supplied".to_string(), "Low supply".to_string())
+    } else if s.fleets[0] == s.fleets[1] {
+        (format!("{} (A)", s.fleets[0].name()), format!("{} (B)", s.fleets[1].name()))
+    } else {
+        (s.fleets[0].name().to_string(), s.fleets[1].name().to_string())
+    };
+    let who = if ai == AiKind::Commander { "commander AI on both sides" } else { "formation only" };
+    let draws = if o.draw >= 0.5 { format!(" · draws {:.0}%", o.draw) } else { String::new() };
+    format!("Simulated ({who}, {BATTLES} battles at {SHIPS} ships): {a} wins {:.0}% · {b} {:.0}%{draws} · ~{:.1} min", o.win, other, o.minutes)
+}
+
+fn set_label_at(texts: &mut Query<(&mut Text, &mut TextColor)>, labels: &BtnLabel, i: usize, s: &str) {
+    if let Some(t) = labels.0.get(i)
+        && let Ok((mut text, _)) = texts.get_mut(*t)
+        && text.0 != s
+    {
+        text.0 = s.to_string();
+    }
+}
+
 fn campaign_state(action: UiAction, model: &UiModel) -> Option<(bool, bool, bool)> {
     let m = &model.campaign;
     Some(match action {
@@ -823,6 +851,10 @@ pub fn update_button_state(
             UiAction::Control(v) => (true, settings.control == v, true),
             UiAction::Ships(v) => (true, settings.ships == v, true),
             UiAction::Ai(v) => (true, settings.ai[0] == v, true),
+            UiAction::Scenario(i) => {
+                set_label_at(&mut texts, labels, 3, &odds_text(i, settings.ai[0]));
+                (true, false, true)
+            }
             _ => (true, false, true),
         } };
         if enabled.0 != on {

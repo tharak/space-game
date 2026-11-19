@@ -120,6 +120,7 @@ Every ship is an entity, and so is every division. The simulation is ordinary EC
 cargo test --lib                          # sim + campaign tests (formations, blocking, morale, supply, income, battles, saves)
 cargo run                                 # native window
 cargo run --release --bin sim -- 25 240   # battle balance table
+cargo run --release --bin sim -- --rust 25 240   # regenerate src/sim/odds.rs (the win rates shown on the menu)
 cargo run --release --bin campaign_sim -- 16   # AI-vs-AI wars
 cargo run --release --example trace -- 0 c 1   # timeline of Arrow vs Line, commander AI, seed 1
 SG_AUTOPLAY=/tmp/shots cargo run          # scripted run, saves PNGs
