@@ -9,6 +9,7 @@
 
 pub mod campaign;
 pub mod game;
+pub mod prototypes;
 pub mod sim;
 pub mod voronoi;
 

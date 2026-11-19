@@ -6,6 +6,10 @@ A real-time fleet battle with hundreds of ships a side, in Rust with [Bevy 0.19]
 
 ## Campaign
 
+## prototype01 — Fleet dominion
+
+The first card on the start page, built from the labs in `src/prototypes/`. Planets are Voronoi regions worth 1–3 resources a turn. Fleets project weighted influence (distance ÷ strength): the side whose fleet dominates a planet collects its income, and contested planets pay nobody. End the turn to bank income, and spend 10 to reinforce a fleet. Drag fleets to move them; tests: `cargo test prototypes`.
+
 ## Voronoi labs
 
 The app opens on a start page that shows every lab with its controls and image. A shared **Config** at the top (seed, site count, distance metric, Lloyd rounds) feeds all nine labs, after the gamegeniuslab tutorial *Voronoi diagrams in game development*:

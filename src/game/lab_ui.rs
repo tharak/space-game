@@ -13,6 +13,7 @@ use bevy::ui::RelativeCursorPosition;
 use super::flow::{AppRequest, Phase};
 use super::theme::*;
 use super::ui::{BtnKind, BtnLabel, Enabled, Selected, button_for, card_title, choice_row, panel, row, text};
+use crate::prototypes::dominion::{self, DrawOptions, Dominion, MAX_STRENGTH, MIN_STRENGTH};
 use crate::voronoi::Vec2 as MapVec;
 use crate::voronoi::labs::{FACTIONS, LabId, LabState, render, site_at, status, zoom_inset};
 use crate::voronoi::metric::Metric;
@@ -46,10 +47,21 @@ struct LabView {
     shown: String,
 }
 
+/// prototype01's state, selection and image.
+struct Proto {
+    d: Dominion,
+    selected: Option<usize>,
+    drag: Option<usize>,
+    regions: bool,
+    borders: bool,
+    view: LabView,
+}
+
 /// Lab state plus each lab's cached image.
 #[derive(Resource)]
 pub struct Labs {
     pub state: LabState,
+    proto: Proto,
     views: Vec<LabView>,
     hover: Option<(LabId, MapVec)>,
     drag: Option<(LabId, Drag)>,
@@ -69,6 +81,12 @@ pub enum LabAction {
     NewSeed,
     Metric(Metric),
     Relax(u32),
+    // prototype01
+    EndTurn,
+    Reinforce,
+    ProtoReset,
+    ProtoRegions,
+    ProtoBorders,
     // Per lab
     Play(LabId),
     Reset(LabId),
@@ -92,6 +110,7 @@ pub enum LabAction {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SliderParam {
     Sites,
+    FleetStrength,
     GrowRadius,
     Crack,
     Weight(usize),
@@ -101,15 +120,17 @@ impl SliderParam {
     fn range(self, cfg: &VoronoiConfig) -> (f32, f32, f32) {
         match self {
             SliderParam::Sites => (3.0, 250.0, 1.0),
+            SliderParam::FleetStrength => (MIN_STRENGTH, MAX_STRENGTH, 0.1),
             SliderParam::GrowRadius => (0.0, LabState::grow_max(cfg), 1.0),
             SliderParam::Crack => (0.5, 10.0, 0.1),
             SliderParam::Weight(_) => (0.2, 4.0, 0.1),
         }
     }
 
-    fn get(self, cfg: &VoronoiConfig, st: &LabState) -> f32 {
+    fn get(self, cfg: &VoronoiConfig, st: &LabState, proto: &Proto) -> f32 {
         match self {
             SliderParam::Sites => cfg.sites as f32,
+            SliderParam::FleetStrength => proto.selected.and_then(|i| proto.d.fleets.get(i)).map_or(MIN_STRENGTH, |f| f.strength),
             SliderParam::GrowRadius => st.grow_radius,
             SliderParam::Crack => st.crack,
             SliderParam::Weight(i) => st.weights[i],
@@ -119,6 +140,7 @@ impl SliderParam {
     fn label(self, v: f32) -> String {
         match self {
             SliderParam::Sites => format!("{v:.0}"),
+            SliderParam::FleetStrength => format!("{v:.1}×"),
             SliderParam::GrowRadius => format!("{v:.0} px"),
             SliderParam::Crack => format!("{v:.1}"),
             SliderParam::Weight(_) => format!("{v:.1}×"),
@@ -140,6 +162,7 @@ pub struct ActiveSlider(Option<SliderParam>);
 #[derive(Component, Clone, Copy, PartialEq)]
 pub enum LabText {
     Seed,
+    Proto,
     Status(LabId),
 }
 
@@ -147,6 +170,8 @@ pub enum LabText {
 pub struct StartPage;
 #[derive(Component)]
 pub struct LabImage(LabId);
+#[derive(Component)]
+pub struct PrototypeImage;
 
 const MAP_W: f32 = 720.0;
 const MAP_H: f32 = 400.0;
@@ -168,15 +193,24 @@ fn toggle(parent: &mut ChildSpawnerCommands, label: &str, action: LabAction) {
 }
 
 fn slider(parent: &mut ChildSpawnerCommands, title: &str, param: SliderParam) {
+    slider_sized(parent, title, param, 160.0, 280.0);
+}
+
+/// A slider in a half-width grid card.
+fn small_slider(parent: &mut ChildSpawnerCommands, title: &str, param: SliderParam) {
+    slider_sized(parent, title, param, 110.0, 200.0);
+}
+
+fn slider_sized(parent: &mut ChildSpawnerCommands, title: &str, param: SliderParam, label_w: f32, track_w: f32) {
     parent.spawn(Node { align_items: AlignItems::Center, column_gap: Val::Px(8.0), ..row() }).with_children(|r| {
-        r.spawn((text(title, 13.5, GOLD), Node { width: Val::Px(160.0), ..default() }));
+        r.spawn((text(title, 13.5, GOLD), Node { width: Val::Px(label_w), ..default() }));
         r.spawn((
             SliderTrack(param),
             Button,
             Interaction::default(),
             RelativeCursorPosition::default(),
             Node {
-                width: Val::Px(280.0),
+                width: Val::Px(track_w),
                 height: Val::Px(16.0),
                 border: UiRect::all(Val::Px(1.0)),
                 border_radius: BorderRadius::all(Val::Px(8.0)),
@@ -199,7 +233,31 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
         .map(|_| LabView { image: images.add(blank_image(&cfg.0)), key: String::new(), base: None, shown: String::new() })
         .collect();
     let handles: Vec<Handle<Image>> = views.iter().map(|v| v.image.clone()).collect();
-    commands.insert_resource(Labs { state: LabState::new(&cfg.0), views, hover: None, drag: None, playing: None, timer: 0.0, last_cfg: cfg.0 });
+    // The labs are drawn at half size: smooth the downscale.
+    for h in &handles {
+        if let Some(mut img) = images.get_mut(h) {
+            img.sampler = ImageSampler::linear();
+        }
+    }
+    let proto_image = images.add(blank_image(&cfg.0));
+    let proto = Proto {
+        d: Dominion::new(&cfg.0),
+        selected: None,
+        drag: None,
+        regions: true,
+        borders: true,
+        view: LabView { image: proto_image.clone(), key: String::new(), base: None, shown: String::new() },
+    };
+    commands.insert_resource(Labs {
+        state: LabState::new(&cfg.0),
+        proto,
+        views,
+        hover: None,
+        drag: None,
+        playing: None,
+        timer: 0.0,
+        last_cfg: cfg.0,
+    });
 
     commands
         .spawn((
@@ -251,27 +309,87 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                     choice_row(p, "Lloyd rounds", &relax);
                     p.spawn(text("Map 720 × 400. Lloyd rounds apply to the biome island and the painted island.", 12.5, DIM));
                 });
-                for (i, lab) in LabId::ALL.iter().enumerate() {
-                    c.spawn(panel()).with_children(|p| {
-                        card_title(p, &format!("{}. {}", i + 1, lab.title()), lab.blurb());
-                        lab_controls(p, *lab);
-                        p.spawn((LabText::Status(*lab), text("", 13.0, GREEN)));
-                        p.spawn((
-                            LabImage(*lab),
-                            ImageNode::new(handles[i].clone()),
-                            RelativeCursorPosition::default(),
-                            Node {
-                                width: Val::Px(MAP_W),
-                                max_width: Val::Percent(100.0),
-                                aspect_ratio: Some(MAP_W / MAP_H),
-                                flex_shrink: 0.0,
-                                ..default()
-                            },
-                        ));
+                section_heading(c, "Prototypes");
+                c.spawn(panel()).with_children(|p| {
+                    card_title(
+                        p,
+                        "prototype01 — Fleet dominion",
+                        "Planets are Voronoi regions worth 1–3 resources a turn (edge regions are empty space). Each fleet \
+                         projects influence by distance ÷ strength; the side whose fleet dominates a planet collects it, \
+                         contested planets pay nobody. End the turn to bank income, spend 10 to reinforce a fleet.",
+                    );
+                    p.spawn(row()).with_children(|r| {
+                        button_for(r, "End turn", LabAction::EndTurn, BtnKind::Primary);
+                        button_for(r, "Reinforce selected (10)", LabAction::Reinforce, BtnKind::Normal);
+                        toggle(r, "Planet regions", LabAction::ProtoRegions);
+                        toggle(r, "Front lines", LabAction::ProtoBorders);
+                        button_for(r, "Reset", LabAction::ProtoReset, BtnKind::Normal);
                     });
-                }
+                    slider(p, "Selected strength", SliderParam::FleetStrength);
+                    p.spawn(text("Drag a fleet to move it · click a fleet to select it.", 12.5, DIM));
+                    p.spawn((LabText::Proto, text("", 13.0, GREEN)));
+                    p.spawn((
+                        PrototypeImage,
+                        ImageNode::new(proto_image),
+                        RelativeCursorPosition::default(),
+                        Node {
+                            width: Val::Px(MAP_W),
+                            max_width: Val::Percent(100.0),
+                            aspect_ratio: Some(MAP_W / MAP_H),
+                            flex_shrink: 0.0,
+                            ..default()
+                        },
+                    ));
+                });
+                section_heading(c, "Labs");
+                c.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
+                    column_gap: Val::Px(12.0),
+                    justify_content: JustifyContent::SpaceBetween,
+                    width: Val::Percent(100.0),
+                    ..default()
+                })
+                .with_children(|g| {
+                    for (i, lab) in LabId::ALL.iter().enumerate() {
+                        g.spawn(panel())
+                            .insert(Node {
+                                flex_direction: FlexDirection::Column,
+                                padding: UiRect::axes(Val::Px(12.0), Val::Px(10.0)),
+                                margin: UiRect::bottom(Val::Px(12.0)),
+                                border: UiRect::all(Val::Px(1.0)),
+                                border_radius: BorderRadius::all(Val::Px(8.0)),
+                                row_gap: Val::Px(6.0),
+                                width: Val::Percent(49.0),
+                                min_width: Val::Px(340.0),
+                                flex_grow: 1.0,
+                                ..default()
+                            })
+                            .with_children(|p| {
+                                card_title(p, &format!("{}. {}", i + 1, lab.title()), lab.blurb());
+                                lab_controls(p, *lab);
+                                p.spawn((LabText::Status(*lab), text("", 12.5, GREEN)));
+                                p.spawn((
+                                    LabImage(*lab),
+                                    ImageNode::new(handles[i].clone()),
+                                    RelativeCursorPosition::default(),
+                                    Node {
+                                        width: Val::Px(MAP_W / 2.0),
+                                        max_width: Val::Percent(100.0),
+                                        aspect_ratio: Some(MAP_W / MAP_H),
+                                        flex_shrink: 0.0,
+                                        ..default()
+                                    },
+                                ));
+                            });
+                    }
+                });
             });
         });
+}
+
+fn section_heading(c: &mut ChildSpawnerCommands, title: &str) {
+    c.spawn((text(title, 18.0, TEXT), Node { margin: UiRect::new(Val::Px(0.0), Val::Px(0.0), Val::Px(10.0), Val::Px(6.0)), ..default() }));
 }
 
 fn metric_row(p: &mut ChildSpawnerCommands) {
@@ -282,7 +400,7 @@ fn metric_row(p: &mut ChildSpawnerCommands) {
 fn lab_controls(l: &mut ChildSpawnerCommands, lab: LabId) {
     match lab {
         LabId::Grow => {
-            slider(l, "Grow radius", SliderParam::GrowRadius);
+            small_slider(l, "Grow radius", SliderParam::GrowRadius);
             l.spawn(row()).with_children(|r| {
                 button_for(r, "▶ Play", LabAction::Play(lab), BtnKind::Primary);
                 toggle(r, "Growth fronts", LabAction::GrowFronts);
@@ -321,7 +439,7 @@ fn lab_controls(l: &mut ChildSpawnerCommands, lab: LabId) {
         }
         LabId::Influence => {
             for (i, (name, _)) in FACTIONS.iter().enumerate() {
-                slider(l, &format!("{name} weight"), SliderParam::Weight(i));
+                small_slider(l, &format!("{name} weight"), SliderParam::Weight(i));
             }
             l.spawn(row()).with_children(|r| {
                 for (i, (name, _)) in FACTIONS.iter().enumerate() {
@@ -340,7 +458,7 @@ fn lab_controls(l: &mut ChildSpawnerCommands, lab: LabId) {
             let presets: Vec<(String, LabAction)> =
                 NoisePreset::ALL.iter().map(|p| (p.name().to_string(), LabAction::Preset(*p))).collect();
             choice_row(l, "Preset", &presets);
-            slider(l, "Crack width", SliderParam::Crack);
+            small_slider(l, "Crack width", SliderParam::Crack);
         }
         LabId::Island => {
             l.spawn(row()).with_children(|r| {
@@ -379,6 +497,18 @@ pub fn handle_lab_buttons(
             LabAction::NewSeed => cfg.0.seed = super::random_seed() % 2_000_000_000 + 1,
             LabAction::Metric(m) => cfg.0.metric = m,
             LabAction::Relax(n) => cfg.0.relax = n,
+            LabAction::EndTurn => labs.proto.d.end_turn(),
+            LabAction::Reinforce => {
+                if let Some(i) = labs.proto.selected {
+                    labs.proto.d.reinforce(i);
+                }
+            }
+            LabAction::ProtoReset => {
+                labs.proto.d = Dominion::new(&cfg.0);
+                labs.proto.selected = None;
+            }
+            LabAction::ProtoRegions => labs.proto.regions = !labs.proto.regions,
+            LabAction::ProtoBorders => labs.proto.borders = !labs.proto.borders,
             LabAction::Play(lab) => {
                 if labs.playing == Some(lab) {
                     labs.playing = None;
@@ -444,6 +574,8 @@ pub fn handle_lab_buttons(
     if cfg.0 != labs.last_cfg {
         let c = cfg.0;
         labs.state.reseed(&c);
+        labs.proto.d = Dominion::new(&c);
+        labs.proto.selected = None;
         labs.last_cfg = c;
     }
 }
@@ -475,6 +607,13 @@ pub fn drag_sliders(
                 let n = v as usize;
                 if cfg.0.sites != n {
                     cfg.0.sites = n;
+                }
+            }
+            SliderParam::FleetStrength => {
+                if let Some(i) = labs.proto.selected
+                    && let Some(f) = labs.proto.d.fleets.get_mut(i)
+                {
+                    f.strength = v;
                 }
             }
             SliderParam::GrowRadius => {
@@ -568,6 +707,38 @@ pub fn lab_pointer(
     }
 }
 
+/// prototype01: click a fleet to select it, drag to move it.
+pub fn proto_pointer(
+    mouse: Res<ButtonInput<MouseButton>>,
+    image: Query<&RelativeCursorPosition, With<PrototypeImage>>,
+    phase: Res<Phase>,
+    cfg: Res<LabsConfig>,
+    mut labs: ResMut<Labs>,
+) {
+    let proto = &mut labs.proto;
+    if !on_start(&phase) || !mouse.pressed(MouseButton::Left) {
+        proto.drag = None;
+        return;
+    }
+    let Ok(cursor) = image.single() else { return };
+    let cfg = cfg.0;
+    let Some(n) = cursor.normalized else { return };
+    let p = MapVec::new((n.x + 0.5) * cfg.w as f32, (n.y + 0.5) * cfg.h as f32)
+        .clamp(MapVec::ZERO, MapVec::new(cfg.w as f32 - 0.5, cfg.h as f32 - 0.5));
+    if mouse.just_pressed(MouseButton::Left) {
+        if !cursor.cursor_over() {
+            return;
+        }
+        let hit = proto.d.fleet_at(p, 14.0);
+        proto.selected = hit;
+        proto.drag = hit;
+    } else if let Some(i) = proto.drag
+        && proto.d.fleets[i].pos != p
+    {
+        proto.d.fleets[i].pos = p;
+    }
+}
+
 /// Play: grow the seeds, or run Lloyd rounds until nothing moves.
 pub fn animate_labs(time: Res<Time>, phase: Res<Phase>, cfg: Res<LabsConfig>, mut labs: ResMut<Labs>) {
     if !on_start(&phase) {
@@ -609,6 +780,24 @@ pub fn render_labs(
         return;
     }
     let labs = &mut *labs;
+    // prototype01 always renders first (full resolution unless dragging).
+    {
+        let proto = &mut labs.proto;
+        let opts = DrawOptions {
+            regions: proto.regions,
+            borders: proto.borders,
+            selected: proto.selected,
+            step: if proto.drag.is_some() { 3 } else { 1 },
+        };
+        let key = format!("{:?}|{:?}|{:?}|{:?}", proto.d.cfg, proto.d.fleets, opts, proto.d.turn);
+        if key != proto.view.key {
+            let rgba = dominion::render(&proto.d, opts).to_rgba();
+            if let Some(mut img) = images.get_mut(&proto.view.image) {
+                img.data = Some(rgba);
+            }
+            proto.view.key = key;
+        }
+    }
     let busy = labs.drag.map(|d| d.0).or(labs.playing);
     let sliding_config = slider.0 == Some(SliderParam::Sites);
     let mut budget = RENDERS_PER_FRAME;
@@ -668,6 +857,7 @@ pub fn update_lab_ui(
     for (which, mut t) in &mut texts {
         let s = match which {
             LabText::Seed => c.seed.to_string(),
+            LabText::Proto => dominion::status(&labs.proto.d, labs.proto.selected),
             LabText::Status(l) => status(&c, *l, st),
         };
         if t.0 != s {
@@ -676,13 +866,17 @@ pub fn update_lab_ui(
     }
     for (f, mut n) in &mut fills {
         let (lo, hi, _) = f.0.range(&c);
-        let pct = ((f.0.get(&c, st) - lo) / (hi - lo)).clamp(0.0, 1.0) * 100.0;
+        let pct = ((f.0.get(&c, st, &labs.proto) - lo) / (hi - lo)).clamp(0.0, 1.0) * 100.0;
         if n.width != Val::Percent(pct) {
             n.width = Val::Percent(pct);
         }
     }
     for (v, mut t) in &mut values {
-        let s = v.0.label(v.0.get(&c, st));
+        let s = if v.0 == SliderParam::FleetStrength && labs.proto.selected.is_none() {
+            "select a fleet".to_string()
+        } else {
+            v.0.label(v.0.get(&c, st, &labs.proto))
+        };
         if t.0 != s {
             t.0 = s;
         }
@@ -690,11 +884,26 @@ pub fn update_lab_ui(
 }
 
 /// Selected/label state of the lab buttons.
-pub fn lab_button_state(cfg: Res<LabsConfig>, labs: Res<Labs>, mut buttons: Query<(&LabAction, &mut Selected, &BtnLabel)>, mut texts: Query<&mut Text>) {
+pub fn lab_button_state(
+    cfg: Res<LabsConfig>,
+    labs: Res<Labs>,
+    mut buttons: Query<(&LabAction, &mut Selected, &mut Enabled, &BtnLabel)>,
+    mut texts: Query<&mut Text>,
+) {
     let st = &labs.state;
     let c = cfg.0;
-    for (action, mut sel, labels) in &mut buttons {
+    let proto = &labs.proto;
+    let can_reinforce = proto.selected.and_then(|i| proto.d.fleets.get(i)).is_some_and(|f| {
+        proto.d.stock[f.side] >= dominion::REINFORCE_COST && f.strength < MAX_STRENGTH
+    });
+    for (action, mut sel, mut enabled, labels) in &mut buttons {
+        let en = !matches!(*action, LabAction::Reinforce) || can_reinforce;
+        if enabled.0 != en {
+            enabled.0 = en;
+        }
         let on = match *action {
+            LabAction::ProtoRegions => proto.regions,
+            LabAction::ProtoBorders => proto.borders,
             LabAction::Metric(m) => c.metric == m,
             LabAction::Relax(n) => c.relax == n,
             LabAction::GrowFronts => st.grow_fronts,

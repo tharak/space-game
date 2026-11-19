@@ -73,7 +73,7 @@ pub fn autoplay(
         // Screenshots land a frame late, so each page change waits a beat.
         99 if since == 10 => {
             if let Ok(mut s) = start_scroll.single_mut() {
-                s.0.y = 2400.0;
+                s.0.y = 900.0;
             }
             next(&mut auto);
         }
