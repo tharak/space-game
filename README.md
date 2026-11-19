@@ -34,7 +34,7 @@ Pick a side, a fleet size (120/240/480 ships a side), an opponent and a scenario
 
 * Ships stop short of enemy ships (a quarter of weapon range) instead of colliding. To get through a line you must destroy the ships in the way.
 * A division that loses ships quickly turns Shaken, then Routs. Staying inside the flagship's command circle steadies it.
-* A fleet breaks when more than half its ships are destroyed, fled or routed.
+* There is no hard break point: the more of a fleet is lost, the shakier all its divisions get, until they rout one by one. Fleets run away or die. Killing the enemy flagship shocks its whole fleet and can set off a cascade of routs.
 
 ## How an arrow breaks a line
 

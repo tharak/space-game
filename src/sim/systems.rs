@@ -268,6 +268,7 @@ pub fn fire(
     let mut contact: Vec<Entity> = Vec::new();
     let mut shock: Vec<(Entity, f32)> = Vec::new();
     let mut closest: Vec<(Entity, f32)> = Vec::new();
+    let mut flag_down: Vec<usize> = Vec::new();
     // Iterate in the hash's stable order so a seed always replays the same.
     for i in 0..hash.entries.len() {
         let me = hash.entries[i];
@@ -316,6 +317,7 @@ pub fn fire(
             hits.push((target, 1.0));
             shock.push((target.division, if arc == 0 { 0.1 } else { 0.25 }));
         }
+        battle.last_shot = battle.time;
         if battle.first_contact.is_none() {
             battle.first_contact = Some(battle.time);
             events.write(SimEvent::Contact);
@@ -357,6 +359,15 @@ pub fn fire(
         if flagship {
             battle.flag_lost[target.side] = true;
             events.write(SimEvent::FlagshipLost { side: target.side });
+            flag_down.push(target.side);
+        }
+    }
+    // Losing the flagship stuns the whole fleet at once.
+    if !flag_down.is_empty() {
+        for mut d in &mut divs {
+            if flag_down.contains(&d.side) {
+                d.shock += tuning.flag_shock;
+            }
         }
     }
 }
@@ -478,6 +489,7 @@ pub fn morale(
     let flag_pos: Vec<(Vec2, usize)> = flagships.iter().map(|(p, s)| (p.0, s.0)).collect();
     let flag_lost = battle.flag_lost;
     let mods = battle.mods;
+    let fleet_left = [battle.remaining(0), battle.remaining(1)];
     for (e, mut d) in &mut divs {
         if d.morale == Morale::Routed || d.alive == 0 {
             continue;
@@ -488,6 +500,7 @@ pub fn morale(
         let lost = 1.0 - d.alive as f32 / d.start.max(1) as f32;
         let stress = d.shock * tuning.k_shock
             + lost * tuning.k_lost
+            + (1.0 - fleet_left[d.side]) * tuning.k_fleet_lost
             + if flag_lost[d.side] { tuning.k_flag_lost } else { 0.0 }
             + mods[d.side].morale
             - if in_command { tuning.k_command } else { 0.0 }
@@ -505,8 +518,9 @@ pub fn morale(
     }
 }
 
-/// A fleet breaks when more than half its ships are destroyed, fled or in
-/// routed divisions. At the time limit the side with more hull left wins.
+/// There is no break point: a battle ends when one side has no fighting
+/// divisions left (all destroyed, fled or routed — morale does the rest).
+/// At the time limit the side with more hull left wins.
 pub fn check_end(
     divs: Query<&Division>,
     ships: Query<(&Ship, &Side, &InDivision)>,
@@ -522,7 +536,7 @@ pub fn check_end(
     }
     let lost: [u32; 2] = std::array::from_fn(|s| battle.start[s].saturating_sub(fighting[s]));
     battle.lost = lost;
-    let broke: [bool; 2] = std::array::from_fn(|s| lost[s] * 2 > battle.start[s]);
+    let broke: [bool; 2] = std::array::from_fn(|s| fighting[s] == 0);
     let (winner, reason) = if broke[0] || broke[1] {
         let frac = |s: usize| lost[s] as f32 / battle.start[s].max(1) as f32;
         let winner = match (broke[0], broke[1]) {
@@ -533,6 +547,18 @@ pub fn check_end(
             _ => None,
         };
         (winner, EndReason::Broke)
+    } else if battle.first_contact.is_some() && battle.time - battle.last_shot > tuning.disengage_after {
+        // Worn-out fleets drift apart. Whoever kept clearly more of its
+        // fleet in the fight holds the field.
+        let left = [battle.remaining(0), battle.remaining(1)];
+        let winner = if (left[0] - left[1]).abs() < 0.1 {
+            None
+        } else if left[0] > left[1] {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        (winner, EndReason::Disengaged)
     } else if battle.time >= tuning.time_limit {
         let mut hull = [0.0f32; 2];
         for (ship, side, div) in &ships {

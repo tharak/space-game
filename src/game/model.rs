@@ -61,7 +61,8 @@ pub fn build_model(world: &mut World) {
     let speed = *world.resource::<Speed>();
     let sel = *world.resource::<Selection>();
     let battle = world.resource::<Battle>().clone();
-    let command_radius = world.resource::<Tuning>().command_radius;
+    let tuning = world.resource::<Tuning>().clone();
+    let command_radius = tuning.command_radius;
     let mut m = UiModel {
         phase,
         spectate: settings.control == Control::Spectate,
@@ -91,6 +92,11 @@ pub fn build_model(world: &mut World) {
     divs.sort_by_key(|(_, d)| (d.side, d.number));
     let flags: Vec<(Vec2, usize)> =
         world.query_filtered::<(&Pos, &Side), With<FleetFlagship>>().iter(world).map(|(p, s)| (p.0, s.0)).collect();
+    let flag_hull: Vec<(usize, f32, f32)> = world
+        .query_filtered::<(&Side, &Ship), With<FleetFlagship>>()
+        .iter(world)
+        .map(|(s, ship)| (s.0, ship.hull, ship.max_hull))
+        .collect();
     let hash = world.resource::<SpatialHash>();
 
     // Status: the clock and each fleet's strength.
@@ -111,13 +117,19 @@ pub fn build_model(world: &mut World) {
     for side in 0..2 {
         let fighting = battle.start[side].saturating_sub(battle.lost[side]);
         let you = if settings.control.human_controls(side) { " (you)" } else { "" };
+        let pct = battle.remaining(side) * 100.0;
         let mut line = vec![
             span(format!("{}{you}: ", side_name(side)), side_color(side)),
             span(format!("{fighting}/{} fighting", battle.start[side]), TEXT),
-            span(format!(" · breaks below {}", battle.start[side] / 2), DIM),
+            span(format!(" ({pct:.0}%)"), if pct < 50.0 { BAD } else { DIM }),
         ];
-        if battle.flag_lost[side] {
-            line.push(span(" · flagship lost", BAD));
+        match flag_hull.iter().find(|(s, _, _)| *s == side) {
+            _ if battle.flag_lost[side] => line.push(span(" · flagship LOST", BAD)),
+            Some((_, hull, max)) => {
+                let c = if *hull <= max * 0.4 { BAD } else if *hull < *max { GOLD } else { DIM };
+                line.push(span(format!(" · flagship {hull:.0}/{max:.0}"), c));
+            }
+            None => {}
         }
         m.status.push(line);
     }
@@ -193,6 +205,13 @@ pub fn build_model(world: &mut World) {
                 battle.start[1 - w]
             ),
             (Some(w), EndReason::TimeLimit) => format!("Time ran out; {} kept more of its fleet in the fight.", side_name(w)),
+            (Some(w), EndReason::Disengaged) => format!(
+                "Both fleets were too shaken to press on. {} kept more of its fleet in the fight ({:.0}% to {:.0}%) and holds the field.",
+                side_name(w),
+                battle.remaining(w) * 100.0,
+                battle.remaining(1 - w) * 100.0
+            ),
+            (None, EndReason::Disengaged) => "Both fleets were too shaken to press on, and drifted apart: draw.".to_string(),
             (None, _) => "Time ran out with both fleets still fighting.".to_string(),
         };
         let line = format!(

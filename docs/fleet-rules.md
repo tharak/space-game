@@ -58,6 +58,13 @@ A **breakthrough** is when enough of a division's ships get behind an enemy divi
 
 ## Victory
 
-A fleet breaks when more than half its ships are destroyed, fled or in routed divisions. After 10 minutes, the fleet with more hull still fighting wins.
+There is **no break point**. Every division's morale stress includes how much of its *whole fleet* is out of the fight (destroyed, fled or routed). As a fleet wears down, all its divisions waver and rout one after another, and fleets run away or die. A battle ends when:
+
+* one side has no fighting divisions left;
+* or nobody has fired for 45 s after contact, because both fleets were too shaken to press on. The side with clearly more of its fleet still fighting (more than 10 points ahead) holds the field; otherwise it's a draw.
+
+**The flagship** (10 hull; regular ships have 5) is the fleet's weak point. When it is destroyed, every division of that fleet takes a sudden shock and stays shakier for the rest of the battle, which can set off a cascade of routs. A fleet that is losing the exchange can still win by reaching and killing the enemy flagship. The status panel shows both flagships' hull and each fleet's fighting %.
+
+After 10 minutes, the fleet with more hull still fighting wins.
 
 All numbers live in `Tuning` (`src/sim/battle.rs`), and `cargo run --release --bin sim` measures what a change does.

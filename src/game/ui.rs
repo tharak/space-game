@@ -430,7 +430,7 @@ pub fn setup_ui(mut commands: Commands) {
                         ("Guns fire in a 60° cone ahead. Ships can only turn a little away from their division's facing, so a division hit from behind must wheel to answer.", DIM),
                         ("Enemy ships block movement: to get through a line you must destroy the ships in the way. Deep formations (wedge, column) close ranks as they lose ships; a line keeps its holes.", DIM),
                         ("Morale: recent losses, total losses, a lost flagship and being broken through push a division to Shaken (slower fire, won't advance) and then Routed (flees, counts as lost). Staying within the flagship's command radius steadies it.", DIM),
-                        ("A fleet breaks when more than half its ships are destroyed, fled or routed. After 10 minutes the fleet with more hull in the fight wins.", DIM),
+                        ("There is no break point. The more of a fleet is destroyed or routed, the shakier all its divisions get, until they rout one by one; the battle ends when a side has nothing left fighting. Destroying the flagship shocks every division at once and keeps them shakier: kill it to turn a battle. After 10 minutes the fleet with more hull in the fight wins.", DIM),
                     ] {
                         c.spawn(text(line, 12.5, color));
                     }

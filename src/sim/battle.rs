@@ -144,6 +144,13 @@ pub struct Tuning {
     /// Engage stops at this fraction of weapon range.
     pub standoff: f32,
     pub time_limit: f32,
+    /// Seconds without a shot (after contact) before the fleets disengage.
+    pub disengage_after: f32,
+    /// Morale stress per fraction of the whole fleet out of the fight: as a
+    /// fleet wears down, all its divisions waver (no hard break point).
+    pub k_fleet_lost: f32,
+    /// Shock every division takes the moment its flagship is destroyed.
+    pub flag_shock: f32,
 }
 
 impl Default for Tuning {
@@ -181,13 +188,19 @@ impl Default for Tuning {
             command_radius: 600.0,
             standoff: 0.8,
             time_limit: 600.0,
+            disengage_after: 45.0,
+            k_fleet_lost: 0.8,
+            flag_shock: 0.3,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndReason {
+    /// One side has nothing left fighting.
     Broke,
+    /// Both sides stopped fighting: nobody fired for a while after contact.
+    Disengaged,
     TimeLimit,
 }
 
@@ -210,6 +223,8 @@ pub struct Battle {
     pub bounds: Rect,
     pub result: Option<Outcome>,
     pub first_contact: Option<f32>,
+    /// Battle time of the most recent shot.
+    pub last_shot: f32,
     /// (breaking division, broken division) pairs already announced.
     pub breakthroughs: Vec<(Entity, Entity)>,
     pub first_breakthrough: [Option<f32>; 2],
@@ -222,6 +237,11 @@ pub struct Battle {
 impl Battle {
     pub fn over(&self) -> bool {
         self.result.is_some()
+    }
+
+    /// Fraction of `side`'s fleet still fighting (not destroyed, fled or routed).
+    pub fn remaining(&self, side: usize) -> f32 {
+        1.0 - self.lost[side] as f32 / self.start[side].max(1) as f32
     }
 }
 

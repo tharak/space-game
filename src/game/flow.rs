@@ -159,7 +159,7 @@ pub fn start_battle_with(world: &mut World, intro: Option<Vec<String>>) {
         let (a, b) = if settings.mirror { (scenario.fleets[1], scenario.fleets[0]) } else { (scenario.fleets[0], scenario.fleets[1]) };
         log.push(format!("Blue: {} · Red: {}", a.name(), b.name()), Tone::Plain);
     }
-    log.push("A fleet breaks when it has lost more than half its ships.", Tone::Plain);
+    log.push("No break point: as a fleet wears down its divisions waver and rout; the battle ends when one side has nothing left fighting.", Tone::Plain);
     if settings.control != Control::Spectate {
         log.push("Paused — give orders, then press Space or Resume.", Tone::Good);
     }
@@ -212,6 +212,10 @@ pub fn log_events(mut events: MessageReader<SimEvent>, mut log: ResMut<LogBook>,
                 let text = match (winner, reason) {
                     (Some(w), EndReason::Broke) => format!("{t} {} breaks. {} wins.", side_name(1 - w), side_name(*w)),
                     (Some(w), EndReason::TimeLimit) => format!("{t} Time. {} holds more of the field.", side_name(*w)),
+                    (Some(w), EndReason::Disengaged) => {
+                        format!("{t} The fleets drift apart, exhausted. {} holds the field.", side_name(*w))
+                    }
+                    (None, EndReason::Disengaged) => format!("{t} The fleets drift apart, exhausted: draw."),
                     (None, _) => format!("{t} Time. Neither side gave way: draw."),
                 };
                 (text, Tone::Title)

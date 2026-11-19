@@ -147,7 +147,7 @@ fn enemies_block_instead_of_shoving() {
 fn every_scenario_ends_before_the_time_limit() {
     for (i, s) in SCENARIOS.iter().enumerate() {
         let r = simulate(SimSettings { scenario: i, ships: 120, ..default() }, 11, None);
-        assert_eq!(r.reason, EndReason::Broke, "{} ran to the time limit", s.title);
+        assert_ne!(r.reason, EndReason::TimeLimit, "{} ran to the time limit", s.title);
         assert!(r.first_contact.is_some_and(|t| t < 90.0), "{}: no contact", s.title);
     }
 }
