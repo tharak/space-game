@@ -13,7 +13,7 @@ use bevy::ui::RelativeCursorPosition;
 use super::flow::{AppRequest, Phase};
 use super::theme::*;
 use super::ui::{BtnKind, BtnLabel, Enabled, Selected, button_for, card_title, choice_row, panel, row, text};
-use crate::prototypes::dominion::{self, DrawOptions, Dominion, Formation, MAX_FLEETS_PER_SIDE, MAX_SHIPS, MIN_SHIPS, Tuning};
+use crate::prototypes::dominion::{self, DrawOptions, Dominion, Formation, MAX_FLEETS_PER_SIDE, MAX_SHIPS, MIN_SHIPS, Tuning, VIEW_H, VIEW_W, View};
 use crate::voronoi::Vec2 as MapVec;
 use crate::voronoi::labs::{FACTIONS, LabId, LabState, render, site_at, status, zoom_inset};
 use crate::voronoi::metric::Metric;
@@ -70,6 +70,22 @@ struct Proto {
     background_key: String,
     /// Seconds since the image was last redrawn.
     since_render: f32,
+    /// The camera: the picture is always VIEW_W × VIEW_H.
+    camera: View,
+    /// Panning with the right or middle button: last cursor position.
+    pan_from: Option<Vec2>,
+    /// Seconds since the camera last moved (coarse background until it settles).
+    camera_still: f32,
+    last_camera: View,
+}
+
+impl Proto {
+    /// A fresh world (after a size, count or config change) and a fitted camera.
+    fn rebuild(&mut self, cfg: &VoronoiConfig) {
+        self.d = Dominion::new(&proto_cfg(cfg, self.size), self.planets, self.fleets, self.d.tuning);
+        self.selected = None;
+        self.camera = View::fit(&self.d.cfg, VIEW_W, VIEW_H);
+    }
 }
 
 /// Lab state plus each lab's cached image.
@@ -105,6 +121,8 @@ pub enum LabAction {
     // prototype01
     ProtoPause,
     ProtoSpeed(u32),
+    /// Zoom the prototype map by a factor (around its centre); 0 = fit.
+    ProtoZoom(i8),
     /// Set a fleet's formation (from the menu by the fleet).
     FleetFormation(u32, Formation),
     ProtoReset,
@@ -306,16 +324,14 @@ fn set_slider(param: SliderParam, v: f32, cfg: &mut VoronoiConfig, labs: &mut La
             let n = (v.round() as usize).clamp(1, cfg.sites);
             if proto.planets != n {
                 proto.planets = n;
-                proto.d = Dominion::new(&proto_cfg(cfg, proto.size), n, proto.fleets, proto.d.tuning);
-                proto.selected = None;
+                proto.rebuild(cfg);
             }
         }
         SliderParam::Fleets => {
             let n = (v.round() as usize).clamp(1, MAX_FLEETS_PER_SIDE);
             if proto.fleets != n {
                 proto.fleets = n;
-                proto.d = Dominion::new(&proto_cfg(cfg, proto.size), proto.planets, n, proto.d.tuning);
-                proto.selected = None;
+                proto.rebuild(cfg);
             }
         }
         SliderParam::FleetShips => {
@@ -361,7 +377,10 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
     }
     let size = PROTO_SIZES[1];
     let pcfg = proto_cfg(&cfg.0, size);
-    let proto_image = images.add(blank_image(&pcfg));
+    // A fixed-resolution picture, smoothed when the page shows it smaller.
+    let mut picture = blank_image(&VoronoiConfig { w: VIEW_W, h: VIEW_H, ..pcfg });
+    picture.sampler = ImageSampler::linear();
+    let proto_image = images.add(picture);
     let (planets, fleets) = (20, 3);
     let proto = Proto {
         d: Dominion::new(&pcfg, planets, fleets, Tuning::default()),
@@ -378,6 +397,10 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
         background: None,
         background_key: String::new(),
         since_render: 0.0,
+        camera: View::fit(&pcfg, VIEW_W, VIEW_H),
+        pan_from: None,
+        camera_still: 0.0,
+        last_camera: View::fit(&pcfg, VIEW_W, VIEW_H),
     };
     commands.insert_resource(Labs {
         state: LabState::new(&cfg.0),
@@ -420,6 +443,9 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                     toggle(r, "Planet regions", LabAction::ProtoRegions);
                     toggle(r, "Patch edges", LabAction::ProtoBorders);
                     button_for(r, "Reset", LabAction::ProtoReset, BtnKind::Normal);
+                    button_for(r, "Zoom −", LabAction::ProtoZoom(-1), BtnKind::Normal);
+                    button_for(r, "Zoom +", LabAction::ProtoZoom(1), BtnKind::Normal);
+                    button_for(r, "Fit", LabAction::ProtoZoom(0), BtnKind::Normal);
                 });
                 p.spawn((LabText::Proto, text("", 13.0, GREEN)));
                 p.spawn((
@@ -428,7 +454,7 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                     RelativeCursorPosition::default(),
                     Node {
                         width: Val::Percent(100.0),
-                        aspect_ratio: Some(size.0 as f32 / size.1 as f32),
+                        aspect_ratio: Some(VIEW_W as f32 / VIEW_H as f32),
                         flex_shrink: 0.0,
                         ..default()
                     },
@@ -451,7 +477,8 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                 slider(p, "Weight per ship", SliderParam::WeightPerShip);
                 slider(p, "Reach per weight", SliderParam::ReachPerWeight);
                 p.spawn(text(
-                    "Click a fleet to select it, then click the map to send it · or drag from a fleet to where it should go.",
+                    "Click a fleet to select it, then click the map to send it · or drag from a fleet to where it should go · \
+                     wheel over the map: zoom · right- or middle-drag: pan.",
                     12.5,
                     DIM,
                 ));
@@ -733,8 +760,7 @@ pub fn handle_lab_buttons(
             LabAction::ProtoSize(w, h) => {
                 if labs.proto.size != (w, h) {
                     labs.proto.size = (w, h);
-                    labs.proto.d = Dominion::new(&proto_cfg(&cfg.0, (w, h)), labs.proto.planets, labs.proto.fleets, labs.proto.d.tuning);
-                    labs.proto.selected = None;
+                    labs.proto.rebuild(&cfg.0);
                 }
             }
             LabAction::Game => {
@@ -759,9 +785,14 @@ pub fn handle_lab_buttons(
                 labs.proto.d.set_formation(id, f);
                 labs.proto.selected = Some(id);
             }
-            LabAction::ProtoReset => {
-                labs.proto.d = Dominion::new(&proto_cfg(&cfg.0, labs.proto.size), labs.proto.planets, labs.proto.fleets, labs.proto.d.tuning);
-                labs.proto.selected = None;
+            LabAction::ProtoReset => labs.proto.rebuild(&cfg.0),
+            LabAction::ProtoZoom(dir) => {
+                let proto = &mut labs.proto;
+                let centre = Vec2::new(VIEW_W as f32, VIEW_H as f32) * 0.5;
+                match dir {
+                    0 => proto.camera = View::fit(&proto.d.cfg, VIEW_W, VIEW_H),
+                    d => proto.camera.zoom_at(centre, if d > 0 { 1.5 } else { 1.0 / 1.5 }, &proto.d.cfg),
+                }
             }
             LabAction::ProtoRegions => labs.proto.regions = !labs.proto.regions,
             LabAction::ProtoBorders => labs.proto.borders = !labs.proto.borders,
@@ -831,8 +862,7 @@ pub fn handle_lab_buttons(
         let c = cfg.0;
         labs.state.reseed(&c);
         labs.proto.planets = labs.proto.planets.min(c.sites);
-        labs.proto.d = Dominion::new(&proto_cfg(&c, labs.proto.size), labs.proto.planets, labs.proto.fleets, labs.proto.d.tuning);
-        labs.proto.selected = None;
+        labs.proto.rebuild(&c);
         labs.last_cfg = c;
     }
 }
@@ -946,8 +976,10 @@ pub fn lab_pointer(
 
 /// prototype01: click a fleet to select it; click the map to send the
 /// selected fleet there, or drag from a fleet to where it should go.
+#[allow(clippy::too_many_arguments)]
 pub fn proto_pointer(
     mouse: Res<ButtonInput<MouseButton>>,
+    mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
     image: Query<&RelativeCursorPosition, With<PrototypeImage>>,
     menu_buttons: Query<&Interaction, With<FleetMenuButton>>,
     phase: Res<Phase>,
@@ -956,20 +988,47 @@ pub fn proto_pointer(
     let proto = &mut labs.proto;
     if !on_start(&phase) {
         proto.drag = None;
+        proto.pan_from = None;
         return;
     }
     let Ok(cursor) = image.single() else { return };
-    let cfg = proto.d.cfg;
     let Some(n) = cursor.normalized else { return };
-    let p = MapVec::new((n.x + 0.5) * cfg.w as f32, (n.y + 0.5) * cfg.h as f32)
-        .clamp(MapVec::ZERO, MapVec::new(cfg.w as f32 - 0.5, cfg.h as f32 - 0.5));
+    // Cursor in picture pixels, then in the world.
+    let screen = Vec2::new((n.x + 0.5) * VIEW_W as f32, (n.y + 0.5) * VIEW_H as f32);
+    let cfg = proto.d.cfg;
+    let p = proto.camera.to_world(screen).clamp(MapVec::ZERO, MapVec::new(cfg.w as f32 - 0.5, cfg.h as f32 - 0.5));
+    let over = cursor.cursor_over();
+    // Wheel over the map zooms around the cursor (the page scroll skips it).
+    let notches: f32 = wheel
+        .read()
+        .map(|ev| match ev.unit {
+            bevy::input::mouse::MouseScrollUnit::Line => ev.y,
+            bevy::input::mouse::MouseScrollUnit::Pixel => ev.y / 40.0,
+        })
+        .sum();
+    if over && notches != 0.0 {
+        proto.camera.zoom_at(screen, 1.2f32.powf(notches), &cfg);
+    }
+    // Right or middle drag pans.
+    if over && (mouse.just_pressed(MouseButton::Right) || mouse.just_pressed(MouseButton::Middle)) {
+        proto.pan_from = Some(screen);
+    }
+    if let Some(from) = proto.pan_from {
+        if mouse.pressed(MouseButton::Right) || mouse.pressed(MouseButton::Middle) {
+            proto.camera.pan(screen - from, &cfg);
+            proto.pan_from = Some(screen);
+        } else {
+            proto.pan_from = None;
+        }
+    }
     // Clicks on a fleet's formation menu are not map clicks.
     let on_menu = menu_buttons.iter().any(|i| *i != Interaction::None);
-    if mouse.just_pressed(MouseButton::Left) && cursor.cursor_over() && !on_menu {
-        match proto.d.fleet_at(p, 8.0 * proto.d.scale()) {
+    if mouse.just_pressed(MouseButton::Left) && over && !on_menu {
+        // About 10 picture pixels, in world units.
+        match proto.d.fleet_at(p, 10.0 / proto.camera.zoom) {
             Some(id) => {
                 proto.selected = Some(id);
-                proto.drag = Some((id, p));
+                proto.drag = Some((id, screen));
             }
             None => {
                 if let Some(id) = proto.selected {
@@ -979,7 +1038,7 @@ pub fn proto_pointer(
         }
     } else if mouse.just_released(MouseButton::Left)
         && let Some((id, from)) = proto.drag.take()
-        && from.distance(p) > 10.0
+        && from.distance(screen) > 12.0
     {
         proto.d.order_move(id, p);
     }
@@ -1006,8 +1065,19 @@ pub fn update_fleet_menus(
         return;
     }
     let d = &labs.proto.d;
-    let fleets: Vec<&dominion::Fleet> = d.fleets.iter().filter(|f| f.controllable()).take(MAX_MENUS).collect();
-    let (w, h) = (d.cfg.w as f32, d.cfg.h as f32);
+    let cam = labs.proto.camera;
+    let (w, h) = (VIEW_W as f32, VIEW_H as f32);
+    // Only fleets on screen get a menu.
+    let fleets: Vec<&dominion::Fleet> = d
+        .fleets
+        .iter()
+        .filter(|f| f.controllable())
+        .filter(|f| {
+            let s = cam.to_screen(f.pos);
+            s.x >= 0.0 && s.y >= 0.0 && s.x <= w && s.y <= h
+        })
+        .take(MAX_MENUS)
+        .collect();
     for (menu, mut node, children) in &mut menus {
         let Some(f) = fleets.get(menu.0) else {
             if node.display != Display::None {
@@ -1015,8 +1085,9 @@ pub fn update_fleet_menus(
             }
             continue;
         };
-        let radius = d.ship_positions(f).iter().map(|s| s.distance(f.pos)).fold(0.0, f32::max);
-        let (left, top) = (Val::Percent(f.pos.x / w * 100.0), Val::Percent(((f.pos.y + radius + 6.0) / h * 100.0).min(96.0)));
+        let radius = d.ship_positions(f).iter().map(|s| s.distance(f.pos)).fold(0.0, f32::max) * cam.zoom;
+        let at = cam.to_screen(f.pos);
+        let (left, top) = (Val::Percent(at.x / w * 100.0), Val::Percent(((at.y + radius + 8.0) / h * 100.0).min(96.0)));
         if node.display != Display::Flex || node.left != left || node.top != top {
             node.display = Display::Flex;
             node.left = left;
@@ -1078,26 +1149,31 @@ pub fn render_labs(
     if on_start(&phase) {
         let proto = &mut labs.proto;
         proto.since_render += time.delta_secs();
+        if proto.camera != proto.last_camera {
+            proto.last_camera = proto.camera;
+            proto.camera_still = 0.0;
+        } else {
+            proto.camera_still += time.delta_secs();
+        }
+        // Half-resolution regions while zooming or panning, sharp once still.
+        let bg_step = if proto.camera_still < 0.25 { 2 } else { 1 };
         let opts = DrawOptions { regions: proto.regions, borders: proto.borders, selected: proto.selected, step: 3 };
         let key = format!(
-            "{}|{:?}|{:?}|{:?}",
+            "{}|{:?}|{:?}|{bg_step}|{:?}|{:?}",
             proto.d.time,
             opts,
+            proto.camera,
             proto.d.tuning,
             proto.d.fleets.iter().map(|f| (f.id, f.pos, f.facing, f.ships, f.formation, f.dest)).collect::<Vec<_>>()
         );
         if key != proto.view.key && proto.since_render >= 0.04 {
-            let bg_key = proto.d.background_key(proto.regions);
+            let bg_key = format!("{}|{:?}|{bg_step}", proto.d.background_key(proto.regions), proto.camera);
             if bg_key != proto.background_key || proto.background.is_none() {
-                proto.background = Some(dominion::render_background(&proto.d, proto.regions));
+                proto.background = Some(dominion::render_background(&proto.d, &proto.camera, proto.regions, bg_step));
                 proto.background_key = bg_key;
             }
-            let rgba = dominion::render(&proto.d, proto.background.as_ref().unwrap(), opts).to_rgba();
+            let rgba = dominion::render(&proto.d, proto.background.as_ref().unwrap(), &proto.camera, opts).to_rgba();
             if let Some(mut img) = images.get_mut(&proto.view.image) {
-                // A new map size needs a texture of that size.
-                if img.width() != proto.d.cfg.w || img.height() != proto.d.cfg.h {
-                    *img = blank_image(&proto.d.cfg);
-                }
                 img.data = Some(rgba);
             }
             proto.view.key = key;
@@ -1172,8 +1248,8 @@ pub fn update_lab_ui(
     for mut n in &mut lab_page {
         show(&mut n, on_labs(&phase));
     }
-    // The prototype image keeps its map's shape.
-    let aspect = Some(labs.proto.size.0 as f32 / labs.proto.size.1 as f32);
+    // The prototype picture has a fixed shape.
+    let aspect = Some(VIEW_W as f32 / VIEW_H as f32);
     for mut n in &mut proto_image {
         if n.aspect_ratio != aspect {
             n.aspect_ratio = aspect;
@@ -1270,6 +1346,7 @@ pub fn lab_button_state(
 /// Wheel scrolling for the start and labs pages.
 pub fn scroll_labs(
     mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
+    map: Query<&RelativeCursorPosition, With<PrototypeImage>>,
     phase: Res<Phase>,
     mut start: Query<&mut ScrollPosition, (With<StartPage>, Without<LabsPage>)>,
     mut lab_page: Query<&mut ScrollPosition, (With<LabsPage>, Without<StartPage>)>,
@@ -1282,6 +1359,10 @@ pub fn scroll_labs(
         })
         .sum();
     if dy == 0.0 {
+        return;
+    }
+    // The wheel zooms the prototype map instead.
+    if on_start(&phase) && map.iter().any(|c| c.cursor_over()) {
         return;
     }
     let target = if on_start(&phase) {

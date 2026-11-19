@@ -14,7 +14,7 @@ pub use crate::sim::formation::Formation;
 use crate::sim::formation::{SHIP_DART, layout};
 use crate::sim::systems::{hit_chance, incoming_arc};
 use crate::voronoi::Vec2;
-use crate::voronoi::grid::{NO_OWNER, OwnerGrid, voronoi_grid};
+use crate::voronoi::grid::{OwnerGrid, voronoi_grid};
 use crate::voronoi::influence::weighted_scores;
 use crate::voronoi::labs::cell_color;
 use crate::voronoi::metric::{Metric, distance};
@@ -581,6 +581,8 @@ impl Default for DrawOptions {
 }
 
 const SPACE: Rgb = [12, 14, 22];
+/// Beyond the edge of the world.
+const OUTSIDE: Rgb = [6, 7, 11];
 const CONTESTED: Rgb = [150, 140, 160];
 const WHITE: Rgb = [240, 240, 240];
 const INK: Rgb = [10, 10, 14];
@@ -611,24 +613,96 @@ fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     [0, 1, 2].map(|i| (a[i] as f32 * (1.0 - t) + b[i] as f32 * t).round() as u8)
 }
 
-/// The slow-changing layer: planet regions in their owner's colours.
-pub fn render_background(d: &Dominion, regions: bool) -> Canvas {
-    let (w, h) = (d.cfg.w, d.cfg.h);
-    let mut c = Canvas::new(w, h, SPACE);
-    if !regions {
-        return c;
+/// What part of the world the picture shows: a fixed-size output image,
+/// the world point at its centre, and output pixels per world pixel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct View {
+    pub w: u32,
+    pub h: u32,
+    pub center: Vec2,
+    pub zoom: f32,
+}
+
+/// The fixed output resolution of the prototype map.
+pub const VIEW_W: u32 = 1440;
+pub const VIEW_H: u32 = 800;
+pub const MAX_ZOOM: f32 = 8.0;
+
+impl View {
+    /// The whole world, fitted into a `w`×`h` picture.
+    pub fn fit(cfg: &VoronoiConfig, w: u32, h: u32) -> Self {
+        let zoom = (w as f32 / cfg.w as f32).min(h as f32 / cfg.h as f32);
+        Self { w, h, center: Vec2::new(cfg.w as f32, cfg.h as f32) * 0.5, zoom }
     }
-    for y in 0..h {
-        for x in 0..w {
-            let site = d.regions.at(x, y);
-            let Some(pi) = (if site == NO_OWNER { None } else { d.planet_at[site as usize] }) else { continue };
-            let col = if d.regions.is_border(x, y) {
-                INK
-            } else {
-                let p = &d.planets[pi];
-                Canvas::shade_px(owner_color(p.owner), if matches!(p.owner, Owner::Side(_)) { 0.45 } else { 0.75 })
+
+    pub fn to_world(&self, screen: Vec2) -> Vec2 {
+        self.center + (screen - Vec2::new(self.w as f32, self.h as f32) * 0.5) / self.zoom
+    }
+
+    pub fn to_screen(&self, world: Vec2) -> Vec2 {
+        (world - self.center) * self.zoom + Vec2::new(self.w as f32, self.h as f32) * 0.5
+    }
+
+    /// Zooms by `factor`, keeping the world point under `screen` in place.
+    /// Never zooms out past the whole world, nor in past `MAX_ZOOM` × that.
+    pub fn zoom_at(&mut self, screen: Vec2, factor: f32, cfg: &VoronoiConfig) {
+        let min = View::fit(cfg, self.w, self.h).zoom;
+        let anchor = self.to_world(screen);
+        self.zoom = (self.zoom * factor).clamp(min, min * MAX_ZOOM);
+        self.center = anchor - (screen - Vec2::new(self.w as f32, self.h as f32) * 0.5) / self.zoom;
+        self.clamp(cfg);
+    }
+
+    /// Moves the view by `screen_delta` output pixels.
+    pub fn pan(&mut self, screen_delta: Vec2, cfg: &VoronoiConfig) {
+        self.center -= screen_delta / self.zoom;
+        self.clamp(cfg);
+    }
+
+    /// Keeps the world's centre-line inside the picture.
+    fn clamp(&mut self, cfg: &VoronoiConfig) {
+        let half = Vec2::new(self.w as f32, self.h as f32) * 0.5 / self.zoom;
+        let world = Vec2::new(cfg.w as f32, cfg.h as f32);
+        let lo = (world * 0.5).min(half);
+        let hi = (world * 0.5).max(world - half);
+        self.center = self.center.clamp(lo, hi);
+    }
+}
+
+/// The slow-changing layer: planet regions in their owner's colours,
+/// computed per output pixel so borders stay sharp at any zoom. `step` > 1
+/// samples coarsely (while the camera is moving).
+pub fn render_background(d: &Dominion, view: &View, regions: bool, step: u32) -> Canvas {
+    let mut c = Canvas::new(view.w, view.h, OUTSIDE);
+    let index = crate::voronoi::metric::SiteIndex::new(&d.sites, d.cfg.metric);
+    let world = Vec2::new(d.cfg.w as f32, d.cfg.h as f32);
+    let step = step.max(1);
+    for y in (0..view.h).step_by(step as usize) {
+        for x in (0..view.w).step_by(step as usize) {
+            let p = view.to_world(Vec2::new(x as f32 + step as f32 * 0.5, y as f32 + step as f32 * 0.5));
+            if p.x < 0.0 || p.y < 0.0 || p.x > world.x || p.y > world.y {
+                continue;
+            }
+            let n = index.nearest_two(p);
+            let planet = d.planet_at.get(n.nearest).copied().flatten();
+            let col = match planet {
+                Some(pi) if regions => {
+                    // On a border when the two nearest sites are almost tied
+                    // (about one output pixel either side).
+                    if (n.d2 - n.d1) * view.zoom < 1.2 * step as f32 && d.planet_at.get(n.second).copied().flatten() != Some(pi) {
+                        INK
+                    } else {
+                        let pl = &d.planets[pi];
+                        Canvas::shade_px(owner_color(pl.owner), if matches!(pl.owner, Owner::Side(_)) { 0.45 } else { 0.75 })
+                    }
+                }
+                _ => SPACE,
             };
-            c.set(x as i32, y as i32, col);
+            for by in y..(y + step).min(view.h) {
+                for bx in x..(x + step).min(view.w) {
+                    c.set(bx as i32, by as i32, col);
+                }
+            }
         }
     }
     c
@@ -644,25 +718,62 @@ pub fn tones(d: &Dominion) -> Vec<Rgb> {
         .collect()
 }
 
-/// Patches, planets and ships over a cached background.
-pub fn render(d: &Dominion, background: &Canvas, opts: DrawOptions) -> Canvas {
-    let (w, h) = (d.cfg.w, d.cfg.h);
+/// Patches, planets and ships over a cached background, through `view`.
+pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: DrawOptions) -> Canvas {
+    let (w, h) = (view.w, view.h);
     let mut c = background.clone();
     let tones = tones(d);
-    // Patches, sampled every `step` pixels.
+    let z = view.zoom;
+    // Patches, sampled every `step` output pixels.
     let step = opts.step.max(1);
     let (gw, gh) = (w.div_ceil(step), h.div_ceil(step));
     let inf = Influence::new(d);
+    let world = Vec2::new(d.cfg.w as f32, d.cfg.h as f32);
     let mut cells: Vec<(Option<usize>, bool, bool)> = vec![(None, false, false); (gw * gh) as usize];
     for gy in 0..gh {
         for gx in 0..gw {
-            let p = Vec2::new((gx * step) as f32 + step as f32 * 0.5, (gy * step) as f32 + step as f32 * 0.5);
+            let p = view.to_world(Vec2::new((gx * step) as f32 + step as f32 * 0.5, (gy * step) as f32 + step as f32 * 0.5));
+            if p.x < 0.0 || p.y < 0.0 || p.x > world.x || p.y > world.y {
+                continue;
+            }
             let (fleet, contested, score) = inf.at(p);
-            let front = fleet.is_some_and(|f| (inf.reach - score) * d.fleets[f].weight(&d.tuning) < 1.5 * step as f32);
+            // The last ~1.5 output pixels of a patch's reach.
+            let front = fleet.is_some_and(|f| (inf.reach - score) * d.fleets[f].weight(&d.tuning) * z < 1.5 * step as f32);
             cells[(gy * gw + gx) as usize] = (fleet, contested, front);
         }
     }
-    let at = |x: u32, y: u32| cells[((y / step) * gw + x / step) as usize];
+    let coarse = |x: u32, y: u32| cells[((y / step) * gw + x / step) as usize];
+    // Cells next to a different cell sit on an edge: those get every pixel
+    // computed exactly, so patch outlines and seams stay smooth.
+    let edge_cell = |gx: u32, gy: u32| {
+        let here = cells[(gy * gw + gx) as usize];
+        here.2
+            || [(gx.wrapping_sub(1), gy), (gx + 1, gy), (gx, gy.wrapping_sub(1)), (gx, gy + 1)]
+                .iter()
+                .any(|&(nx, ny)| nx < gw && ny < gh && cells[(ny * gw + nx) as usize].0 != here.0)
+    };
+    let mut fine: Vec<Option<(Option<usize>, bool, bool)>> = vec![None; (w * h) as usize];
+    for gy in 0..gh {
+        for gx in 0..gw {
+            if !edge_cell(gx, gy) {
+                continue;
+            }
+            for y in gy * step..((gy + 1) * step).min(h) {
+                for x in gx * step..((gx + 1) * step).min(w) {
+                    let p = view.to_world(Vec2::new(x as f32 + 0.5, y as f32 + 0.5));
+                    let v = if p.x < 0.0 || p.y < 0.0 || p.x > world.x || p.y > world.y {
+                        (None, false, false)
+                    } else {
+                        let (fleet, contested, score) = inf.at(p);
+                        let front = fleet.is_some_and(|f| (inf.reach - score) * d.fleets[f].weight(&d.tuning) * z < 1.5);
+                        (fleet, contested, front)
+                    };
+                    fine[(y * w + x) as usize] = Some(v);
+                }
+            }
+        }
+    }
+    let at = |x: u32, y: u32| fine[(y * w + x) as usize].unwrap_or_else(|| coarse(x, y));
     for y in 0..h {
         for x in 0..w {
             let (fleet, contested, front) = at(x, y);
@@ -681,41 +792,46 @@ pub fn render(d: &Dominion, background: &Canvas, opts: DrawOptions) -> Canvas {
             c.set(x as i32, y as i32, col);
         }
     }
-    let scale = d.scale();
-    // Planets, with a capture ring while someone holds them.
+    // Planets (world size, at least a few pixels), with a capture ring.
     for p in &d.planets {
-        let r = (1.5 + 1.3 * p.value as f32) * scale.max(0.8);
+        let at = view.to_screen(p.pos);
+        let r = ((1.5 + 1.3 * p.value as f32) * d.scale().max(0.8) * z).max(2.5);
         if let Some((by, t)) = p.hold {
-            let col = owner_color(by);
             let frac = (t / HOLD_SECS).clamp(0.0, 1.0);
-            let n = (48.0 * frac) as usize;
+            let n = (64.0 * frac) as usize;
             for k in 0..n {
-                let a = -std::f32::consts::FRAC_PI_2 + k as f32 / 48.0 * std::f32::consts::TAU;
-                c.disc(p.pos + Vec2::from_angle(a) * (r + 6.0), 1.6, col, 1.0);
+                let a = -std::f32::consts::FRAC_PI_2 + k as f32 / 64.0 * std::f32::consts::TAU;
+                c.disc(at + Vec2::from_angle(a) * (r + 6.0), 1.8, owner_color(by), 1.0);
             }
         }
-        c.disc(p.pos, r + 1.0, INK, 1.0);
-        c.disc(p.pos, r, [230, 220, 170], 1.0);
+        c.disc(at, r + 1.0, INK, 1.0);
+        c.disc(at, r, [230, 220, 170], 1.0);
     }
     // Destination of the selected fleet.
     if let Some(f) = opts.selected.and_then(|id| d.fleet(id))
         && let Some(dest) = f.dest
     {
-        c.dashed_line(f.pos, dest, 5.0, 4.0, GOLD, 0.9);
-        c.circle(dest, 4.0, GOLD, 1.0);
+        let (a, b) = (view.to_screen(f.pos), view.to_screen(dest));
+        c.dashed_line(a, b, 6.0, 5.0, GOLD, 0.9);
+        c.circle(b, 5.0, GOLD, 1.0);
     }
-    // Ships: the battle's darts at their formation slots.
-    let dart_scale = 0.32 * scale;
+    // Ships: the battle's darts at their formation slots, drawn at screen scale.
+    let dart_scale = (0.32 * d.scale() * z).max(0.35);
     for (i, f) in d.fleets.iter().enumerate() {
-        let ships = d.ship_positions(f);
+        let ships: Vec<Vec2> = d.ship_positions(f).iter().map(|s| view.to_screen(*s)).collect();
+        let centre = view.to_screen(f.pos);
         let facing = Vec2::from_angle(f.facing);
         if opts.selected == Some(f.id) {
-            let r = ships.iter().map(|s| s.distance(f.pos)).fold(0.0, f32::max) + 6.0;
-            c.circle(f.pos, r, GOLD, 1.0);
+            let r = ships.iter().map(|s| s.distance(centre)).fold(0.0, f32::max) + 7.0;
+            c.circle(centre, r, GOLD, 1.0);
+            c.circle(centre, r + 1.0, GOLD, 1.0);
         }
         let flash = f.taken > 0.0;
-        let flag = (0..ships.len()).min_by(|a, b| ships[*a].distance(f.pos).total_cmp(&ships[*b].distance(f.pos)));
+        let flag = (0..ships.len()).min_by(|a, b| ships[*a].distance(centre).total_cmp(&ships[*b].distance(centre)));
         for (k, s) in ships.iter().enumerate() {
+            if s.x < -10.0 || s.y < -10.0 || s.x > w as f32 + 10.0 || s.y > h as f32 + 10.0 {
+                continue;
+            }
             let col = if Some(k) == flag && f.controllable() {
                 WHITE
             } else if flash && k % 7 == (d.time * 10.0) as usize % 7 {
@@ -724,7 +840,7 @@ pub fn render(d: &Dominion, background: &Canvas, opts: DrawOptions) -> Canvas {
                 mix(tones[i], WHITE, 0.25)
             };
             let pts = |k: f32| -> Vec<Vec2> { SHIP_DART.iter().map(|p| *s + facing.rotate(*p * dart_scale * k)).collect() };
-            c.polygon_fill(&pts(1.5), INK, 1.0);
+            c.polygon_fill(&pts(1.45), INK, 1.0);
             c.polygon_fill(&pts(1.0), col, 1.0);
         }
     }

@@ -183,9 +183,37 @@ fn deterministic_and_renders() {
     a.step(20.0);
     b.step(20.0);
     assert_eq!(a, b);
-    let bg = render_background(&a, true);
-    let c = render(&a, &bg, DrawOptions::default());
-    assert_eq!((c.w, c.h, c.px.len()), (720, 400, 720 * 400 * 3));
+    // A fixed-size picture, whatever the map size or zoom.
+    let mut view = View::fit(&a.cfg, VIEW_W, VIEW_H);
+    let bg = render_background(&a, &view, true, 1);
+    let c = render(&a, &bg, &view, DrawOptions::default());
+    assert_eq!(render_background(&a, &view, true, 2).px.len(), bg.px.len());
+    assert_eq!((c.w, c.h), (VIEW_W, VIEW_H));
+    view.zoom_at(Vec2::new(700.0, 400.0), 4.0, &a.cfg);
+    let bg = render_background(&a, &view, true, 1);
+    assert_eq!(render(&a, &bg, &view, DrawOptions::default()).px.len(), c.px.len());
+}
+
+#[test]
+fn the_view_zooms_around_the_cursor_and_stays_on_the_map() {
+    let c = cfg();
+    let mut v = View::fit(&c, VIEW_W, VIEW_H);
+    // Fitted: the whole 720×400 world fills the 1440×800 picture.
+    assert_eq!(v.zoom, 2.0);
+    assert_eq!(v.to_screen(Vec2::ZERO), Vec2::ZERO);
+    let p = Vec2::new(1000.0, 300.0);
+    let under = v.to_world(p);
+    v.zoom_at(p, 3.0, &c);
+    assert_eq!(v.zoom, 6.0);
+    assert!((v.to_world(p) - under).length() < 1e-3, "the point under the cursor stays put");
+    // Can't zoom out past the whole map or pan off it.
+    v.zoom_at(p, 0.01, &c);
+    assert_eq!(v.zoom, 2.0);
+    v.pan(Vec2::new(-5000.0, 0.0), &c);
+    assert_eq!(v.center, Vec2::new(360.0, 200.0));
+    // Round trip.
+    let w = Vec2::new(123.0, 45.0);
+    assert!((v.to_world(v.to_screen(w)) - w).length() < 1e-3);
 }
 
 #[test]

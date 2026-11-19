@@ -18,7 +18,9 @@ The start page's prototype, in real time (Pause, 1×, 2×, 4×). Code: `src/prot
 - **Capture:** a planet changes hands once its garrison is gone and a single enemy side has held it for 3 s (a ring shows the progress).
 - **Patches:** like lab 1's growing seeds, they show each fleet's influence (weight = ships × weight per ship, reach = reach per weight × weight, scaled to the map).
 
-Tests: `cargo test prototypes`. `cargo run --release --example prototype01_dump -- <dir>` plays a minute and writes frames.
+- **View:** the map renders at a fixed 1440×800 through a camera, so it stays sharp at any map size. The wheel over the map zooms toward the cursor (up to 8×), right- or middle-drag pans, and the Zoom −, Zoom + and Fit buttons do the same.
+
+Tests: `cargo test prototypes`. `cargo run --release --example prototype01_dump -- <dir>` plays a minute and writes frames, a 4× close-up of each, and render timings.
 
 ## Voronoi labs
 
