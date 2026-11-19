@@ -1,10 +1,12 @@
 //! prototype01 — Fleet dominion. Space is split into Voronoi regions; some
 //! of them hold a planet. Every planet starts as its own independent
-//! faction that only defends itself. Blue and Red fleets project weighted
-//! influence (distance ÷ strength). At the end of each turn, a planet
-//! joins the faction of the fleet dominating it if that fleet is stronger
-//! than the planet's defence, and every planet pays its owner. Contested
-//! planets (the other side within 10%) don't change hands.
+//! faction that only defends itself. Blue and Red fleets project influence
+//! like growing seeds: each reaches a radius proportional to its ships, and
+//! where patches meet the border sits at distance ÷ ships. At the end of
+//! each turn a planet joins the side of the fleet dominating it if that
+//! fleet has more ships than the planet's defence, and every planet pays
+//! its owner. Contested planets (the other side within 10%) don't change
+//! hands.
 
 use crate::voronoi::Vec2;
 use crate::voronoi::grid::{NO_OWNER, OwnerGrid, voronoi_grid};
@@ -15,14 +17,19 @@ use crate::voronoi::raster::{Canvas, Rgb};
 use crate::voronoi::rng::ParkMiller;
 use crate::voronoi::sites::{VoronoiConfig, make_sites};
 
-pub const FLEETS_PER_SIDE: usize = 3;
-pub const MIN_STRENGTH: f32 = 0.2;
-pub const MAX_STRENGTH: f32 = 4.0;
+pub const MAX_FLEETS_PER_SIDE: usize = 8;
+pub const START_SHIPS: u32 = 50;
+pub const MIN_SHIPS: u32 = 10;
+pub const MAX_SHIPS: u32 = 200;
 pub const REINFORCE_COST: u32 = 10;
-pub const REINFORCE_STEP: f32 = 0.5;
-/// Planet defence range.
-pub const MIN_DEFENCE: f32 = 0.5;
-pub const MAX_DEFENCE: f32 = 3.0;
+pub const REINFORCE_SHIPS: u32 = 25;
+/// Planet defence range, in ships.
+pub const MIN_DEFENCE: u32 = 25;
+pub const MAX_DEFENCE: u32 = 150;
+/// Ships that count as influence weight 1.
+pub const SHIPS_PER_WEIGHT: f32 = 50.0;
+/// How far a fleet of weight 1 (50 ships) reaches, in map pixels.
+pub const REACH: f32 = 70.0;
 /// The other side's best fleet within this fraction contests the ground.
 pub const CONTEST_MARGIN: f32 = 0.10;
 pub const SIDE_NAMES: [&str; 2] = ["Blue", "Red"];
@@ -45,8 +52,8 @@ pub struct Planet {
     pub pos: Vec2,
     /// Resources a turn, 1 (poor) to 3 (rich).
     pub value: u32,
-    /// A fleet must be stronger than this to take the planet.
-    pub defence: f32,
+    /// A fleet needs more ships than this to take the planet.
+    pub defence: u32,
     pub owner: Owner,
 }
 
@@ -54,7 +61,19 @@ pub struct Planet {
 pub struct FleetToken {
     pub side: usize,
     pub pos: Vec2,
-    pub strength: f32,
+    pub ships: u32,
+}
+
+impl FleetToken {
+    /// Influence weight: distance ÷ weight decides who dominates.
+    pub fn weight(&self) -> f32 {
+        self.ships as f32 / SHIPS_PER_WEIGHT
+    }
+
+    /// How far its patch can grow.
+    pub fn reach(&self) -> f32 {
+        REACH * self.weight()
+    }
 }
 
 /// Which side's fleets dominate a point of space.
@@ -74,8 +93,8 @@ pub enum Pressure {
     Contested,
     /// The dominating side already owns it.
     Held(usize),
-    /// The dominating fleet is stronger than the defence: it falls at the
-    /// end of the turn.
+    /// The dominating fleet has more ships than the defence: it falls at
+    /// the end of the turn.
     Falls(usize),
     /// The dominating fleet is too weak to take it.
     Resists(usize),
@@ -98,9 +117,9 @@ pub struct Dominion {
 }
 
 impl Dominion {
-    /// `planets` of the config's sites get a planet: inland regions first,
-    /// picked at random from the seed.
-    pub fn new(cfg: &VoronoiConfig, planets: usize) -> Self {
+    /// `planets` of the config's sites get a planet (inland regions first,
+    /// picked at random from the seed); each side gets `fleets` fleets.
+    pub fn new(cfg: &VoronoiConfig, planets: usize, fleets: usize) -> Self {
         let sites = cfg.relaxed_sites();
         let regions = voronoi_grid(&sites, cfg.w, cfg.h, cfg.metric);
         let edge = regions.edge_owners();
@@ -122,18 +141,21 @@ impl Dominion {
             } else {
                 1
             };
-            let defence = ((MIN_DEFENCE + rng.next_float() * (MAX_DEFENCE - MIN_DEFENCE)) * 10.0).round() / 10.0;
+            // Rounded to 5 ships.
+            let defence = ((MIN_DEFENCE as f32 + rng.next_float() * (MAX_DEFENCE - MIN_DEFENCE) as f32) / 5.0).round() as u32 * 5;
             planet_at[site] = Some(list.len());
             list.push(Planet { site, pos: sites[site], value, defence, owner: Owner::Independent(list.len()) });
         }
         // Blue starts in the left third; Red mirrors it.
         let (w, h) = (cfg.w as f32, cfg.h as f32);
-        let spots = make_sites(FLEETS_PER_SIDE, w / 3.0, h * 0.8, cfg.seed.wrapping_add(23));
+        let spots = make_sites(fleets.clamp(1, MAX_FLEETS_PER_SIDE), w / 3.0, h * 0.8, cfg.seed.wrapping_add(23));
         let fleets = (0..2)
             .flat_map(|side| {
                 spots.iter().map(move |p| {
-                    let x = if side == 0 { p.x } else { w - p.x };
-                    FleetToken { side, pos: Vec2::new(x, p.y + h * 0.1), strength: 1.0 }
+                    // Keep a margin so patches don't start half off the map.
+                    let x = 30.0 + p.x * 0.85;
+                    let x = if side == 0 { x } else { w - x };
+                    FleetToken { side, pos: Vec2::new(x, p.y + h * 0.1), ships: START_SHIPS }
                 })
             })
             .collect();
@@ -156,7 +178,7 @@ impl Dominion {
                 (Control::Side(s), fleet) => {
                     if pl.owner == Owner::Side(s) {
                         Pressure::Held(s)
-                    } else if fleet.is_some_and(|f| self.fleets[f].strength > pl.defence) {
+                    } else if fleet.is_some_and(|f| self.fleets[f].ships > pl.defence) {
                         Pressure::Falls(s)
                     } else {
                         Pressure::Resists(s)
@@ -209,16 +231,22 @@ impl Dominion {
         self.turn += 1;
     }
 
-    /// Spends from the fleet's side to add strength. False if it can't.
+    /// Spends from the fleet's side to add ships. False if it can't.
     pub fn reinforce(&mut self, fleet: usize) -> bool {
         let Some(f) = self.fleets.get(fleet) else { return false };
-        if self.stock[f.side] < REINFORCE_COST || f.strength >= MAX_STRENGTH {
+        if self.stock[f.side] < REINFORCE_COST || f.ships >= MAX_SHIPS {
             return false;
         }
         self.stock[f.side] -= REINFORCE_COST;
         let f = &mut self.fleets[fleet];
-        f.strength = (f.strength + REINFORCE_STEP).min(MAX_STRENGTH);
+        f.ships = (f.ships + REINFORCE_SHIPS).min(MAX_SHIPS);
         true
+    }
+
+    /// The fleet's number within its side (1-based), for labels.
+    pub fn fleet_number(&self, fleet: usize) -> usize {
+        let side = self.fleets[fleet].side;
+        self.fleets[..=fleet].iter().filter(|g| g.side == side).count()
     }
 
     /// The fleet within `r` pixels of `p`, nearest first.
@@ -240,18 +268,26 @@ impl Influence {
     pub fn new(d: &Dominion) -> Self {
         Self {
             bases: d.fleets.iter().map(|f| f.pos).collect(),
-            weights: d.fleets.iter().map(|f| f.strength).collect(),
+            weights: d.fleets.iter().map(|f| f.weight()).collect(),
             sides: d.fleets.iter().map(|f| f.side).collect(),
             metric: d.cfg.metric,
         }
     }
 
-    /// The controlling side at `p` and the fleet that dominates it.
+    /// The controlling side at `p` and the fleet that dominates it. Like
+    /// growing seeds, a fleet only reaches `REACH × weight`: a score
+    /// (distance ÷ weight) above `REACH` is out of reach.
     pub fn at(&self, p: Vec2) -> (Control, Option<usize>) {
+        let (ctrl, fleet, _) = self.at_scored(p);
+        (ctrl, fleet)
+    }
+
+    /// Like [`Influence::at`], plus the dominating fleet's score.
+    pub fn at_scored(&self, p: Vec2) -> (Control, Option<usize>, f32) {
         let inf = weighted_scores(&self.bases, &self.weights, p, self.metric);
-        let Some(best) = inf.owner else { return (Control::Neutral, None) };
+        let Some(best) = inf.owner.filter(|_| inf.best <= REACH) else { return (Control::Neutral, None, inf.best) };
         let side = self.sides[best];
-        // The other side's best score, not just the runner-up fleet.
+        // The other side's best score, if that fleet reaches here too.
         let rival = self
             .bases
             .iter()
@@ -260,7 +296,8 @@ impl Influence {
             .filter(|((_, w), s)| **s != side && **w > 0.0)
             .map(|((b, w), _)| distance(*b, p, self.metric) / w)
             .fold(f32::INFINITY, f32::min);
-        if rival <= inf.best * (1.0 + CONTEST_MARGIN) { (Control::Contested, Some(best)) } else { (Control::Side(side), Some(best)) }
+        let ctrl = if rival <= REACH && rival <= inf.best * (1.0 + CONTEST_MARGIN) { Control::Contested } else { Control::Side(side) };
+        (ctrl, Some(best), inf.best)
     }
 }
 
@@ -280,7 +317,7 @@ impl Default for DrawOptions {
 }
 
 const SPACE: Rgb = [12, 14, 22];
-const CONTESTED: Rgb = [120, 110, 130];
+const CONTESTED: Rgb = [150, 140, 160];
 const WHITE: Rgb = [240, 240, 240];
 const INK: Rgb = [10, 10, 14];
 const GOLD: Rgb = [235, 190, 80];
@@ -293,47 +330,74 @@ fn owner_color(o: Owner) -> Rgb {
     }
 }
 
+/// Fleet `k` of a side gets its own tone of the side colour.
+pub fn fleet_color(side: usize, k: usize) -> Rgb {
+    const TONES: [f32; MAX_FLEETS_PER_SIDE] = [0.0, -0.35, 0.35, -0.6, 0.6, -0.18, 0.18, 0.8];
+    let base = SIDE_COLORS[side];
+    let t = TONES[k % TONES.len()];
+    if t >= 0.0 {
+        // Toward white.
+        [0, 1, 2].map(|i| (base[i] as f32 + (255.0 - base[i] as f32) * t * 0.7) as u8)
+    } else {
+        Canvas::shade_px(base, 1.0 + t)
+    }
+}
+
+fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    [0, 1, 2].map(|i| (a[i] as f32 * (1.0 - t) + b[i] as f32 * t).round() as u8)
+}
+
 pub fn render(d: &Dominion, opts: DrawOptions) -> Canvas {
     let (w, h) = (d.cfg.w, d.cfg.h);
     let mut c = Canvas::new(w, h, SPACE);
-    // Fleet territory, coarse when `step` > 1.
+    let tones: Vec<Rgb> = (0..d.fleets.len()).map(|i| fleet_color(d.fleets[i].side, d.fleet_number(i) - 1)).collect();
+    // Each fleet's patch (as in "grow the seeds"), coarse when `step` > 1.
     let step = opts.step.max(1);
     let (gw, gh) = (w.div_ceil(step), h.div_ceil(step));
     let inf = Influence::new(d);
-    let mut terr = vec![Control::Neutral; (gw * gh) as usize];
+    // (control, dominating fleet, on its growth front)
+    let mut cells = vec![(Control::Neutral, None, false); (gw * gh) as usize];
     for gy in 0..gh {
         for gx in 0..gw {
             let p = Vec2::new((gx * step) as f32 + step as f32 * 0.5, (gy * step) as f32 + step as f32 * 0.5);
-            terr[(gy * gw + gx) as usize] = inf.at(p).0;
+            let (ctrl, fleet, score) = inf.at_scored(p);
+            // The last ~1.5 px of a patch's reach.
+            let front = fleet.is_some_and(|f| (REACH - score) * d.fleets[f].weight() < 1.5 * step as f32);
+            cells[(gy * gw + gx) as usize] = (ctrl, fleet, front);
         }
     }
-    let at = |x: u32, y: u32| terr[((y / step) * gw + x / step) as usize];
-    let side_of = |c: Control| if let Control::Side(s) = c { Some(s) } else { None };
+    let at = |x: u32, y: u32| cells[((y / step) * gw + x / step) as usize];
     for y in 0..h {
         for x in 0..w {
             let site = d.regions.at(x, y);
             let planet = if site == NO_OWNER { None } else { d.planet_at[site as usize] };
-            let mut col = match planet {
-                // Planet regions show their owner.
+            // Base: planet regions in their owner's colour, else empty space.
+            let base = match planet {
                 Some(pi) if opts.regions => {
-                    let pl = &d.planets[pi];
-                    let k = if matches!(pl.owner, Owner::Side(_)) { 0.5 + 0.08 * pl.value as f32 } else { 1.0 };
-                    if d.regions.is_border(x, y) { INK } else { Canvas::shade_px(owner_color(pl.owner), k) }
+                    if d.regions.is_border(x, y) {
+                        INK
+                    } else {
+                        let pl = &d.planets[pi];
+                        Canvas::shade_px(owner_color(pl.owner), if matches!(pl.owner, Owner::Side(_)) { 0.45 } else { 0.8 })
+                    }
                 }
-                // Empty space (and everything, with regions off) shows the
-                // fleets' reach, dimly.
-                _ => match at(x, y) {
-                    Control::Side(s) => Canvas::shade_px(SIDE_COLORS[s], 0.2),
-                    Control::Contested if (x + y) % 8 < 4 => Canvas::shade_px(CONTESTED, 0.35),
-                    _ => SPACE,
-                },
+                _ => SPACE,
+            };
+            let (ctrl, fleet, front) = at(x, y);
+            let mut col = match (ctrl, fleet) {
+                (Control::Contested, _) if (x + y) % 8 < 4 => mix(base, CONTESTED, 0.55),
+                (_, Some(f)) => mix(base, tones[f], if planet.is_some() && opts.regions { 0.45 } else { 0.6 }),
+                _ => base,
             };
             if opts.borders {
-                let here = side_of(at(x, y));
-                let right = if x + 1 < w { side_of(at(x + 1, y)) } else { here };
-                let down = if y + 1 < h { side_of(at(x, y + 1)) } else { here };
-                if here.is_some() && ((right.is_some() && right != here) || (down.is_some() && down != here)) {
-                    col = WHITE;
+                // Dark seams where two fleets' patches meet, a bright edge
+                // where a patch stops growing.
+                let right = if x + 1 < w { at(x + 1, y).1 } else { fleet };
+                let down = if y + 1 < h { at(x, y + 1).1 } else { fleet };
+                if fleet.is_some() && ((right.is_some() && right != fleet) || (down.is_some() && down != fleet)) {
+                    col = INK;
+                } else if front && let Some(f) = fleet {
+                    col = tones[f];
                 }
             }
             c.set(x as i32, y as i32, col);
@@ -343,28 +407,27 @@ pub fn render(d: &Dominion, opts: DrawOptions) -> Canvas {
     // at the end of this turn.
     for (p, pr) in d.planets.iter().zip(d.pressure()) {
         let r = 1.5 + 1.3 * p.value as f32;
-        c.circle(p.pos, r + 2.0 + 2.0 * p.defence, [170, 170, 180], 0.7);
+        let ring = r + 2.0 + p.defence as f32 / 25.0;
+        c.circle(p.pos, ring, [170, 170, 180], 0.7);
         match pr {
             Pressure::Falls(s) => {
-                c.circle(p.pos, r + 4.0 + 2.0 * p.defence, GOLD, 1.0);
-                c.circle(p.pos, r + 5.0 + 2.0 * p.defence, SIDE_COLORS[s], 1.0);
+                c.circle(p.pos, ring + 2.0, GOLD, 1.0);
+                c.circle(p.pos, ring + 3.0, SIDE_COLORS[s], 1.0);
             }
-            Pressure::Contested => c.circle(p.pos, r + 4.0 + 2.0 * p.defence, WHITE, 0.8),
+            Pressure::Contested => c.circle(p.pos, ring + 2.0, WHITE, 0.8),
             _ => {}
         }
         c.disc(p.pos, r + 1.0, INK, 1.0);
         c.disc(p.pos, r, [230, 220, 170], 1.0);
     }
-    // Fleets: a ring sized by strength.
+    // Fleets, in their own tone.
     for (i, f) in d.fleets.iter().enumerate() {
-        let col = SIDE_COLORS[f.side];
-        c.circle(f.pos, 9.0 + 6.0 * f.strength, col, 0.9);
         if opts.selected == Some(i) {
-            c.circle(f.pos, 11.0 + 6.0 * f.strength, GOLD, 1.0);
+            c.circle(f.pos, 12.0, GOLD, 1.0);
             c.disc(f.pos, 10.0, GOLD, 1.0);
         }
         c.disc(f.pos, 8.0, INK, 1.0);
-        c.disc(f.pos, 6.5, col, 1.0);
+        c.disc(f.pos, 6.5, tones[i], 1.0);
         c.disc(f.pos, 2.0, WHITE, 1.0);
     }
     c
@@ -375,18 +438,27 @@ pub fn status(d: &Dominion, selected: Option<usize>) -> String {
     let income = d.income();
     let (held, free) = d.holdings();
     let falling = d.pressure().iter().filter(|p| matches!(p, Pressure::Falls(_))).count();
-    let sel = match selected.and_then(|i| d.fleets.get(i).map(|f| (i, f))) {
-        Some((i, f)) => format!(
-            "Selected: {} fleet {}, strength {:.1}.",
-            SIDE_NAMES[f.side],
-            d.fleets[..=i].iter().filter(|g| g.side == f.side).count(),
-            f.strength
-        ),
+    let ships = |side: usize| d.fleets.iter().filter(|f| f.side == side).map(|f| f.ships).sum::<u32>();
+    let sel = match selected.filter(|i| *i < d.fleets.len()) {
+        Some(i) => {
+            let f = &d.fleets[i];
+            format!("Selected: {} fleet {}, {} ships, reach {:.0} px.", SIDE_NAMES[f.side], d.fleet_number(i), f.ships, f.reach())
+        }
         None => "Click a fleet to select it.".into(),
     };
     let mut s = format!(
-        "Turn {} · Blue {} (+{}/turn, {} planets) · Red {} (+{}/turn, {}) · {} independent · {} fall at end of turn\n{sel}",
-        d.turn, d.stock[0], income[0], held[0], d.stock[1], income[1], held[1], free, falling
+        "Turn {} · Blue {} (+{}/turn, {} planets, {} ships) · Red {} (+{}/turn, {}, {} ships) · {} independent · {} fall at end of turn\n{sel}",
+        d.turn,
+        d.stock[0],
+        income[0],
+        held[0],
+        ships(0),
+        d.stock[1],
+        income[1],
+        held[1],
+        ships(1),
+        free,
+        falling
     );
     if !d.last_turn.is_empty() {
         s.push(' ');

@@ -13,7 +13,7 @@ use bevy::ui::RelativeCursorPosition;
 use super::flow::{AppRequest, Phase};
 use super::theme::*;
 use super::ui::{BtnKind, BtnLabel, Enabled, Selected, button_for, card_title, choice_row, panel, row, text};
-use crate::prototypes::dominion::{self, DrawOptions, Dominion, MAX_STRENGTH, MIN_STRENGTH};
+use crate::prototypes::dominion::{self, DrawOptions, Dominion, MAX_FLEETS_PER_SIDE, MAX_SHIPS, MIN_SHIPS};
 use crate::voronoi::Vec2 as MapVec;
 use crate::voronoi::labs::{FACTIONS, LabId, LabState, render, site_at, status, zoom_inset};
 use crate::voronoi::metric::Metric;
@@ -52,6 +52,8 @@ struct Proto {
     d: Dominion,
     /// How many of the sites get a planet.
     planets: usize,
+    /// Fleets per side.
+    fleets: usize,
     selected: Option<usize>,
     drag: Option<usize>,
     regions: bool,
@@ -113,7 +115,8 @@ pub enum LabAction {
 pub enum SliderParam {
     Sites,
     Planets,
-    FleetStrength,
+    Fleets,
+    FleetShips,
     GrowRadius,
     Crack,
     Weight(usize),
@@ -124,7 +127,8 @@ impl SliderParam {
         match self {
             SliderParam::Sites => (3.0, 250.0, 1.0),
             SliderParam::Planets => (1.0, cfg.sites as f32, 1.0),
-            SliderParam::FleetStrength => (MIN_STRENGTH, MAX_STRENGTH, 0.1),
+            SliderParam::Fleets => (1.0, MAX_FLEETS_PER_SIDE as f32, 1.0),
+            SliderParam::FleetShips => (MIN_SHIPS as f32, MAX_SHIPS as f32, 5.0),
             SliderParam::GrowRadius => (0.0, LabState::grow_max(cfg), 1.0),
             SliderParam::Crack => (0.5, 10.0, 0.1),
             SliderParam::Weight(_) => (0.2, 4.0, 0.1),
@@ -135,7 +139,8 @@ impl SliderParam {
         match self {
             SliderParam::Sites => cfg.sites as f32,
             SliderParam::Planets => proto.planets.min(cfg.sites) as f32,
-            SliderParam::FleetStrength => proto.selected.and_then(|i| proto.d.fleets.get(i)).map_or(MIN_STRENGTH, |f| f.strength),
+            SliderParam::Fleets => proto.fleets as f32,
+            SliderParam::FleetShips => proto.selected.and_then(|i| proto.d.fleets.get(i)).map_or(MIN_SHIPS as f32, |f| f.ships as f32),
             SliderParam::GrowRadius => st.grow_radius,
             SliderParam::Crack => st.crack,
             SliderParam::Weight(i) => st.weights[i],
@@ -146,7 +151,8 @@ impl SliderParam {
         match self {
             SliderParam::Sites => format!("{v:.0}"),
             SliderParam::Planets => format!("{v:.0}"),
-            SliderParam::FleetStrength => format!("{v:.1}×"),
+            SliderParam::Fleets => format!("{v:.0} a side"),
+            SliderParam::FleetShips => format!("{v:.0} ships"),
             SliderParam::GrowRadius => format!("{v:.0} px"),
             SliderParam::Crack => format!("{v:.1}"),
             SliderParam::Weight(_) => format!("{v:.1}×"),
@@ -246,10 +252,11 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
         }
     }
     let proto_image = images.add(blank_image(&cfg.0));
-    let planets = 20;
+    let (planets, fleets) = (20, 3);
     let proto = Proto {
-        d: Dominion::new(&cfg.0, planets),
+        d: Dominion::new(&cfg.0, planets, fleets),
         planets,
+        fleets,
         selected: None,
         drag: None,
         regions: true,
@@ -323,21 +330,23 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                         p,
                         "prototype01 — Fleet dominion",
                         "Some Voronoi regions hold a planet worth 1–3 resources a turn. Every planet starts as its own \
-                         independent faction that only defends (grey ring = defence). Fleets project influence by \
-                         distance ÷ strength; at the end of the turn a planet joins the side whose fleet dominates it if \
-                         that fleet is stronger than its defence (gold ring = falls this turn). Contested planets don't \
-                         change hands. Owned planets pay every turn; spend 10 to reinforce a fleet.",
+                         independent faction that only defends (grey ring = defence in ships). Each fleet grows a patch \
+                         like the seeds in lab 1, in its own tone of its side's colour: reach is 70 px per 50 ships, and \
+                         where patches meet the border sits at distance ÷ ships. At the end of the turn a planet joins the \
+                         side whose fleet dominates it if that fleet has more ships than its defence (gold ring = falls \
+                         this turn). Contested planets don't change hands. Owned planets pay every turn; 10 buys 25 ships.",
                     );
                     p.spawn(row()).with_children(|r| {
                         button_for(r, "End turn", LabAction::EndTurn, BtnKind::Primary);
-                        button_for(r, "Reinforce selected (10)", LabAction::Reinforce, BtnKind::Normal);
+                        button_for(r, "Reinforce selected (+25 ships for 10)", LabAction::Reinforce, BtnKind::Normal);
                         toggle(r, "Planet regions", LabAction::ProtoRegions);
-                        toggle(r, "Front lines", LabAction::ProtoBorders);
+                        toggle(r, "Patch edges", LabAction::ProtoBorders);
                         button_for(r, "Reset", LabAction::ProtoReset, BtnKind::Normal);
                     });
                     slider(p, "Sites", SliderParam::Sites);
                     slider(p, "Planets", SliderParam::Planets);
-                    slider(p, "Selected strength", SliderParam::FleetStrength);
+                    slider(p, "Fleets", SliderParam::Fleets);
+                    slider(p, "Selected ships", SliderParam::FleetShips);
                     p.spawn(text("Drag a fleet to move it · click a fleet to select it.", 12.5, DIM));
                     p.spawn((LabText::Proto, text("", 13.0, GREEN)));
                     p.spawn((
@@ -516,7 +525,7 @@ pub fn handle_lab_buttons(
                 }
             }
             LabAction::ProtoReset => {
-                labs.proto.d = Dominion::new(&cfg.0, labs.proto.planets);
+                labs.proto.d = Dominion::new(&cfg.0, labs.proto.planets, labs.proto.fleets);
                 labs.proto.selected = None;
             }
             LabAction::ProtoRegions => labs.proto.regions = !labs.proto.regions,
@@ -587,7 +596,7 @@ pub fn handle_lab_buttons(
         let c = cfg.0;
         labs.state.reseed(&c);
         labs.proto.planets = labs.proto.planets.min(c.sites);
-        labs.proto.d = Dominion::new(&c, labs.proto.planets);
+        labs.proto.d = Dominion::new(&c, labs.proto.planets, labs.proto.fleets);
         labs.proto.selected = None;
         labs.last_cfg = c;
     }
@@ -626,15 +635,23 @@ pub fn drag_sliders(
                 let n = (v as usize).clamp(1, cfg.0.sites);
                 if labs.proto.planets != n {
                     labs.proto.planets = n;
-                    labs.proto.d = Dominion::new(&cfg.0, n);
+                    labs.proto.d = Dominion::new(&cfg.0, n, labs.proto.fleets);
                     labs.proto.selected = None;
                 }
             }
-            SliderParam::FleetStrength => {
+            SliderParam::Fleets => {
+                let n = (v as usize).clamp(1, MAX_FLEETS_PER_SIDE);
+                if labs.proto.fleets != n {
+                    labs.proto.fleets = n;
+                    labs.proto.d = Dominion::new(&cfg.0, labs.proto.planets, n);
+                    labs.proto.selected = None;
+                }
+            }
+            SliderParam::FleetShips => {
                 if let Some(i) = labs.proto.selected
                     && let Some(f) = labs.proto.d.fleets.get_mut(i)
                 {
-                    f.strength = v;
+                    f.ships = v as u32;
                 }
             }
             SliderParam::GrowRadius => {
@@ -893,7 +910,7 @@ pub fn update_lab_ui(
         }
     }
     for (v, mut t) in &mut values {
-        let s = if v.0 == SliderParam::FleetStrength && labs.proto.selected.is_none() {
+        let s = if v.0 == SliderParam::FleetShips && labs.proto.selected.is_none() {
             "select a fleet".to_string()
         } else {
             v.0.label(v.0.get(&c, st, &labs.proto))
@@ -915,7 +932,7 @@ pub fn lab_button_state(
     let c = cfg.0;
     let proto = &labs.proto;
     let can_reinforce = proto.selected.and_then(|i| proto.d.fleets.get(i)).is_some_and(|f| {
-        proto.d.stock[f.side] >= dominion::REINFORCE_COST && f.strength < MAX_STRENGTH
+        proto.d.stock[f.side] >= dominion::REINFORCE_COST && f.ships < MAX_SHIPS
     });
     for (action, mut sel, mut enabled, labels) in &mut buttons {
         let en = !matches!(*action, LabAction::Reinforce) || can_reinforce;
