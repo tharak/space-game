@@ -2,72 +2,100 @@ use super::dominion::*;
 use crate::voronoi::Vec2;
 use crate::voronoi::sites::VoronoiConfig;
 
-fn small() -> Dominion {
-    Dominion::new(&VoronoiConfig { sites: 30, w: 300, h: 180, ..Default::default() })
+fn cfg() -> VoronoiConfig {
+    VoronoiConfig { sites: 30, w: 300, h: 180, ..Default::default() }
+}
+
+/// One planet, one fleet of `side` sitting on it.
+fn duel(defence: f32, strength: f32) -> Dominion {
+    let mut d = Dominion::new(&cfg(), 1);
+    d.planets[0].defence = defence;
+    let pos = d.planets[0].pos;
+    d.fleets = vec![FleetToken { side: 0, pos, strength }];
+    d
 }
 
 #[test]
-fn starts_with_three_fleets_a_side_and_edge_planets_worth_nothing() {
-    let d = small();
-    assert_eq!(d.fleets.iter().filter(|f| f.side == 0).count(), FLEETS_PER_SIDE);
-    assert_eq!(d.fleets.iter().filter(|f| f.side == 1).count(), FLEETS_PER_SIDE);
-    for o in d.regions.edge_owners() {
-        assert_eq!(d.planets[o as usize].value, 0);
+fn planets_are_a_subset_of_sites_and_start_independent() {
+    let d = Dominion::new(&cfg(), 12);
+    assert_eq!(d.planets.len(), 12);
+    assert_eq!(d.planet_at.iter().flatten().count(), 12);
+    for (i, p) in d.planets.iter().enumerate() {
+        assert_eq!(p.owner, Owner::Independent(i), "each planet is its own faction");
+        assert_eq!(d.planet_at[p.site], Some(i));
+        assert!((MIN_DEFENCE..=MAX_DEFENCE).contains(&p.defence));
     }
-    assert!(d.planets.iter().any(|p| p.value > 0));
+    // Inland regions are used before edge ones.
+    let edge = d.regions.edge_owners();
+    assert!(d.planets.iter().all(|p| !edge.contains(&(p.site as u32))));
+    // Never more planets than sites.
+    assert_eq!(Dominion::new(&cfg(), 999).planets.len(), 30);
+    assert_eq!(d.holdings(), ([0, 0], 12));
+    assert_eq!(d.income(), [0, 0]);
 }
 
 #[test]
-fn income_is_the_value_of_held_planets() {
-    let d = small();
-    let control = d.control();
-    for side in 0..2 {
-        let expect: u32 = d.planets.iter().zip(&control).filter(|(_, c)| **c == Control::Side(side)).map(|(p, _)| p.value).sum();
-        assert_eq!(d.income()[side], expect);
-    }
-}
-
-#[test]
-fn contested_planets_pay_nobody() {
-    let mut d = small();
-    let (i, p) = d.planets.iter().enumerate().find(|(_, p)| p.value > 0).map(|(i, p)| (i, *p)).unwrap();
-    // One fleet a side, equally strong and equally far from the planet.
-    d.fleets = vec![
-        FleetToken { side: 0, pos: p.pos - Vec2::new(20.0, 0.0), strength: 1.0 },
-        FleetToken { side: 1, pos: p.pos + Vec2::new(20.0, 0.0), strength: 1.0 },
-    ];
-    assert_eq!(d.control()[i], Control::Contested);
-    let before = d.income();
-    d.fleets[0].strength = 2.0;
-    assert_eq!(d.control()[i], Control::Side(0));
-    assert!(d.income()[0] >= before[0] + p.value);
-}
-
-#[test]
-fn moving_a_fleet_onto_a_planet_takes_it() {
-    let mut d = small();
-    let (i, p) = d.planets.iter().enumerate().find(|(_, p)| p.value > 0).map(|(i, p)| (i, *p)).unwrap();
-    let red = d.fleets.iter().position(|f| f.side == 1).unwrap();
-    d.fleets[red].pos = p.pos;
-    assert_eq!(d.control()[i], Control::Side(1));
-}
-
-#[test]
-fn a_stronger_fleet_never_holds_less() {
-    let mut d = small();
-    let before = d.holdings().0[0];
-    for f in d.fleets.iter_mut().filter(|f| f.side == 0) {
-        f.strength *= 2.0;
-    }
-    assert!(d.holdings().0[0] >= before);
-}
-
-#[test]
-fn turns_pay_and_reinforcements_cost() {
-    let mut d = small();
-    let income = d.income();
+fn a_stronger_fleet_takes_the_planet() {
+    let mut d = duel(1.0, 1.5);
+    assert_eq!(d.pressure()[0], Pressure::Falls(0));
     d.end_turn();
-    assert_eq!((d.stock, d.turn), (income, 2));
+    assert_eq!(d.planets[0].owner, Owner::Side(0));
+    // Captured planets pay at once, and are held from then on.
+    assert_eq!(d.stock[0], d.planets[0].value);
+    assert_eq!(d.pressure()[0], Pressure::Held(0));
+}
+
+#[test]
+fn a_weaker_fleet_is_resisted() {
+    let mut d = duel(2.0, 1.5);
+    assert_eq!(d.pressure()[0], Pressure::Resists(0));
+    d.end_turn();
+    assert_eq!(d.planets[0].owner, Owner::Independent(0));
+    assert_eq!(d.stock, [0, 0]);
+}
+
+#[test]
+fn contested_planets_dont_change_hands() {
+    let mut d = duel(0.5, 1.0);
+    let p = d.planets[0].pos;
+    d.fleets = vec![
+        FleetToken { side: 0, pos: p - Vec2::new(20.0, 0.0), strength: 1.0 },
+        FleetToken { side: 1, pos: p + Vec2::new(20.0, 0.0), strength: 1.0 },
+    ];
+    assert_eq!(d.pressure()[0], Pressure::Contested);
+    d.end_turn();
+    assert_eq!(d.planets[0].owner, Owner::Independent(0));
+}
+
+#[test]
+fn a_captured_planet_defends_against_the_other_side() {
+    let mut d = duel(1.0, 1.5);
+    d.end_turn();
+    let p = d.planets[0].pos;
+    d.fleets = vec![FleetToken { side: 1, pos: p, strength: 0.8 }];
+    d.end_turn();
+    assert_eq!(d.planets[0].owner, Owner::Side(0), "Red is weaker than the defence");
+    d.fleets[0].strength = 1.2;
+    d.end_turn();
+    assert_eq!(d.planets[0].owner, Owner::Side(1));
+}
+
+#[test]
+fn a_faction_can_hold_many_planets() {
+    let mut d = Dominion::new(&cfg(), 10);
+    for p in &mut d.planets {
+        p.defence = MIN_DEFENCE;
+    }
+    // One huge Blue fleet in the middle reaches everything.
+    d.fleets = vec![FleetToken { side: 0, pos: Vec2::new(150.0, 90.0), strength: MAX_STRENGTH }];
+    d.end_turn();
+    assert_eq!(d.holdings(), ([10, 0], 0));
+    assert_eq!(d.income()[0], d.planets.iter().map(|p| p.value).sum::<u32>());
+}
+
+#[test]
+fn reinforcements_cost_and_cap() {
+    let mut d = Dominion::new(&cfg(), 5);
     let blue = d.fleets.iter().position(|f| f.side == 0).unwrap();
     d.stock[0] = REINFORCE_COST;
     assert!(d.reinforce(blue));
@@ -80,10 +108,9 @@ fn turns_pay_and_reinforcements_cost() {
 
 #[test]
 fn renders_deterministically() {
-    let d = small();
+    let d = Dominion::new(&cfg(), 12);
     let a = render(&d, DrawOptions::default());
     assert_eq!((a.w, a.h, a.px.len()), (300, 180, 300 * 180 * 3));
     assert_eq!(render(&d, DrawOptions::default()), a);
-    let coarse = render(&d, DrawOptions { step: 2, ..Default::default() });
-    assert_eq!(coarse.px.len(), a.px.len());
+    assert_eq!(render(&d, DrawOptions { step: 3, ..Default::default() }).px.len(), a.px.len());
 }

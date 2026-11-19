@@ -8,7 +8,15 @@ A real-time fleet battle with hundreds of ships a side, in Rust with [Bevy 0.19]
 
 ## prototype01 — Fleet dominion
 
-The first card on the start page, built from the labs in `src/prototypes/`. Planets are Voronoi regions worth 1–3 resources a turn. Fleets project weighted influence (distance ÷ strength): the side whose fleet dominates a planet collects its income, and contested planets pay nobody. End the turn to bank income, and spend 10 to reinforce a fleet. Drag fleets to move them; tests: `cargo test prototypes`.
+The first card on the start page, built from the labs in `src/prototypes/`.
+
+- **Planets:** some of the Voronoi regions hold one (Sites and Planets sliders), worth 1–3 resources a turn.
+- **Independent factions:** every planet starts as its own faction, with a defence of 0.5–3 and no fleet; it only defends.
+- **Fleets:** Blue and Red fleets project weighted influence (distance ÷ strength).
+- **Conquest:** at the end of a turn, a planet joins the side whose fleet dominates it if that fleet is stronger than the planet's defence. Contested planets don't change hands, and captured planets keep their defence against the other side.
+- **Economy:** owned planets pay every turn, and 10 buys +0.5 fleet strength.
+
+Drag fleets to move them. Tests: `cargo test prototypes`.
 
 ## Voronoi labs
 

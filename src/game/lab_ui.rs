@@ -50,6 +50,8 @@ struct LabView {
 /// prototype01's state, selection and image.
 struct Proto {
     d: Dominion,
+    /// How many of the sites get a planet.
+    planets: usize,
     selected: Option<usize>,
     drag: Option<usize>,
     regions: bool,
@@ -110,6 +112,7 @@ pub enum LabAction {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SliderParam {
     Sites,
+    Planets,
     FleetStrength,
     GrowRadius,
     Crack,
@@ -120,6 +123,7 @@ impl SliderParam {
     fn range(self, cfg: &VoronoiConfig) -> (f32, f32, f32) {
         match self {
             SliderParam::Sites => (3.0, 250.0, 1.0),
+            SliderParam::Planets => (1.0, cfg.sites as f32, 1.0),
             SliderParam::FleetStrength => (MIN_STRENGTH, MAX_STRENGTH, 0.1),
             SliderParam::GrowRadius => (0.0, LabState::grow_max(cfg), 1.0),
             SliderParam::Crack => (0.5, 10.0, 0.1),
@@ -130,6 +134,7 @@ impl SliderParam {
     fn get(self, cfg: &VoronoiConfig, st: &LabState, proto: &Proto) -> f32 {
         match self {
             SliderParam::Sites => cfg.sites as f32,
+            SliderParam::Planets => proto.planets.min(cfg.sites) as f32,
             SliderParam::FleetStrength => proto.selected.and_then(|i| proto.d.fleets.get(i)).map_or(MIN_STRENGTH, |f| f.strength),
             SliderParam::GrowRadius => st.grow_radius,
             SliderParam::Crack => st.crack,
@@ -140,6 +145,7 @@ impl SliderParam {
     fn label(self, v: f32) -> String {
         match self {
             SliderParam::Sites => format!("{v:.0}"),
+            SliderParam::Planets => format!("{v:.0}"),
             SliderParam::FleetStrength => format!("{v:.1}×"),
             SliderParam::GrowRadius => format!("{v:.0} px"),
             SliderParam::Crack => format!("{v:.1}"),
@@ -240,8 +246,10 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
         }
     }
     let proto_image = images.add(blank_image(&cfg.0));
+    let planets = 20;
     let proto = Proto {
-        d: Dominion::new(&cfg.0),
+        d: Dominion::new(&cfg.0, planets),
+        planets,
         selected: None,
         drag: None,
         regions: true,
@@ -314,9 +322,11 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                     card_title(
                         p,
                         "prototype01 — Fleet dominion",
-                        "Planets are Voronoi regions worth 1–3 resources a turn (edge regions are empty space). Each fleet \
-                         projects influence by distance ÷ strength; the side whose fleet dominates a planet collects it, \
-                         contested planets pay nobody. End the turn to bank income, spend 10 to reinforce a fleet.",
+                        "Some Voronoi regions hold a planet worth 1–3 resources a turn. Every planet starts as its own \
+                         independent faction that only defends (grey ring = defence). Fleets project influence by \
+                         distance ÷ strength; at the end of the turn a planet joins the side whose fleet dominates it if \
+                         that fleet is stronger than its defence (gold ring = falls this turn). Contested planets don't \
+                         change hands. Owned planets pay every turn; spend 10 to reinforce a fleet.",
                     );
                     p.spawn(row()).with_children(|r| {
                         button_for(r, "End turn", LabAction::EndTurn, BtnKind::Primary);
@@ -325,6 +335,8 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                         toggle(r, "Front lines", LabAction::ProtoBorders);
                         button_for(r, "Reset", LabAction::ProtoReset, BtnKind::Normal);
                     });
+                    slider(p, "Sites", SliderParam::Sites);
+                    slider(p, "Planets", SliderParam::Planets);
                     slider(p, "Selected strength", SliderParam::FleetStrength);
                     p.spawn(text("Drag a fleet to move it · click a fleet to select it.", 12.5, DIM));
                     p.spawn((LabText::Proto, text("", 13.0, GREEN)));
@@ -504,7 +516,7 @@ pub fn handle_lab_buttons(
                 }
             }
             LabAction::ProtoReset => {
-                labs.proto.d = Dominion::new(&cfg.0);
+                labs.proto.d = Dominion::new(&cfg.0, labs.proto.planets);
                 labs.proto.selected = None;
             }
             LabAction::ProtoRegions => labs.proto.regions = !labs.proto.regions,
@@ -574,7 +586,8 @@ pub fn handle_lab_buttons(
     if cfg.0 != labs.last_cfg {
         let c = cfg.0;
         labs.state.reseed(&c);
-        labs.proto.d = Dominion::new(&c);
+        labs.proto.planets = labs.proto.planets.min(c.sites);
+        labs.proto.d = Dominion::new(&c, labs.proto.planets);
         labs.proto.selected = None;
         labs.last_cfg = c;
     }
@@ -607,6 +620,14 @@ pub fn drag_sliders(
                 let n = v as usize;
                 if cfg.0.sites != n {
                     cfg.0.sites = n;
+                }
+            }
+            SliderParam::Planets => {
+                let n = (v as usize).clamp(1, cfg.0.sites);
+                if labs.proto.planets != n {
+                    labs.proto.planets = n;
+                    labs.proto.d = Dominion::new(&cfg.0, n);
+                    labs.proto.selected = None;
                 }
             }
             SliderParam::FleetStrength => {
@@ -789,7 +810,7 @@ pub fn render_labs(
             selected: proto.selected,
             step: if proto.drag.is_some() { 3 } else { 1 },
         };
-        let key = format!("{:?}|{:?}|{:?}|{:?}", proto.d.cfg, proto.d.fleets, opts, proto.d.turn);
+        let key = format!("{:?}|{:?}|{:?}|{:?}|{}", proto.d.cfg, proto.d.fleets, opts, proto.d.turn, proto.d.planets.len());
         if key != proto.view.key {
             let rgba = dominion::render(&proto.d, opts).to_rgba();
             if let Some(mut img) = images.get_mut(&proto.view.image) {
