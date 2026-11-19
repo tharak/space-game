@@ -8,15 +8,17 @@ A real-time fleet battle with hundreds of ships a side, in Rust with [Bevy 0.19]
 
 ## prototype01 — Fleet dominion
 
-The first card on the start page, built from the labs in `src/prototypes/`.
+The start page's prototype, in real time (Pause, 1×, 2×, 4×). Code: `src/prototypes/dominion.rs`.
 
-- **Planets:** some of the Voronoi regions hold one (Sites and Planets sliders), worth 1–3 resources a turn.
-- **Independent factions:** every planet starts as its own faction with no fleet; it only defends. All planets share one weight (Planet weight slider).
-- **Fleets:** Blue and Red each get 1–8 fleets (Fleets slider). A fleet weighs ships × weight per ship (slider, 0.01 steps, default 0.1). Each fleet grows a patch like the seeds in lab 1, in its own tone of its side's colour. It reaches reach-per-weight × weight (slider, 1 px steps, default 14, measured on a 720-wide map and scaled with the map size), and where patches meet, the border sits at distance ÷ weight.
-- **Conquest:** at the end of a turn, a planet joins the side whose fleet dominates it if that fleet outweighs the planet. Contested planets don't change hands, and captured planets keep their weight against the other side.
-- **Economy:** owned planets pay every turn, and 10 buys 25 ships.
+- **Planets:** some of the Voronoi regions hold a planet (Sites and Planets sliders). Each builds ships into its own garrison fleet: one every 15 s ÷ the planet's value (1–3), set by the Production slider.
+- **Independent planets:** they start with 10 ships, build up to 30, and only defend.
+- **Fleets:** Blue and Red each start with a home planet and 1–8 fleets of 50 ships (Fleets slider). A fleet takes orders once it has 10 ships. Click a fleet, then click the map to send it, or drag from a fleet to where it should go. Both sides are controlled by hand.
+- **Formations:** a small menu under each commandable fleet picks one of the battle's formations (Line, Wedge, Crescent, Echelon L/R, Column). Ships sit at the battle's formation slots.
+- **Combat:** fleets in range fight automatically with the battle's rules: gun range, gun cone, front, flank and rear hit chances, range falloff, reload and hull. It's resolved as expected damage, scaled by the Combat speed slider. A moving fleet stops short of an enemy and faces it, as in the battle, so formation and facing matter.
+- **Capture:** a planet changes hands once its garrison is gone and a single enemy side has held it for 3 s (a ring shows the progress).
+- **Patches:** like lab 1's growing seeds, they show each fleet's influence (weight = ships × weight per ship, reach = reach per weight × weight, scaled to the map).
 
-Drag fleets to move them. Tests: `cargo test prototypes`.
+Tests: `cargo test prototypes`. `cargo run --release --example prototype01_dump -- <dir>` plays a minute and writes frames.
 
 ## Voronoi labs
 

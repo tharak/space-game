@@ -13,7 +13,7 @@ use bevy::ui::RelativeCursorPosition;
 use super::flow::{AppRequest, Phase};
 use super::theme::*;
 use super::ui::{BtnKind, BtnLabel, Enabled, Selected, button_for, card_title, choice_row, panel, row, text};
-use crate::prototypes::dominion::{self, DrawOptions, Dominion, MAX_FLEETS_PER_SIDE, MAX_SHIPS, MIN_SHIPS, Tuning};
+use crate::prototypes::dominion::{self, DrawOptions, Dominion, Formation, MAX_FLEETS_PER_SIDE, MAX_SHIPS, MIN_SHIPS, Tuning};
 use crate::voronoi::Vec2 as MapVec;
 use crate::voronoi::labs::{FACTIONS, LabId, LabState, render, site_at, status, zoom_inset};
 use crate::voronoi::metric::Metric;
@@ -56,11 +56,20 @@ struct Proto {
     planets: usize,
     /// Fleets per side.
     fleets: usize,
-    selected: Option<usize>,
-    drag: Option<usize>,
+    /// Selected fleet id.
+    selected: Option<u32>,
+    /// A press on a fleet: its id and where the press started.
+    drag: Option<(u32, MapVec)>,
     regions: bool,
     borders: bool,
+    paused: bool,
+    speed: u32,
     view: LabView,
+    /// Cached planet-region layer and what it was drawn from.
+    background: Option<Canvas>,
+    background_key: String,
+    /// Seconds since the image was last redrawn.
+    since_render: f32,
 }
 
 /// Lab state plus each lab's cached image.
@@ -94,8 +103,10 @@ pub enum LabAction {
     /// −/+ on a slider: one step down or up.
     Nudge(SliderParam, i8),
     // prototype01
-    EndTurn,
-    Reinforce,
+    ProtoPause,
+    ProtoSpeed(u32),
+    /// Set a fleet's formation (from the menu by the fleet).
+    FleetFormation(u32, Formation),
     ProtoReset,
     ProtoRegions,
     ProtoBorders,
@@ -127,7 +138,9 @@ pub enum SliderParam {
     FleetShips,
     WeightPerShip,
     ReachPerWeight,
-    PlanetWeight,
+    Production,
+    FleetSpeed,
+    CombatSpeed,
     GrowRadius,
     Crack,
     Weight(usize),
@@ -142,7 +155,9 @@ impl SliderParam {
             SliderParam::FleetShips => (MIN_SHIPS as f32, MAX_SHIPS as f32, 5.0),
             SliderParam::WeightPerShip => (0.01, 1.0, 0.01),
             SliderParam::ReachPerWeight => (1.0, 100.0, 1.0),
-            SliderParam::PlanetWeight => (0.0, 50.0, 0.1),
+            SliderParam::Production => (0.5, 30.0, 0.5),
+            SliderParam::FleetSpeed => (5.0, 150.0, 1.0),
+            SliderParam::CombatSpeed => (0.25, 20.0, 0.25),
             SliderParam::GrowRadius => (0.0, LabState::grow_max(cfg), 1.0),
             SliderParam::Crack => (0.5, 10.0, 0.1),
             SliderParam::Weight(_) => (0.2, 4.0, 0.1),
@@ -154,10 +169,12 @@ impl SliderParam {
             SliderParam::Sites => cfg.sites as f32,
             SliderParam::Planets => proto.planets.min(cfg.sites) as f32,
             SliderParam::Fleets => proto.fleets as f32,
-            SliderParam::FleetShips => proto.selected.and_then(|i| proto.d.fleets.get(i)).map_or(MIN_SHIPS as f32, |f| f.ships as f32),
+            SliderParam::FleetShips => proto.selected.and_then(|id| proto.d.fleet(id)).map_or(MIN_SHIPS as f32, |f| f.ships as f32),
             SliderParam::WeightPerShip => proto.d.tuning.weight_per_ship,
             SliderParam::ReachPerWeight => proto.d.tuning.reach_per_weight,
-            SliderParam::PlanetWeight => proto.d.tuning.planet_weight,
+            SliderParam::Production => proto.d.tuning.secs_per_ship,
+            SliderParam::FleetSpeed => proto.d.tuning.speed,
+            SliderParam::CombatSpeed => proto.d.tuning.combat_speed,
             SliderParam::GrowRadius => st.grow_radius,
             SliderParam::Crack => st.crack,
             SliderParam::Weight(i) => st.weights[i],
@@ -172,7 +189,9 @@ impl SliderParam {
             SliderParam::FleetShips => format!("{v:.0} ships"),
             SliderParam::WeightPerShip => format!("{v:.2} a ship"),
             SliderParam::ReachPerWeight => format!("{v:.0} × weight (px at 720 wide)"),
-            SliderParam::PlanetWeight => format!("{v:.1}"),
+            SliderParam::Production => format!("{v:.1} s a ship (÷ planet value)"),
+            SliderParam::FleetSpeed => format!("{v:.0} px/s (at 720 wide)"),
+            SliderParam::CombatSpeed => format!("{v:.2}× the battle's rate of fire"),
             SliderParam::GrowRadius => format!("{v:.0} px"),
             SliderParam::Crack => format!("{v:.1}"),
             SliderParam::Weight(_) => format!("{v:.1}×"),
@@ -300,15 +319,17 @@ fn set_slider(param: SliderParam, v: f32, cfg: &mut VoronoiConfig, labs: &mut La
             }
         }
         SliderParam::FleetShips => {
-            if let Some(i) = proto.selected
-                && let Some(f) = proto.d.fleets.get_mut(i)
+            if let Some(id) = proto.selected
+                && let Some(i) = proto.d.fleet_index(id)
             {
-                f.ships = v.round() as u32;
+                proto.d.fleets[i].ships = v.round() as u32;
             }
         }
-        SliderParam::WeightPerShip => proto.d.set_tuning(Tuning { weight_per_ship: v, ..proto.d.tuning }),
-        SliderParam::ReachPerWeight => proto.d.set_tuning(Tuning { reach_per_weight: v, ..proto.d.tuning }),
-        SliderParam::PlanetWeight => proto.d.set_tuning(Tuning { planet_weight: v, ..proto.d.tuning }),
+        SliderParam::WeightPerShip => proto.d.tuning.weight_per_ship = v,
+        SliderParam::ReachPerWeight => proto.d.tuning.reach_per_weight = v,
+        SliderParam::Production => proto.d.tuning.secs_per_ship = v,
+        SliderParam::FleetSpeed => proto.d.tuning.speed = v,
+        SliderParam::CombatSpeed => proto.d.tuning.combat_speed = v,
         SliderParam::GrowRadius => {
             labs.state.grow_radius = v;
             if labs.playing == Some(LabId::Grow) {
@@ -351,7 +372,12 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
         drag: None,
         regions: true,
         borders: true,
+        paused: false,
+        speed: 1,
         view: LabView { image: proto_image.clone(), key: String::new(), base: None, shown: String::new() },
+        background: None,
+        background_key: String::new(),
+        since_render: 0.0,
     };
     commands.insert_resource(Labs {
         state: LabState::new(&cfg.0),
@@ -379,33 +405,22 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                 card_title(
                     p,
                     "prototype01 — Fleet dominion",
-                    "Some Voronoi regions hold a planet worth 1–3 resources a turn. Every planet starts as its own \
-                     independent faction that only defends (grey ring = its weight). A fleet weighs ships × weight per \
-                     ship and grows a patch like the seeds in lab 1, in its own tone of its side's colour: reach is \
-                     reach-per-weight × weight, in pixels of a 720-wide map (it scales with the map size), and where \
-                     patches meet the border sits at distance ÷ weight. Fleets are \
-                     drawn as the battle's ships, one per 5, flagship in white. At the end of the turn a planet joins the \
-                     side whose fleet dominates it if that fleet outweighs the planet (gold ring = falls this turn). \
-                     Contested planets don't change hands. Owned planets pay every turn; 10 buys 25 ships.",
+                    "Real time. Every planet builds ships into its own garrison fleet (richer planets faster); \
+                     independent planets only defend. Blue and Red fleets take orders once they have 10 ships. Fleets \
+                     in range fight automatically with the battle's rules: range, gun cone, front/flank/rear hit \
+                     chances, reload and hull, so formation and facing matter. Pick a formation from the menu under \
+                     each fleet. A planet changes hands once its garrison is gone and an enemy fleet holds it for 3 s \
+                     (ring). Patches show each fleet's influence (ships × weight per ship, reach × weight).",
                 );
                 p.spawn(row()).with_children(|r| {
-                    button_for(r, "End turn", LabAction::EndTurn, BtnKind::Primary);
-                    button_for(r, "Reinforce selected (+25 ships for 10)", LabAction::Reinforce, BtnKind::Normal);
+                    button_for(r, "Pause", LabAction::ProtoPause, BtnKind::Primary);
+                    for m in [1, 2, 4] {
+                        button_for(r, &format!("{m}×"), LabAction::ProtoSpeed(m), BtnKind::Choice);
+                    }
                     toggle(r, "Planet regions", LabAction::ProtoRegions);
                     toggle(r, "Patch edges", LabAction::ProtoBorders);
                     button_for(r, "Reset", LabAction::ProtoReset, BtnKind::Normal);
                 });
-                let sizes: Vec<(String, LabAction)> =
-                    PROTO_SIZES.iter().map(|(w, h)| (format!("{w}×{h}"), LabAction::ProtoSize(*w, *h))).collect();
-                choice_row(p, "Map size", &sizes);
-                slider(p, "Sites", SliderParam::Sites);
-                slider(p, "Planets", SliderParam::Planets);
-                slider(p, "Fleets", SliderParam::Fleets);
-                slider(p, "Selected ships", SliderParam::FleetShips);
-                slider(p, "Weight per ship", SliderParam::WeightPerShip);
-                slider(p, "Reach per weight", SliderParam::ReachPerWeight);
-                slider(p, "Planet weight", SliderParam::PlanetWeight);
-                p.spawn(text("Drag a fleet to move it · click a fleet to select it.", 12.5, DIM));
                 p.spawn((LabText::Proto, text("", 13.0, GREEN)));
                 p.spawn((
                     PrototypeImage,
@@ -417,6 +432,28 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                         flex_shrink: 0.0,
                         ..default()
                     },
+                ))
+                .with_children(|img| {
+                    for slot in 0..MAX_MENUS {
+                        fleet_menu(img, slot);
+                    }
+                });
+                let sizes: Vec<(String, LabAction)> =
+                    PROTO_SIZES.iter().map(|(w, h)| (format!("{w}×{h}"), LabAction::ProtoSize(*w, *h))).collect();
+                choice_row(p, "Map size", &sizes);
+                slider(p, "Sites", SliderParam::Sites);
+                slider(p, "Planets", SliderParam::Planets);
+                slider(p, "Fleets", SliderParam::Fleets);
+                slider(p, "Production", SliderParam::Production);
+                slider(p, "Fleet speed", SliderParam::FleetSpeed);
+                slider(p, "Combat speed", SliderParam::CombatSpeed);
+                slider(p, "Selected ships", SliderParam::FleetShips);
+                slider(p, "Weight per ship", SliderParam::WeightPerShip);
+                slider(p, "Reach per weight", SliderParam::ReachPerWeight);
+                p.spawn(text(
+                    "Click a fleet to select it, then click the map to send it · or drag from a fleet to where it should go.",
+                    12.5,
+                    DIM,
                 ));
             });
         });
@@ -478,6 +515,68 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
             });
         });
     });
+}
+
+/// Formation menus available at once (one per commandable fleet).
+const MAX_MENUS: usize = 48;
+
+/// A small formation menu that follows a fleet on the prototype map.
+#[derive(Component)]
+pub struct FleetMenu(usize);
+/// A button in a fleet's formation menu.
+#[derive(Component)]
+pub struct FleetMenuButton;
+
+fn short_name(f: Formation) -> &'static str {
+    match f {
+        Formation::Line => "Line",
+        Formation::Wedge => "Wedge",
+        Formation::Crescent => "Cresc",
+        Formation::EchelonLeft => "Ech L",
+        Formation::EchelonRight => "Ech R",
+        Formation::Column => "Col",
+        _ => "?",
+    }
+}
+
+fn fleet_menu(parent: &mut ChildSpawnerCommands, slot: usize) {
+    parent
+        .spawn((
+            FleetMenu(slot),
+            Node {
+                position_type: PositionType::Absolute,
+                display: Display::None,
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(2.0),
+                padding: UiRect::all(Val::Px(2.0)),
+                border_radius: BorderRadius::all(Val::Px(4.0)),
+                ..default()
+            },
+            BackgroundColor(BG.with_alpha(0.75)),
+        ))
+        .with_children(|m| {
+            for f in Formation::PLAYER {
+                let mut labels = Vec::new();
+                let mut b = m.spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::axes(Val::Px(4.0), Val::Px(1.0)),
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(3.0)),
+                        ..default()
+                    },
+                    BackgroundColor(PANEL2),
+                    BorderColor::all(LINE),
+                    LabAction::FleetFormation(0, f),
+                    FleetMenuButton,
+                    BtnKind::Choice,
+                    Enabled(true),
+                    Selected(false),
+                ));
+                b.with_children(|t| labels.push(t.spawn(text(short_name(f), 10.5, TEXT)).id()));
+                b.insert(BtnLabel::new(labels));
+            }
+        });
 }
 
 fn page_root() -> Node {
@@ -651,11 +750,14 @@ pub fn handle_lab_buttons(
                 let v = snap(param.get(&cfg.0, &labs.state, &labs.proto) + step * dir as f32, lo, step);
                 set_slider(param, v, &mut cfg.0, labs);
             }
-            LabAction::EndTurn => labs.proto.d.end_turn(),
-            LabAction::Reinforce => {
-                if let Some(i) = labs.proto.selected {
-                    labs.proto.d.reinforce(i);
-                }
+            LabAction::ProtoPause => labs.proto.paused = !labs.proto.paused,
+            LabAction::ProtoSpeed(m) => {
+                labs.proto.speed = m;
+                labs.proto.paused = false;
+            }
+            LabAction::FleetFormation(id, f) => {
+                labs.proto.d.set_formation(id, f);
+                labs.proto.selected = Some(id);
             }
             LabAction::ProtoReset => {
                 labs.proto.d = Dominion::new(&proto_cfg(&cfg.0, labs.proto.size), labs.proto.planets, labs.proto.fleets, labs.proto.d.tuning);
@@ -842,15 +944,17 @@ pub fn lab_pointer(
     }
 }
 
-/// prototype01: click a fleet to select it, drag to move it.
+/// prototype01: click a fleet to select it; click the map to send the
+/// selected fleet there, or drag from a fleet to where it should go.
 pub fn proto_pointer(
     mouse: Res<ButtonInput<MouseButton>>,
     image: Query<&RelativeCursorPosition, With<PrototypeImage>>,
+    menu_buttons: Query<&Interaction, With<FleetMenuButton>>,
     phase: Res<Phase>,
     mut labs: ResMut<Labs>,
 ) {
     let proto = &mut labs.proto;
-    if !on_start(&phase) || !mouse.pressed(MouseButton::Left) {
+    if !on_start(&phase) {
         proto.drag = None;
         return;
     }
@@ -859,17 +963,75 @@ pub fn proto_pointer(
     let Some(n) = cursor.normalized else { return };
     let p = MapVec::new((n.x + 0.5) * cfg.w as f32, (n.y + 0.5) * cfg.h as f32)
         .clamp(MapVec::ZERO, MapVec::new(cfg.w as f32 - 0.5, cfg.h as f32 - 0.5));
-    if mouse.just_pressed(MouseButton::Left) {
-        if !cursor.cursor_over() {
-            return;
+    // Clicks on a fleet's formation menu are not map clicks.
+    let on_menu = menu_buttons.iter().any(|i| *i != Interaction::None);
+    if mouse.just_pressed(MouseButton::Left) && cursor.cursor_over() && !on_menu {
+        match proto.d.fleet_at(p, 8.0 * proto.d.scale()) {
+            Some(id) => {
+                proto.selected = Some(id);
+                proto.drag = Some((id, p));
+            }
+            None => {
+                if let Some(id) = proto.selected {
+                    proto.d.order_move(id, p);
+                }
+            }
         }
-        let hit = proto.d.fleet_at(p, 14.0);
-        proto.selected = hit;
-        proto.drag = hit;
-    } else if let Some(i) = proto.drag
-        && proto.d.fleets[i].pos != p
+    } else if mouse.just_released(MouseButton::Left)
+        && let Some((id, from)) = proto.drag.take()
+        && from.distance(p) > 10.0
     {
-        proto.d.fleets[i].pos = p;
+        proto.d.order_move(id, p);
+    }
+}
+
+/// Runs prototype01 in real time while the start page is open.
+pub fn step_proto(time: Res<Time>, phase: Res<Phase>, mut labs: ResMut<Labs>) {
+    let proto = &mut labs.proto;
+    if !on_start(&phase) || proto.paused {
+        return;
+    }
+    let dt = time.delta_secs().min(0.1) * proto.speed as f32;
+    proto.d.step(dt);
+}
+
+/// Places each commandable fleet's formation menu under it.
+pub fn update_fleet_menus(
+    phase: Res<Phase>,
+    labs: Res<Labs>,
+    mut menus: Query<(&FleetMenu, &mut Node, &Children)>,
+    mut buttons: Query<&mut LabAction, With<FleetMenuButton>>,
+) {
+    if !on_start(&phase) {
+        return;
+    }
+    let d = &labs.proto.d;
+    let fleets: Vec<&dominion::Fleet> = d.fleets.iter().filter(|f| f.controllable()).take(MAX_MENUS).collect();
+    let (w, h) = (d.cfg.w as f32, d.cfg.h as f32);
+    for (menu, mut node, children) in &mut menus {
+        let Some(f) = fleets.get(menu.0) else {
+            if node.display != Display::None {
+                node.display = Display::None;
+            }
+            continue;
+        };
+        let radius = d.ship_positions(f).iter().map(|s| s.distance(f.pos)).fold(0.0, f32::max);
+        let (left, top) = (Val::Percent(f.pos.x / w * 100.0), Val::Percent(((f.pos.y + radius + 6.0) / h * 100.0).min(96.0)));
+        if node.display != Display::Flex || node.left != left || node.top != top {
+            node.display = Display::Flex;
+            node.left = left;
+            node.top = top;
+            // Centre the ~170 px menu under the fleet.
+            node.margin = UiRect::left(Val::Px(-85.0));
+        }
+        for child in children.iter() {
+            if let Ok(mut action) = buttons.get_mut(child)
+                && let LabAction::FleetFormation(id, form) = *action
+                && id != f.id
+            {
+                *action = LabAction::FleetFormation(f.id, form);
+            }
+        }
     }
 }
 
@@ -904,6 +1066,7 @@ pub fn animate_labs(time: Res<Time>, phase: Res<Phase>, cfg: Res<LabsConfig>, mu
 /// Re-renders the lab images whose inputs changed: the lab being dragged,
 /// animated or hovered first, then at most a couple of others per frame.
 pub fn render_labs(
+    time: Res<Time>,
     phase: Res<Phase>,
     cfg: Res<LabsConfig>,
     slider: Res<ActiveSlider>,
@@ -911,18 +1074,25 @@ pub fn render_labs(
     mut images: ResMut<Assets<Image>>,
 ) {
     let labs = &mut *labs;
-    // prototype01, on the start page only.
+    // prototype01, on the start page only, at most ~25 frames a second.
     if on_start(&phase) {
         let proto = &mut labs.proto;
-        let opts = DrawOptions {
-            regions: proto.regions,
-            borders: proto.borders,
-            selected: proto.selected,
-            step: if proto.drag.is_some() { 3 } else { 1 },
-        };
-        let key = format!("{:?}|{:?}|{:?}|{:?}|{}|{:?}", proto.d.cfg, proto.d.fleets, opts, proto.d.turn, proto.d.planets.len(), proto.d.tuning);
-        if key != proto.view.key {
-            let rgba = dominion::render(&proto.d, opts).to_rgba();
+        proto.since_render += time.delta_secs();
+        let opts = DrawOptions { regions: proto.regions, borders: proto.borders, selected: proto.selected, step: 3 };
+        let key = format!(
+            "{}|{:?}|{:?}|{:?}",
+            proto.d.time,
+            opts,
+            proto.d.tuning,
+            proto.d.fleets.iter().map(|f| (f.id, f.pos, f.facing, f.ships, f.formation, f.dest)).collect::<Vec<_>>()
+        );
+        if key != proto.view.key && proto.since_render >= 0.04 {
+            let bg_key = proto.d.background_key(proto.regions);
+            if bg_key != proto.background_key || proto.background.is_none() {
+                proto.background = Some(dominion::render_background(&proto.d, proto.regions));
+                proto.background_key = bg_key;
+            }
+            let rgba = dominion::render(&proto.d, proto.background.as_ref().unwrap(), opts).to_rgba();
             if let Some(mut img) = images.get_mut(&proto.view.image) {
                 // A new map size needs a texture of that size.
                 if img.width() != proto.d.cfg.w || img.height() != proto.d.cfg.h {
@@ -931,6 +1101,7 @@ pub fn render_labs(
                 img.data = Some(rgba);
             }
             proto.view.key = key;
+            proto.since_render = 0.0;
         }
         return;
     }
@@ -1028,7 +1199,7 @@ pub fn update_lab_ui(
         }
     }
     for (v, mut t) in &mut values {
-        let s = if v.0 == SliderParam::FleetShips && labs.proto.selected.is_none() {
+        let s = if v.0 == SliderParam::FleetShips && labs.proto.selected.and_then(|id| labs.proto.d.fleet(id)).is_none() {
             "select a fleet".to_string()
         } else {
             v.0.label(v.0.get(&c, st, &labs.proto))
@@ -1050,15 +1221,14 @@ pub fn lab_button_state(
     let c = cfg.0;
     let proto = &labs.proto;
     let size = proto.size;
-    let can_reinforce = proto.selected.and_then(|i| proto.d.fleets.get(i)).is_some_and(|f| {
-        proto.d.stock[f.side] >= dominion::REINFORCE_COST && f.ships < MAX_SHIPS
-    });
     for (action, mut sel, mut enabled, labels) in &mut buttons {
-        let en = !matches!(*action, LabAction::Reinforce) || can_reinforce;
-        if enabled.0 != en {
-            enabled.0 = en;
+        if !enabled.0 {
+            enabled.0 = true;
         }
         let on = match *action {
+            LabAction::ProtoPause => proto.paused,
+            LabAction::ProtoSpeed(m) => !proto.paused && proto.speed == m,
+            LabAction::FleetFormation(id, f) => proto.d.fleet(id).is_some_and(|g| g.formation == f),
             LabAction::ProtoSize(w, h) => size == (w, h),
             LabAction::ProtoRegions => proto.regions,
             LabAction::ProtoBorders => proto.borders,
@@ -1083,6 +1253,7 @@ pub fn lab_button_state(
         }
         let label = match *action {
             LabAction::Play(l) => Some(if labs.playing == Some(l) { "⏸ Pause".to_string() } else { "▶ Play".to_string() }),
+            LabAction::ProtoPause => Some(if proto.paused { "▶ Resume".to_string() } else { "Pause".to_string() }),
             LabAction::Destroy(i) => Some(if st.alive[i] { format!("Destroy {}", FACTIONS[i].0) } else { format!("Rebuild {}", FACTIONS[i].0) }),
             _ => None,
         };

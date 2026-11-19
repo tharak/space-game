@@ -3,188 +3,213 @@ use crate::voronoi::Vec2;
 use crate::voronoi::sites::VoronoiConfig;
 
 fn cfg() -> VoronoiConfig {
-    VoronoiConfig { sites: 30, w: 300, h: 180, ..Default::default() }
+    VoronoiConfig { sites: 30, w: 720, h: 400, ..Default::default() }
 }
 
-/// One planet, one Blue fleet sitting on it (default tuning: 0.1 a ship).
-fn duel(planet_weight: f32, ships: u32) -> Dominion {
-    let mut d = Dominion::new(&cfg(), 1, 1, Tuning::default());
-    d.planets[0].weight = planet_weight;
-    let pos = d.planets[0].pos;
-    d.fleets = vec![FleetToken { side: 0, pos, ships }];
-    d
+fn world() -> Dominion {
+    Dominion::new(&cfg(), 12, 3, Tuning::default())
+}
+
+/// The map with no production and only these two fleets.
+fn duel(a: (Owner, Vec2, f32, u32), b: (Owner, Vec2, f32, u32)) -> (Dominion, u32, u32) {
+    let mut d = world();
+    d.fleets.clear();
+    for p in &mut d.planets {
+        p.value = 0;
+    }
+    let mk = |id, (owner, pos, facing, ships): (Owner, Vec2, f32, u32)| Fleet {
+        id,
+        owner,
+        pos,
+        facing,
+        dest: None,
+        ships,
+        damage: 0.0,
+        formation: Formation::Line,
+        home: None,
+        dealt: 0.0,
+        taken: 0.0,
+    };
+    d.fleets.push(mk(1001, a));
+    d.fleets.push(mk(1002, b));
+    (d, 1001, 1002)
+}
+
+const BLUE: Owner = Owner::Side(0);
+const RED: Owner = Owner::Side(1);
+const WEST: f32 = std::f32::consts::PI;
+
+fn rate(d: &Dominion, a: u32, b: u32) -> f32 {
+    let (fa, fb) = (d.fleet(a).unwrap(), d.fleet(b).unwrap());
+    d.fire_rate(fa, &d.ship_positions(fa), fb, &d.ship_positions(fb))
 }
 
 #[test]
-fn planets_are_a_subset_of_sites_and_start_independent() {
-    let d = Dominion::new(&cfg(), 12, 3, Tuning::default());
-    assert_eq!(d.planets.len(), 12);
-    assert_eq!(d.planet_at.iter().flatten().count(), 12);
+fn the_world_starts_with_home_planets_fleets_and_garrisons() {
+    let d = world();
+    let (planets, fleets, ships, free) = d.tally();
+    assert_eq!(planets, [1, 1]);
+    assert_eq!(fleets, [3, 3]);
+    assert_eq!(ships, [3 * START_SHIPS, 3 * START_SHIPS]);
+    assert_eq!(free, 10);
     for (i, p) in d.planets.iter().enumerate() {
-        assert_eq!(p.owner, Owner::Independent(i), "each planet is its own faction");
-        assert_eq!(d.planet_at[p.site], Some(i));
-        assert_eq!(p.weight, Tuning::default().planet_weight, "all planets weigh the same");
-    }
-    // Inland regions are used before edge ones.
-    let edge = d.regions.edge_owners();
-    assert!(d.planets.iter().all(|p| !edge.contains(&(p.site as u32))));
-    // Never more planets than sites.
-    assert_eq!(Dominion::new(&cfg(), 999, 3, Tuning::default()).planets.len(), 30);
-    assert_eq!(d.holdings(), ([0, 0], 12));
-    assert_eq!(d.income(), [0, 0]);
-}
-
-#[test]
-fn a_stronger_fleet_takes_the_planet() {
-    let mut d = duel(5.0, 75);
-    assert_eq!(d.pressure()[0], Pressure::Falls(0));
-    d.end_turn();
-    assert_eq!(d.planets[0].owner, Owner::Side(0));
-    // Captured planets pay at once, and are held from then on.
-    assert_eq!(d.stock[0], d.planets[0].value);
-    assert_eq!(d.pressure()[0], Pressure::Held(0));
-}
-
-#[test]
-fn a_weaker_fleet_is_resisted() {
-    let mut d = duel(10.0, 75);
-    assert_eq!(d.pressure()[0], Pressure::Resists(0));
-    d.end_turn();
-    assert_eq!(d.planets[0].owner, Owner::Independent(0));
-    assert_eq!(d.stock, [0, 0]);
-}
-
-#[test]
-fn contested_planets_dont_change_hands() {
-    let mut d = duel(2.5, 50);
-    let p = d.planets[0].pos;
-    d.fleets = vec![
-        FleetToken { side: 0, pos: p - Vec2::new(20.0, 0.0), ships: 50 },
-        FleetToken { side: 1, pos: p + Vec2::new(20.0, 0.0), ships: 50 },
-    ];
-    assert_eq!(d.pressure()[0], Pressure::Contested);
-    d.end_turn();
-    assert_eq!(d.planets[0].owner, Owner::Independent(0));
-}
-
-#[test]
-fn a_captured_planet_defends_against_the_other_side() {
-    let mut d = duel(5.0, 75);
-    d.end_turn();
-    let p = d.planets[0].pos;
-    d.fleets = vec![FleetToken { side: 1, pos: p, ships: 40 }];
-    d.end_turn();
-    assert_eq!(d.planets[0].owner, Owner::Side(0), "Red (4.0) is lighter than the planet (5.0)");
-    d.fleets[0].ships = 60;
-    d.end_turn();
-    assert_eq!(d.planets[0].owner, Owner::Side(1));
-}
-
-#[test]
-fn a_faction_can_hold_many_planets() {
-    let mut d = Dominion::new(&cfg(), 10, 3, Tuning::default());
-    // Light planets, and enough reach to cover this small map.
-    d.set_tuning(Tuning { planet_weight: 1.0, reach_per_weight: 40.0, ..Tuning::default() });
-    // One huge Blue fleet in the middle reaches everything.
-    d.fleets = vec![FleetToken { side: 0, pos: Vec2::new(150.0, 90.0), ships: MAX_SHIPS }];
-    d.end_turn();
-    assert_eq!(d.holdings(), ([10, 0], 0));
-    assert_eq!(d.income()[0], d.planets.iter().map(|p| p.value).sum::<u32>());
-}
-
-#[test]
-fn reinforcements_cost_and_cap() {
-    let mut d = Dominion::new(&cfg(), 5, 3, Tuning::default());
-    let blue = d.fleets.iter().position(|f| f.side == 0).unwrap();
-    d.stock[0] = REINFORCE_COST;
-    assert!(d.reinforce(blue));
-    assert_eq!((d.stock[0], d.fleets[blue].ships), (0, START_SHIPS + REINFORCE_SHIPS));
-    assert!(!d.reinforce(blue), "no money left");
-    d.stock[0] = 1000;
-    while d.reinforce(blue) {}
-    assert_eq!(d.fleets[blue].ships, MAX_SHIPS);
-}
-
-#[test]
-fn renders_deterministically() {
-    let d = Dominion::new(&cfg(), 12, 3, Tuning::default());
-    let a = render(&d, DrawOptions::default());
-    assert_eq!((a.w, a.h, a.px.len()), (300, 180, 300 * 180 * 3));
-    assert_eq!(render(&d, DrawOptions::default()), a);
-    assert_eq!(render(&d, DrawOptions { step: 3, ..Default::default() }).px.len(), a.px.len());
-}
-
-#[test]
-fn fleets_only_reach_as_far_as_their_ships_allow() {
-    let mut d = duel(2.5, 50);
-    let p = d.planets[0].pos;
-    // 50 ships × 0.1 = weight 5, × 14 px = 70 px on a 720-wide map,
-    // scaled to this 300-wide one.
-    let reach = d.fleets[0].reach(&d.tuning, map_scale(&d.cfg));
-    assert!((reach - 70.0 * 300.0 / 720.0).abs() < 1e-3, "{reach}");
-    d.fleets[0].pos = p + Vec2::new(reach - 2.0, 0.0);
-    assert_eq!(d.pressure()[0], Pressure::Falls(0));
-    d.fleets[0].pos = p + Vec2::new(reach + 2.0, 0.0);
-    assert_eq!(d.pressure()[0], Pressure::None);
-    // Twice the ships, twice the reach.
-    d.fleets[0].ships = 100;
-    d.fleets[0].pos = p + Vec2::new(2.0 * reach - 2.0, 0.0);
-    assert_eq!(d.pressure()[0], Pressure::Falls(0));
-    // Reach scales with the reach-per-weight slider.
-    d.set_tuning(Tuning { reach_per_weight: 7.0, ..d.tuning });
-    assert_eq!(d.pressure()[0], Pressure::None);
-}
-
-#[test]
-fn fleet_slider_sets_fleets_per_side_and_tones_differ() {
-    for n in [1, 4, MAX_FLEETS_PER_SIDE] {
-        let d = Dominion::new(&cfg(), 5, n, Tuning::default());
-        assert_eq!(d.fleets.iter().filter(|f| f.side == 0).count(), n);
-        assert_eq!(d.fleets.iter().filter(|f| f.side == 1).count(), n);
-    }
-    for side in 0..2 {
-        let tones: Vec<_> = (0..MAX_FLEETS_PER_SIDE).map(|k| fleet_color(side, k)).collect();
-        for i in 0..tones.len() {
-            for j in i + 1..tones.len() {
-                assert_ne!(tones[i], tones[j], "side {side} fleets {i} and {j}");
-            }
+        if let Owner::Independent(_) = p.owner {
+            let g = d.fleets.iter().find(|f| f.home == Some(i)).expect("garrison");
+            assert_eq!((g.owner, g.ships), (p.owner, INDEPENDENT_START));
         }
     }
 }
 
 #[test]
-fn tuning_sets_weights() {
-    let mut d = duel(5.0, 50);
-    // 50 ships at 0.1 = 5.0: not more than the planet's 5.0.
-    assert_eq!(d.pressure()[0], Pressure::Resists(0));
-    d.set_tuning(Tuning { weight_per_ship: 0.11, ..d.tuning });
-    assert_eq!(d.pressure()[0], Pressure::Falls(0));
-    d.set_tuning(Tuning { planet_weight: 6.0, ..d.tuning });
-    assert_eq!(d.planets[0].weight, 6.0);
-    assert_eq!(d.pressure()[0], Pressure::Resists(0));
+fn planets_build_ships_into_their_garrison() {
+    let mut d = world();
+    d.tuning.secs_per_ship = 6.0;
+    let home = d.planets.iter().position(|p| p.owner == BLUE).unwrap();
+    d.planets[home].value = 2;
+    // 6 s a ship at value 1, so value 2 builds one every 3 s.
+    d.step(9.05);
+    let g = d.fleets.iter().find(|f| f.home == Some(home)).expect("a new garrison");
+    assert_eq!(g.ships, 3);
+    assert!(!g.controllable(), "too few ships to command");
+    d.step(21.0);
+    let g = d.fleets.iter().find(|f| f.home == Some(home)).unwrap();
+    assert!(g.ships >= CONTROL_MIN && g.controllable());
+    // Sending it away starts a new garrison.
+    let id = g.id;
+    assert!(d.order_move(id, Vec2::new(360.0, 200.0)));
+    d.step(3.1);
+    assert!(d.fleets.iter().any(|f| f.home == Some(home) && f.id != id));
 }
 
 #[test]
-fn fleets_are_drawn_as_battle_ships() {
-    assert_eq!(ship_icons(1), 1);
-    assert_eq!(ship_icons(50), 10);
-    assert_eq!(ship_icons(51), 11);
-    assert_eq!(ship_icons(10_000), 40);
-    let slots = fleet_slots(10);
-    assert_eq!(slots.len(), 10);
-    // Centred on the fleet, flagship in the middle.
-    let centre = slots.iter().copied().sum::<Vec2>() / 10.0;
-    assert!(centre.length() < 1e-3);
-    assert!(slots.iter().all(|s| s.length() >= slots[0].length()));
+fn independents_never_take_orders_and_cap_their_garrison() {
+    let mut d = world();
+    let g = d.fleets.iter().find(|f| matches!(f.owner, Owner::Independent(_))).unwrap().clone();
+    assert!(!g.controllable());
+    assert!(!d.order_move(g.id, Vec2::ZERO));
+    d.step(400.0);
+    assert!(d.fleets.iter().filter(|f| matches!(f.owner, Owner::Independent(_))).all(|f| f.ships <= INDEPENDENT_CAP));
 }
 
 #[test]
-fn reach_scales_with_the_map_not_the_sites() {
-    let t = Tuning::default();
-    let fleet = FleetToken { side: 0, pos: Vec2::ZERO, ships: 50 };
-    let small = VoronoiConfig { w: 720, h: 400, ..Default::default() };
-    let big = VoronoiConfig { w: 1440, h: 800, sites: 200, ..Default::default() };
-    assert_eq!(fleet.reach(&t, map_scale(&small)), 70.0);
-    // Twice the map, twice the reach: the same share of the map.
-    assert_eq!(fleet.reach(&t, map_scale(&big)), 140.0);
+fn fleets_move_at_the_set_speed() {
+    let (mut d, a, _) = duel((BLUE, Vec2::new(100.0, 200.0), 0.0, 20), (RED, Vec2::new(700.0, 30.0), 0.0, 20));
+    assert!(d.order_move(a, Vec2::new(250.0, 200.0)));
+    d.step(2.05);
+    let x = d.fleet(a).unwrap().pos.x;
+    assert!((x - 160.0).abs() < 1.0, "30 px/s for 2 s: {x}");
+    d.step(10.0);
+    assert_eq!(d.fleet(a).unwrap().pos, Vec2::new(250.0, 200.0));
+    assert!(d.fleet(a).unwrap().dest.is_none());
+}
+
+#[test]
+fn fleets_out_of_range_dont_fight() {
+    let (mut d, a, b) = duel((BLUE, Vec2::new(100.0, 200.0), 0.0, 30), (RED, Vec2::new(300.0, 200.0), WEST, 30));
+    d.step(5.0);
+    assert_eq!((d.fleet(a).unwrap().ships, d.fleet(b).unwrap().ships), (30, 30));
+}
+
+#[test]
+fn fleets_in_range_wear_each_other_down_with_battle_hit_chances() {
+    let (mut d, a, b) = duel((BLUE, Vec2::new(300.0, 200.0), 0.0, 30), (RED, Vec2::new(325.0, 200.0), WEST, 30));
+    // Facing each other: front hits, at most 12% a shot every 3 s (× combat speed).
+    let r = rate(&d, a, b);
+    assert!(r > 0.0 && r <= 30.0 * 0.12 / 3.0 * d.tuning.combat_speed + 1e-4, "{r}");
+    d.step(30.0);
+    let (sa, sb) = (d.fleet(a).map_or(0, |f| f.ships), d.fleet(b).map_or(0, |f| f.ships));
+    assert!(sa < 30 && sb < 30, "{sa} {sb}");
+    assert_eq!(sa, sb, "a mirror fight stays even");
+}
+
+#[test]
+fn flank_shots_hit_harder_than_front_shots() {
+    let attacker = (BLUE, Vec2::new(300.0, 200.0), 0.0, 20);
+    let (front, a1, b1) = duel(attacker, (RED, Vec2::new(322.0, 200.0), WEST, 20));
+    let (flank, a2, b2) = duel(attacker, (RED, Vec2::new(322.0, 200.0), std::f32::consts::FRAC_PI_2, 20));
+    assert!(rate(&flank, a2, b2) > rate(&front, a1, b1) * 1.5);
+}
+
+#[test]
+fn a_line_brings_more_guns_to_bear_than_a_column() {
+    let target = (RED, Vec2::new(325.0, 200.0), WEST, 40);
+    let (mut line, a, b) = duel((BLUE, Vec2::new(300.0, 200.0), 0.0, 40), target);
+    let (mut column, c, e) = duel((BLUE, Vec2::new(300.0, 200.0), 0.0, 40), target);
+    line.fleets[0].formation = Formation::Line;
+    column.fleets[0].formation = Formation::Column;
+    assert!(rate(&line, a, b) > rate(&column, c, e));
+    // The menu action sets it on controllable fleets only.
+    assert!(line.set_formation(a, Formation::Wedge));
+    assert_eq!(line.fleet(a).unwrap().formation, Formation::Wedge);
+}
+
+#[test]
+fn a_planet_falls_only_after_its_garrison_is_gone_and_it_is_held() {
+    let mut d = world();
+    let (i, p) = d.planets.iter().enumerate().find(|(_, p)| matches!(p.owner, Owner::Independent(_))).map(|(i, p)| (i, *p)).unwrap();
+    // Park a big Blue fleet next to it, facing it: the garrison fights first.
+    let blue = d.fleets.iter().find(|f| f.owner == BLUE).unwrap().id;
+    let fi = d.fleet_index(blue).unwrap();
+    d.fleets[fi].pos = p.pos + Vec2::new(-12.0, 0.0);
+    d.fleets[fi].facing = 0.0;
+    d.fleets[fi].ships = 150;
+    d.planets[i].value = 1;
+    d.step(1.0);
+    assert_eq!(d.planets[i].owner, p.owner, "garrison still there");
+    d.step(120.0);
+    assert!(d.fleets.iter().all(|f| f.home != Some(i) || f.owner == BLUE), "garrison destroyed");
+    assert_eq!(d.planets[i].owner, BLUE);
+}
+
+#[test]
+fn both_sides_present_stops_the_capture() {
+    let (mut d, a, b) = duel((BLUE, Vec2::ZERO, 0.0, 10), (RED, Vec2::ZERO, 0.0, 10));
+    let p = d.planets.iter().position(|p| matches!(p.owner, Owner::Independent(_))).unwrap();
+    let at = d.planets[p].pos;
+    // Both parked on the planet; neither can capture while the other is there.
+    let ia = d.fleet_index(a).unwrap();
+    d.fleets[ia].pos = at + Vec2::new(-10.0, 0.0);
+    let ib = d.fleet_index(b).unwrap();
+    d.fleets[ib].pos = at + Vec2::new(10.0, 0.0);
+    d.step(HOLD_SECS * 0.9);
+    assert!(matches!(d.planets[p].owner, Owner::Independent(_)));
+    assert!(d.planets[p].hold.is_none());
+}
+
+#[test]
+fn deterministic_and_renders() {
+    let mut a = world();
+    let mut b = world();
+    a.step(20.0);
+    b.step(20.0);
+    assert_eq!(a, b);
+    let bg = render_background(&a, true);
+    let c = render(&a, &bg, DrawOptions::default());
+    assert_eq!((c.w, c.h, c.px.len()), (720, 400, 720 * 400 * 3));
+}
+
+#[test]
+fn moving_fleets_stop_short_of_the_enemy_and_face_it() {
+    let (mut d, a, b) = duel((BLUE, Vec2::new(100.0, 200.0), 0.0, 20), (RED, Vec2::new(300.0, 200.0), WEST, 20));
+    assert!(d.order_move(a, Vec2::new(300.0, 200.0)));
+    d.step(15.0);
+    let (fa, fb) = (d.fleet(a).unwrap(), d.fleet(b).unwrap());
+    let gap = d.ship_positions(fb).iter().map(|s| s.distance(fa.pos)).fold(f32::INFINITY, f32::min);
+    assert!(gap > 0.0 && gap <= d.range() * 0.6 + 1.0, "stopped short: {gap}");
+    assert!(fa.dest.is_some(), "still wants to go there");
+    assert!(fa.ships < 20 || fb.ships < 20, "and they fight");
+}
+
+#[test]
+fn a_fleet_sent_at_a_planet_takes_it() {
+    let mut d = world();
+    let (i, p) = d.planets.iter().enumerate().find(|(_, p)| matches!(p.owner, Owner::Independent(_))).map(|(i, p)| (i, *p)).unwrap();
+    d.planets[i].value = 1;
+    let blue = d.fleets.iter().find(|f| f.owner == BLUE).unwrap().id;
+    let fi = d.fleet_index(blue).unwrap();
+    d.fleets[fi].pos = p.pos + Vec2::new(-80.0, 0.0);
+    d.fleets[fi].ships = 80;
+    assert!(d.order_move(blue, p.pos));
+    d.step(90.0);
+    assert_eq!(d.planets[i].owner, BLUE);
 }

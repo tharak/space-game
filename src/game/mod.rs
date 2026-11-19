@@ -84,8 +84,8 @@ impl Plugin for GamePlugin {
                     (flow::apply_requests, campaign_ui::process_turn, campaign_ui::tick_resolving).chain().in_set(Stage::Apply),
                     model::build_model.in_set(Stage::Model),
                     (lab_ui::handle_lab_buttons, lab_ui::drag_sliders, lab_ui::lab_pointer, lab_ui::proto_pointer, lab_ui::scroll_labs).chain().in_set(Stage::Input),
-                    lab_ui::animate_labs.in_set(Stage::Apply),
-                    (lab_ui::render_labs, lab_ui::update_lab_ui, lab_ui::lab_button_state).chain().in_set(Stage::Present).before(ui::style_buttons),
+                    (lab_ui::animate_labs, lab_ui::step_proto).in_set(Stage::Apply),
+                    (lab_ui::render_labs, lab_ui::update_lab_ui, lab_ui::update_fleet_menus, lab_ui::lab_button_state).chain().in_set(Stage::Present).before(ui::style_buttons),
                     (
                         flow::log_events,
                         view::collect_fx,

@@ -47,6 +47,7 @@ pub fn autoplay(
     phase: Res<Phase>,
     battle: Res<Battle>,
     divs: Query<(Entity, &Division)>,
+    mut start_scroll: Query<&mut ScrollPosition, With<super::lab_ui::StartPage>>,
 ) {
     auto.frame += 1;
     let f = auto.frame;
@@ -71,8 +72,22 @@ pub fn autoplay(
         }
         // Screenshots land a frame late, so each page change waits a beat.
         99 if since == 10 => {
+            // Scroll down to the prototype map and its fleet menus.
+            if let Ok(mut s) = start_scroll.single_mut() {
+                s.0.y = 480.0;
+            }
+            auto.step = 97;
+            auto.wait_from = f;
+        }
+        97 if since == 60 => {
+            shot(&mut commands, "00-start-map");
+            auto.step = 98;
+            auto.wait_from = f;
+        }
+        98 if since == 10 => {
             requests.write(AppRequest::LabsPage);
-            next(&mut auto);
+            auto.step = 100;
+            auto.wait_from = f;
         }
         100 if since == 40 => {
             shot(&mut commands, "00-labs");

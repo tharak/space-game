@@ -130,7 +130,7 @@ impl Default for SimSettings {
 }
 
 /// Every number that shapes how a battle plays, in one place for tuning.
-#[derive(Resource, Clone, Debug)]
+#[derive(Resource, Clone, Debug, PartialEq)]
 pub struct Tuning {
     pub spacing: f32,
     pub ship_speed: f32,
