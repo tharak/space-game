@@ -13,12 +13,10 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use super::flow::Phase;
 use super::theme::*;
 use super::ui::{BtnKind, BtnLabel, Enabled, Selected, button_for, card_title, panel, row, text};
-use crate::sim::battle::{Battle, Control, DT, EndReason, SimEvent, SimSettings, Tuning};
+use crate::sim::battle::{Battle, DT, EndReason, SimEvent, SimSettings, Tuning};
 use crate::sim::components::*;
 use crate::sim::formation::{self, Formation, SHIP_DART};
-use crate::sim::rng::Rng;
 use crate::sim::spatial::SpatialHash;
-use crate::sim::systems::build_schedule;
 use crate::voronoi::raster::{Canvas, Rgb};
 
 /// Each card's picture, in pixels.
@@ -195,62 +193,17 @@ fn blank_image() -> Image {
 
 // --- Building the worlds ---
 
-/// A world with the sim's resources and schedule, and no ships yet.
+/// The sim's own empty world; the commander card lets the AI run both sides.
 fn empty_world(seed: u32, bounds: Rect, tuning: Tuning, commander: bool) -> World {
-    let mut world = World::new();
-    let ai = if commander { crate::sim::battle::AiKind::Commander } else { crate::sim::battle::AiKind::Advance };
-    world.insert_resource(SimSettings { control: Control::Spectate, ai: [ai; 2], ..default() });
-    world.insert_resource(tuning);
-    world.insert_resource(Rng::seeded(seed));
-    world.insert_resource(Battle { bounds, ..default() });
-    world.init_resource::<SpatialHash>();
-    world.init_resource::<Messages<SimEvent>>();
-    world.add_schedule(build_schedule());
+    let mut world = crate::sim::open_world(tuning, seed, bounds);
+    if commander {
+        world.resource_mut::<SimSettings>().ai = [crate::sim::battle::AiKind::Commander; 2];
+    }
     world
 }
 
-/// Spawns a division and its ships like `scenario::spawn_battle` does.
 fn spawn_division(world: &mut World, side: usize, form: Formation, anchor: Vec2, facing: f32, ships: usize, order: Order) -> Entity {
-    let tuning = world.resource::<Tuning>().clone();
-    let slots = formation::layout(form, ships, tuning.spacing);
-    let (depth, half_width) = formation::extent(&slots);
-    let number = world.query::<&Division>().iter(world).filter(|d| d.side == side).count() + 1;
-    let division = world
-        .spawn(Division {
-            side,
-            number,
-            formation: form,
-            anchor,
-            facing,
-            order,
-            morale: Morale::Steady,
-            start: ships as u32,
-            alive: ships as u32,
-            slots: ships as u32,
-            shock: 0.0,
-            flagship: false,
-            depth,
-            half_width,
-            since_contact: f32::INFINITY,
-            closest: f32::INFINITY,
-        })
-        .id();
-    let rot = Vec2::from_angle(facing);
-    for slot in &slots {
-        let cd = world.resource_mut::<Rng>().range(0.0, tuning.cooldown);
-        world.spawn((
-            Ship { hull: tuning.hull, max_hull: tuning.hull },
-            Side(side),
-            Pos(anchor + rot.rotate(*slot)),
-            Vel::default(),
-            Heading(facing),
-            InDivision(division),
-            Slot(*slot),
-            Weapon { cooldown: cd, aim: None },
-        ));
-    }
-    world.resource_mut::<Battle>().start[side] += ships as u32;
-    division
+    crate::sim::spawn_division(world, side, form, anchor, facing, ships, order)
 }
 
 const EAST: f32 = 0.0;

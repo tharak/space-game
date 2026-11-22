@@ -6,6 +6,8 @@ use bevy::prelude::*;
 
 use super::formation::Formation;
 
+/// Blue (0) or Red (1). Ships of different sides fight; a third side (2)
+/// fights both but not itself (prototype01's independents).
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Side(pub usize);
 

@@ -52,6 +52,123 @@ pub fn init_world(world: &mut World, settings: SimSettings, seed: u32) {
     let _ = world.run_system_once(systems::rebuild_hash);
 }
 
+/// A world with the sim's resources and schedule but no ships: for maps
+/// and demos that spawn their own divisions (prototype01, the ECS page).
+/// Nobody is AI-commanded.
+pub fn open_world(tuning: Tuning, seed: u32, bounds: Rect) -> World {
+    let mut world = World::new();
+    world.insert_resource(SimSettings { control: Control::Spectate, ai: [AiKind::Advance; 2], ..default() });
+    world.insert_resource(tuning);
+    world.insert_resource(Rng::seeded(seed));
+    world.insert_resource(Battle { bounds, ..default() });
+    world.init_resource::<SpatialHash>();
+    world.init_resource::<Messages<SimEvent>>();
+    world.add_schedule(systems::build_schedule());
+    world
+}
+
+/// Spawns a division of `ships` in `form` at `anchor`, like a battle does.
+pub fn spawn_division(world: &mut World, side: usize, form: Formation, anchor: Vec2, facing: f32, ships: usize, order: Order) -> Entity {
+    let spacing = world.resource::<Tuning>().spacing;
+    let slots = formation::layout(form, ships, spacing);
+    let (depth, half_width) = formation::extent(&slots);
+    let number = world.query::<&Division>().iter(world).filter(|d| d.side == side).count() + 1;
+    let division = world
+        .spawn(Division {
+            side,
+            number,
+            formation: form,
+            anchor,
+            facing,
+            order,
+            morale: Morale::Steady,
+            start: 0,
+            alive: 0,
+            slots: ships as u32,
+            shock: 0.0,
+            flagship: false,
+            depth,
+            half_width,
+            since_contact: f32::INFINITY,
+            closest: f32::INFINITY,
+        })
+        .id();
+    let rot = Vec2::from_angle(facing);
+    let points: Vec<Vec2> = slots.iter().map(|s| anchor + rot.rotate(*s)).collect();
+    spawn_ships(world, division, &points);
+    set_formation(world, division, form);
+    division
+}
+
+/// New ships for `division` at `points` (they take slots on the next re-form).
+fn spawn_ships(world: &mut World, division: Entity, points: &[Vec2]) {
+    let Some(d) = world.get::<Division>(division).cloned() else { return };
+    let tuning = world.resource::<Tuning>().clone();
+    for p in points {
+        let cd = world.resource_mut::<Rng>().range(0.0, tuning.cooldown);
+        world.spawn((
+            Ship { hull: tuning.hull, max_hull: tuning.hull },
+            Side(d.side),
+            Pos(*p),
+            Vel::default(),
+            Heading(d.facing),
+            InDivision(division),
+            Slot(Vec2::ZERO),
+            Weapon { cooldown: cd, aim: None },
+        ));
+    }
+    let n = points.len() as u32;
+    if let Some(mut d) = world.get_mut::<Division>(division) {
+        d.start += n;
+        d.alive += n;
+    }
+    if let Some(s) = world.resource_mut::<Battle>().start.get_mut(d.side) {
+        *s += n;
+    }
+}
+
+/// Adds `n` fresh ships to a division at its anchor and re-forms it, as if
+/// they had always been there (no change to its losses or morale).
+pub fn add_ships(world: &mut World, division: Entity, n: usize) {
+    let Some(anchor) = world.get::<Division>(division).map(|d| d.anchor) else { return };
+    spawn_ships(world, division, &vec![anchor; n]);
+    reform(world, division);
+}
+
+/// Takes `n` ships out of a division (the rear-most first) without counting
+/// them as losses, and re-forms it.
+pub fn remove_ships(world: &mut World, division: Entity, n: usize) {
+    let Some(d) = world.get::<Division>(division).cloned() else { return };
+    let mut ships: Vec<(Entity, f32)> = world
+        .query::<(Entity, &Pos, &InDivision)>()
+        .iter(world)
+        .filter(|(_, _, div)| div.0 == division)
+        .map(|(e, p, _)| (e, d.to_local(p.0).x))
+        .collect();
+    ships.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    let n = n.min(ships.len());
+    for (e, _) in &ships[..n] {
+        world.despawn(*e);
+    }
+    if let Some(mut d) = world.get_mut::<Division>(division) {
+        d.alive = d.alive.saturating_sub(n as u32);
+        d.start = d.start.saturating_sub(n as u32);
+    }
+    reform(world, division);
+}
+
+/// Re-forms a division in its current formation (even a routed one).
+fn reform(world: &mut World, division: Entity) {
+    let Some(d) = world.get::<Division>(division).cloned() else { return };
+    if d.morale == Morale::Routed {
+        world.get_mut::<Division>(division).unwrap().morale = Morale::Shaken;
+        set_formation(world, division, d.formation);
+        world.get_mut::<Division>(division).unwrap().morale = Morale::Routed;
+    } else {
+        set_formation(world, division, d.formation);
+    }
+}
+
 pub fn step(world: &mut World) {
     world.run_schedule(SimTick);
 }

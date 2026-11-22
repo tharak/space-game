@@ -13,8 +13,9 @@ The start page's prototype, in real time (Pause, 1×, 2×, 4×). Code: `src/prot
 - **Planets:** some of the Voronoi regions hold a planet (Sites and Planets sliders). Each builds ships into its own garrison fleet: one every 15 s ÷ the planet's value (1–3), set by the Production slider.
 - **Independent planets:** they start with 10 ships, build up to 30, and only defend.
 - **Fleets:** Blue and Red each start with a home planet and 1–8 fleets of 50 ships (Fleets slider). A fleet takes orders once it has 10 ships. Click a fleet, then click the map to send it, or drag from a fleet to where it should go. Both sides are controlled by hand.
-- **Formations:** keys 1–6 set the selected fleet's formation (1 Line, 2 Wedge, 3 Crescent, 4 Echelon L, 5 Echelon R, 6 Column). Ships sit at the battle's formation slots.
-- **Combat:** fleets in range fight automatically with the battle's rules: gun range, gun cone, front, flank and rear hit chances, range falloff, reload and hull. It's resolved as expected damage, scaled by the Combat speed slider. A moving fleet stops short of an enemy and faces it, as in the battle, so formation and facing matter.
+- **One ship ECS:** every ship on the map is an entity in the battle's ECS world, and every fleet is one of its divisions, run by the battle's own `SimTick` systems (steering, blocking, gunnery, closing ranks, morale). Independents are a third side that fights Blue and Red but not each other. Map speeds come from the Fleet speed slider; the Combat speed slider shortens the reload.
+- **Formations:** keys 1–6 set the selected fleet's formation (1 Line, 2 Wedge, 3 Crescent, 4 Echelon L, 5 Echelon R, 6 Column).
+- **Combat:** fleets in range fight with the battle's rules: gun range and cone, front, flank and rear hit chances, range falloff, reload and hull. Ships never move into an enemy's space, and idle fleets turn to face the nearest enemy. A beaten fleet turns Shaken (gold, fires slower), then Routed (grey): it stops taking orders and flees off the map toward its home edge.
 - **Capture:** a planet changes hands once its garrison is gone and a single enemy side has held it for 3 s (a ring shows the progress).
 - **Patches:** like lab 1's growing seeds, they show each fleet's influence (weight = ships × weight per ship, reach = reach per weight × weight, scaled to the map).
 

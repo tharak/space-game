@@ -88,7 +88,7 @@ pub fn steer_divisions(mut divs: Query<(Entity, &mut Division)>, hash: Res<Spati
                 d.order = Order::Engage(*t);
             }
         }
-        let m = battle.mods[d.side];
+        let m = battle.mods_of(d.side);
         let base = tuning.anchor_speed * m.speed;
         let ahead = |d: &Division| d.anchor + d.forward() * 100.0;
         let (goal, facing, speed) = if d.morale == Morale::Routed {
@@ -145,9 +145,10 @@ pub fn steer_divisions(mut divs: Query<(Entity, &mut Division)>, hash: Res<Spati
             let dist = to.length();
             if dist > 0.5 {
                 let dir = to / dist;
-                // Never run more than a little ahead of the ships themselves.
+                // Never run more than a little ahead of the ships themselves
+                // (2.5 s of anchor travel: 30 units in the battle).
                 let lead = (d.anchor - centroid).dot(dir);
-                if lead < 30.0 || d.morale == Morale::Routed {
+                if lead < tuning.anchor_speed * 2.5 || d.morale == Morale::Routed {
                     d.anchor += dir * (speed * DT).min(dist);
                 }
             }
@@ -164,7 +165,7 @@ pub fn steer_ships(
 ) {
     for (mut vel, mut heading, pos, slot, div, weapon) in &mut ships {
         let Ok(d) = divs.get(div.0) else { continue };
-        let speed = battle.mods[d.side].speed;
+        let speed = battle.mods_of(d.side).speed;
         let target = d.to_world(slot.0);
         let to = target - pos.0;
         let max = match (d.morale, d.order) {
@@ -330,7 +331,7 @@ pub fn fire(
         }
         let (p, h, s) = (pos.0, heading.0, side.0);
         // Concentrate only if this division is near its fleet's centre.
-        let centre = focus[s].filter(|c| hash.centroid(div.0).is_some_and(|dc| dc.distance(*c) <= tuning.focus_radius));
+        let centre = focus.get(s).copied().flatten().filter(|c| hash.centroid(div.0).is_some_and(|dc| dc.distance(*c) <= tuning.focus_radius));
         let mut nearest: Option<(Entry, f32)> = None;
         let mut candidates: Vec<(Entry, f32, f32)> = Vec::new();
         hash.for_each_within(p, tuning.range, |o, d2| {
@@ -367,7 +368,7 @@ pub fn fire(
         let arc = incoming_arc(target.pos, target.heading, p);
         let hit = rng.chance(hit_chance(&tuning, arc, dist));
         let slow = if d.morale == Morale::Shaken { tuning.shaken_cooldown } else { 1.0 };
-        weapon.cooldown = tuning.cooldown * slow / battle.mods[s].fire_rate.max(0.1) * rng.range(0.85, 1.15);
+        weapon.cooldown = tuning.cooldown * slow / battle.mods_of(s).fire_rate.max(0.1) * rng.range(0.85, 1.15);
         weapon.aim = Some(target.pos - p);
         events.write(SimEvent::Shot { from: p, to: target.pos, side: s, hit });
         contact.push(div.0);
@@ -407,7 +408,9 @@ pub fn fire(
             continue;
         }
         commands.entity(target.entity).despawn();
-        battle.destroyed[target.side] += 1;
+        if let Some(n) = battle.destroyed.get_mut(target.side) {
+            *n += 1;
+        }
         let mut label = String::new();
         if let Ok(mut d) = divs.get_mut(target.division) {
             d.alive = d.alive.saturating_sub(1);
@@ -416,7 +419,9 @@ pub fn fire(
         }
         events.write(SimEvent::Destroyed { pos: target.pos, side: target.side, flagship, division: label });
         if flagship {
-            battle.flag_lost[target.side] = true;
+            if let Some(f) = battle.flag_lost.get_mut(target.side) {
+                *f = true;
+            }
             events.write(SimEvent::FlagshipLost { side: target.side });
             flag_down.push(target.side);
         }
@@ -475,7 +480,9 @@ pub fn remove_fled(
     }
     for (e, side) in fled {
         commands.entity(e).despawn();
-        battle.fled[side] += 1;
+        if let Some(n) = battle.fled.get_mut(side) {
+            *n += 1;
+        }
     }
 }
 
@@ -536,8 +543,11 @@ pub fn morale(
         let (da, db) = (&snapshot.iter().find(|(e, _)| *e == a).unwrap().1, &snapshot.iter().find(|(e, _)| *e == b).unwrap().1);
         battle.breakthroughs.push((a, b));
         let side = da.side;
-        if battle.first_breakthrough[side].is_none() {
-            battle.first_breakthrough[side] = Some(battle.time);
+        let now = battle.time;
+        if let Some(first) = battle.first_breakthrough.get_mut(side)
+            && first.is_none()
+        {
+            *first = Some(now);
         }
         events.write(SimEvent::Breakthrough { side, division: da.label(), through: db.label() });
         if let Ok((_, mut d)) = divs.get_mut(b) {
@@ -559,9 +569,9 @@ pub fn morale(
         let lost = 1.0 - d.alive as f32 / d.start.max(1) as f32;
         let stress = d.shock * tuning.k_shock
             + lost * tuning.k_lost
-            + (1.0 - fleet_left[d.side]) * tuning.k_fleet_lost
-            + if flag_lost[d.side] { tuning.k_flag_lost } else { 0.0 }
-            + mods[d.side].morale
+            + (1.0 - fleet_left.get(d.side).copied().unwrap_or(1.0)) * tuning.k_fleet_lost
+            + if flag_lost.get(d.side).copied().unwrap_or(false) { tuning.k_flag_lost } else { 0.0 }
+            + mods.get(d.side).map_or(0.0, |m| m.morale)
             - if in_command { tuning.k_command } else { 0.0 }
             + rng.range(-tuning.noise, tuning.noise);
         let next = match d.morale {
@@ -587,10 +597,15 @@ pub fn check_end(
     mut battle: ResMut<Battle>,
     mut events: MessageWriter<SimEvent>,
 ) {
+    if battle.endless {
+        return;
+    }
     let mut fighting = [0u32; 2];
     for d in &divs {
-        if d.morale != Morale::Routed {
-            fighting[d.side] += d.alive;
+        if d.morale != Morale::Routed
+            && let Some(n) = fighting.get_mut(d.side)
+        {
+            *n += d.alive;
         }
     }
     let lost: [u32; 2] = std::array::from_fn(|s| battle.start[s].saturating_sub(fighting[s]));
@@ -621,8 +636,10 @@ pub fn check_end(
     } else if battle.time >= tuning.time_limit {
         let mut hull = [0.0f32; 2];
         for (ship, side, div) in &ships {
-            if divs.get(div.0).is_ok_and(|d| d.morale != Morale::Routed) {
-                hull[side.0] += ship.hull;
+            if divs.get(div.0).is_ok_and(|d| d.morale != Morale::Routed)
+                && let Some(h) = hull.get_mut(side.0)
+            {
+                *h += ship.hull;
             }
         }
         let winner = if (hull[0] - hull[1]).abs() < 1.0 {

@@ -1,18 +1,23 @@
 //! prototype01 — Fleet dominion, in real time. Space is split into Voronoi
 //! regions; some hold a planet. Every planet builds ships into its own
 //! garrison fleet; Blue's and Red's fleets can be commanded once they have
-//! 10 ships. Fleets in range fight automatically with the battle's rules
-//! (range, gun cone, front/flank/rear hit chances, reload, hull), resolved
-//! as expected damage so it is deterministic. A planet changes hands once
-//! its garrison is gone and an enemy fleet has held it for a few seconds.
+//! 10 ships. Every ship is an entity in the battle's ECS world and every
+//! fleet is one of its divisions, run by the battle's own `SimTick`
+//! systems: steering, blocking, gunnery (cone, front/flank/rear hit
+//! chances, reload, hull), closing ranks and morale, so a fleet can be
+//! shaken, rout and flee off the map. Independents are a third side that
+//! fights Blue and Red but not each other. A planet changes hands once its
+//! garrison is gone and an enemy fleet has held it for a few seconds.
 //! Influence patches (weight = ships × weight per ship, reach = reach per
 //! weight × weight) show who dominates where.
 
-use crate::sim::battle::Tuning as BattleTuning;
-use crate::sim::components::{angle_diff, turn_toward};
+use bevy::ecs::message::Messages;
+use bevy::prelude::{Entity, Rect, World};
+
+use crate::sim::battle::{Battle, DT, SimEvent, Tuning as BattleTuning};
+use crate::sim::components::{Division, Heading, InDivision, Morale, Order, Pos};
 pub use crate::sim::formation::Formation;
-use crate::sim::formation::{SHIP_DART, layout};
-use crate::sim::systems::{hit_chance, incoming_arc};
+use crate::sim::formation::SHIP_DART;
 use crate::voronoi::Vec2;
 use crate::voronoi::grid::{OwnerGrid, voronoi_grid};
 use crate::voronoi::influence::weighted_scores;
@@ -35,8 +40,8 @@ pub const INDEPENDENT_CAP: u32 = 30;
 pub const HOLD_SECS: f32 = 3.0;
 /// Battle units to map pixels on a 720-wide map (range 150 → 30 px).
 pub const UNIT: f32 = 0.2;
-/// Simulation tick, seconds.
-pub const TICK: f32 = 0.1;
+/// The ECS side independents fight on.
+pub const INDEPENDENT_SIDE: usize = 2;
 /// Map width the pixel-based settings are measured against.
 pub const REFERENCE_WIDTH: f32 = 720.0;
 /// The other side's best fleet within this fraction contests the ground.
@@ -84,7 +89,15 @@ pub enum Owner {
 impl Owner {
     /// Blue and Red fight everyone; independents only fight Blue and Red.
     pub fn hostile(self, other: Owner) -> bool {
-        self != other && (matches!(self, Owner::Side(_)) || matches!(other, Owner::Side(_)))
+        self.side() != other.side()
+    }
+
+    /// The side its ships fight on in the ECS.
+    pub fn side(self) -> usize {
+        match self {
+            Owner::Side(s) => s,
+            Owner::Independent(_) => INDEPENDENT_SIDE,
+        }
     }
 }
 
@@ -101,24 +114,27 @@ pub struct Planet {
     pub hold: Option<(Owner, f32)>,
 }
 
+/// A fleet as the map sees it: one ECS division, read back every tick.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Fleet {
-    /// Stable across removals (the UI keys menus on it).
+    /// Stable across removals (the UI keys selection on it).
     pub id: u32,
+    pub division: Entity,
     pub owner: Owner,
+    /// Centre of its ships, map pixels.
     pub pos: Vec2,
     /// Radians; 0 = +x.
     pub facing: f32,
     pub dest: Option<Vec2>,
     pub ships: u32,
-    /// Hull points taken toward the next ship lost.
-    pub damage: f32,
     pub formation: Formation,
+    pub morale: Morale,
     /// The planet it garrisons (planets build into it).
     pub home: Option<usize>,
-    /// Damage it dealt and took in the last tick (for status and flashes).
-    pub dealt: f32,
-    pub taken: f32,
+    /// Each ship's position (map pixels) and heading.
+    pub ship_px: Vec<(Vec2, f32)>,
+    /// Fired or was fired on in the last second or so.
+    pub engaged: bool,
 }
 
 impl Fleet {
@@ -126,26 +142,58 @@ impl Fleet {
         self.ships as f32 * t.weight_per_ship
     }
 
-    /// Blue and Red fleets with 10+ ships, or that already left home.
+    /// Blue and Red fleets with 10+ ships, or that already left home, unless routed.
     pub fn controllable(&self) -> bool {
-        matches!(self.owner, Owner::Side(_)) && (self.ships >= CONTROL_MIN || self.home.is_none())
+        matches!(self.owner, Owner::Side(_)) && self.morale != Morale::Routed && (self.ships >= CONTROL_MIN || self.home.is_none())
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// A shot on the map: from, to (pixels), the shooter's side, hit, age (s).
+pub type Shot = (Vec2, Vec2, usize, bool, f32);
+
+/// How long shots and explosions stay on the map, seconds.
+const SHOT_SECS: f32 = 0.3;
+const BOOM_SECS: f32 = 0.6;
+
 pub struct Dominion {
     pub cfg: VoronoiConfig,
     pub tuning: Tuning,
+    /// The battle tuning the ECS world runs with (from `tuning`).
     pub battle: BattleTuning,
     pub sites: Vec<Vec2>,
     pub regions: OwnerGrid,
     pub planet_at: Vec<Option<usize>>,
     pub planets: Vec<Planet>,
     pub fleets: Vec<Fleet>,
+    /// The ECS world every ship lives in.
+    pub world: World,
+    pub shots: Vec<Shot>,
+    /// Explosions: where (pixels) and age.
+    pub booms: Vec<(Vec2, f32)>,
     next_id: u32,
     pub time: f32,
     /// Leftover time below one tick.
     pending: f32,
+    /// The tuning the world was last given.
+    applied: Option<Tuning>,
+    face_timer: f32,
+}
+
+/// The battle's rules with the prototype's speeds: map fleets cross the map
+/// in seconds, and combat speed shortens the reload.
+pub fn battle_tuning(t: &Tuning) -> BattleTuning {
+    let base = BattleTuning::default();
+    // Pixels a second on a 720-wide map, in battle units (UNIT px each).
+    let anchor = t.speed / UNIT;
+    BattleTuning {
+        anchor_speed: anchor,
+        ship_speed: anchor * base.ship_speed / base.anchor_speed,
+        rout_speed: anchor * base.rout_speed / base.anchor_speed,
+        div_turn_rate: 1.2,
+        ship_turn_rate: 3.0,
+        cooldown: base.cooldown / t.combat_speed.max(0.05),
+        ..base
+    }
 }
 
 impl Dominion {
@@ -178,18 +226,28 @@ impl Dominion {
             planet_at[site] = Some(list.len());
             list.push(Planet { site, pos: sites[site], value, owner: Owner::Independent(list.len()), build: 0.0, hold: None });
         }
+        let battle = battle_tuning(&tuning);
+        let unit = UNIT * map_scale(cfg);
+        let bounds = Rect::new(0.0, 0.0, cfg.w as f32 / unit, cfg.h as f32 / unit);
+        let mut world = crate::sim::open_world(battle.clone(), cfg.seed.wrapping_add(7), bounds);
+        world.resource_mut::<Battle>().endless = true;
         let mut d = Self {
             cfg: *cfg,
             tuning,
-            battle: BattleTuning::default(),
+            battle,
             sites,
             regions,
             planet_at,
             planets: list,
             fleets: Vec::new(),
+            world,
+            shots: Vec::new(),
+            booms: Vec::new(),
             next_id: 1,
             time: 0.0,
             pending: 0.0,
+            applied: Some(tuning),
+            face_timer: 0.0,
         };
         if d.planets.len() < 2 {
             return d;
@@ -221,24 +279,53 @@ impl Dominion {
                 d.spawn(owner, pos, 0.0, INDEPENDENT_START, Some(i));
             }
         }
+        d.sync();
         d
     }
 
+    /// Removes every fleet and its ships (for tests and set-pieces).
+    pub fn clear_fleets(&mut self) {
+        for f in std::mem::take(&mut self.fleets) {
+            let ships: Vec<Entity> = self
+                .world
+                .query::<(Entity, &InDivision)>()
+                .iter(&self.world)
+                .filter(|(_, d)| d.0 == f.division)
+                .map(|(e, _)| e)
+                .collect();
+            for e in ships.into_iter().chain([f.division]) {
+                self.world.despawn(e);
+            }
+        }
+    }
+
+    /// A new fleet of `ships` for `owner` at `pos` (pixels), facing `facing`.
+    pub fn add_fleet(&mut self, owner: Owner, pos: Vec2, facing: f32, ships: u32, home: Option<usize>) -> u32 {
+        let id = self.spawn(owner, pos, facing, ships, home);
+        self.sync();
+        id
+    }
+
+    /// A new division of `ships` for `owner` at `pos` (pixels).
     fn spawn(&mut self, owner: Owner, pos: Vec2, facing: f32, ships: u32, home: Option<usize>) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
+        let unit = self.unit();
+        let division =
+            crate::sim::spawn_division(&mut self.world, owner.side(), Formation::Line, pos / unit, facing, ships as usize, Order::Hold);
         self.fleets.push(Fleet {
             id,
+            division,
             owner,
             pos,
             facing,
             dest: None,
             ships,
-            damage: 0.0,
             formation: Formation::Line,
+            morale: Morale::Steady,
             home,
-            dealt: 0.0,
-            taken: 0.0,
+            ship_px: Vec::new(),
+            engaged: false,
         });
         id
     }
@@ -270,40 +357,56 @@ impl Dominion {
         self.fleets.iter().position(|f| f.id == id)
     }
 
-    /// Each ship's position: the battle's formation layout (+x = facing),
-    /// centred on the fleet, scaled to the map.
+    /// Each ship's position, map pixels.
     pub fn ship_positions(&self, f: &Fleet) -> Vec<Vec2> {
-        let slots = layout(f.formation, f.ships as usize, self.battle.spacing);
-        if slots.is_empty() {
-            return slots;
-        }
-        let centre = slots.iter().copied().sum::<Vec2>() / slots.len() as f32;
-        let rot = Vec2::from_angle(f.facing);
-        let unit = self.unit();
-        slots.into_iter().map(|s| f.pos + rot.rotate((s - centre) * unit)).collect()
+        f.ship_px.iter().map(|s| s.0).collect()
+    }
+
+    /// Whether the fleet with this id takes orders.
+    pub fn controllable_id(&self, id: u32) -> bool {
+        self.fleet(id).is_some_and(Fleet::controllable)
+    }
+
+    fn division_mut(&mut self, id: u32) -> Option<bevy::prelude::Mut<'_, Division>> {
+        let e = self.fleet(id)?.division;
+        self.world.get_mut::<Division>(e)
     }
 
     /// Orders a controllable fleet to move; it stops garrisoning.
     pub fn order_move(&mut self, id: u32, to: Vec2) -> bool {
         let (w, h) = (self.cfg.w as f32, self.cfg.h as f32);
-        match self.fleets.iter_mut().find(|f| f.id == id) {
-            Some(f) if f.controllable() => {
-                f.dest = Some(to.clamp(Vec2::ZERO, Vec2::new(w, h)));
-                f.home = None;
-                true
-            }
-            _ => false,
+        let unit = self.unit();
+        let Some(i) = self.fleet_index(id).filter(|i| self.fleets[*i].controllable()) else { return false };
+        let to = to.clamp(Vec2::ZERO, Vec2::new(w, h));
+        let f = &mut self.fleets[i];
+        f.dest = Some(to);
+        f.home = None;
+        let facing = (to - f.pos).to_angle();
+        if let Some(mut d) = self.division_mut(id) {
+            d.order = Order::MoveTo { to: to / unit, facing };
         }
+        true
     }
 
     pub fn set_formation(&mut self, id: u32, formation: Formation) -> bool {
-        match self.fleets.iter_mut().find(|f| f.id == id) {
-            Some(f) if f.controllable() => {
-                f.formation = formation;
-                true
-            }
-            _ => false,
+        let Some(f) = self.fleet(id).filter(|f| f.controllable()) else { return false };
+        let e = f.division;
+        crate::sim::set_formation(&mut self.world, e, formation);
+        self.sync();
+        true
+    }
+
+    /// Sets a fleet's ship count (the "Selected ships" slider).
+    pub fn set_ships(&mut self, id: u32, n: u32) {
+        let Some(f) = self.fleet(id) else { return };
+        let (e, have) = (f.division, f.ships);
+        let n = n.max(1);
+        if n > have {
+            crate::sim::add_ships(&mut self.world, e, (n - have) as usize);
+        } else if n < have {
+            crate::sim::remove_ships(&mut self.world, e, (have - n) as usize);
         }
+        self.sync();
     }
 
     /// The fleet with a ship within `r` pixels of `p`, nearest first.
@@ -311,29 +414,128 @@ impl Dominion {
         self.fleets
             .iter()
             .filter_map(|f| {
-                let d = self.ship_positions(f).iter().map(|s| s.distance(p)).fold(f.pos.distance(p), f32::min);
+                let d = f.ship_px.iter().map(|s| s.0.distance(p)).fold(f.pos.distance(p), f32::min);
                 (d <= r).then_some((f.id, d))
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(id, _)| id)
     }
 
-    /// Advances the world by `dt` seconds, in fixed ticks.
+    /// Advances the world by `dt` seconds, in the battle's fixed ticks.
     pub fn step(&mut self, dt: f32) {
         self.pending += dt;
-        while self.pending >= TICK {
-            self.pending -= TICK;
-            self.tick(TICK);
+        while self.pending >= DT {
+            self.pending -= DT;
+            self.tick();
         }
     }
 
-    fn tick(&mut self, dt: f32) {
-        self.time += dt;
-        self.produce(dt);
-        self.move_fleets(dt);
-        self.fight(dt);
-        self.fleets.retain(|f| f.ships > 0);
-        self.capture(dt);
+    fn tick(&mut self) {
+        if self.applied != Some(self.tuning) {
+            self.battle = battle_tuning(&self.tuning);
+            self.world.insert_resource(self.battle.clone());
+            self.applied = Some(self.tuning);
+        }
+        self.time += DT;
+        self.produce(DT);
+        self.face_timer += DT;
+        if self.face_timer >= 0.5 {
+            self.face_timer = 0.0;
+            self.face_threats();
+        }
+        crate::sim::step(&mut self.world);
+        let unit = self.unit();
+        for s in &mut self.shots {
+            s.4 += DT;
+        }
+        for b in &mut self.booms {
+            b.1 += DT;
+        }
+        self.shots.retain(|s| s.4 < SHOT_SECS);
+        self.booms.retain(|b| b.1 < BOOM_SECS);
+        let events: Vec<SimEvent> = self.world.resource_mut::<Messages<SimEvent>>().drain().collect();
+        for ev in events {
+            match ev {
+                SimEvent::Shot { from, to, side, hit } => self.shots.push((from * unit, to * unit, side, hit, 0.0)),
+                SimEvent::Destroyed { pos, .. } => self.booms.push((pos * unit, 0.0)),
+                _ => {}
+            }
+        }
+        self.sync();
+        self.capture(DT);
+    }
+
+    /// Reads every fleet back from its division; drops the empty ones.
+    fn sync(&mut self) {
+        let unit = self.unit();
+        let mut ships: std::collections::HashMap<Entity, Vec<(Vec2, f32)>> = std::collections::HashMap::new();
+        for (p, h, d) in self.world.query::<(&Pos, &Heading, &InDivision)>().iter(&self.world) {
+            ships.entry(d.0).or_default().push((p.0 * unit, h.0));
+        }
+        let mut gone = Vec::new();
+        let mut arrived = Vec::new();
+        for f in &mut self.fleets {
+            let Some(d) = self.world.get::<Division>(f.division) else {
+                gone.push(f.division);
+                continue;
+            };
+            let list = ships.remove(&f.division).unwrap_or_default();
+            if list.is_empty() {
+                gone.push(f.division);
+                continue;
+            }
+            f.pos = list.iter().map(|s| s.0).sum::<Vec2>() / list.len() as f32;
+            f.ships = list.len() as u32;
+            f.ship_px = list;
+            f.facing = d.facing;
+            f.formation = d.formation;
+            f.morale = d.morale;
+            f.engaged = d.since_contact < 1.5;
+            if f.morale == Morale::Routed {
+                f.dest = None;
+                f.home = None;
+            }
+            if let Some(dest) = f.dest
+                && (d.anchor * unit).distance(dest) < 1.0
+            {
+                f.dest = None;
+                arrived.push(f.division);
+            }
+        }
+        for e in arrived {
+            if let Some(mut d) = self.world.get_mut::<Division>(e) {
+                d.order = Order::Hold;
+            }
+        }
+        self.fleets.retain(|f| !gone.contains(&f.division));
+        for e in gone {
+            if self.world.get_entity(e).is_ok() {
+                self.world.despawn(e);
+            }
+        }
+    }
+
+    /// Fleets that aren't moving turn to face the nearest enemy close by.
+    fn face_threats(&mut self) {
+        let reach = self.range() * 2.5;
+        let unit = self.unit();
+        let snapshot: Vec<(Owner, Vec2, Morale)> = self.fleets.iter().map(|f| (f.owner, f.pos, f.morale)).collect();
+        for f in &self.fleets {
+            if f.dest.is_some() || f.morale == Morale::Routed {
+                continue;
+            }
+            let enemy = snapshot
+                .iter()
+                .filter(|(o, p, m)| f.owner.hostile(*o) && *m != Morale::Routed && p.distance(f.pos) <= reach)
+                .min_by(|a, b| a.1.distance(f.pos).total_cmp(&b.1.distance(f.pos)));
+            let Some((_, at, _)) = enemy else { continue };
+            let facing = (*at - f.pos).to_angle();
+            if let Some(mut d) = self.world.get_mut::<Division>(f.division) {
+                let anchor = d.anchor;
+                d.order = Order::MoveTo { to: anchor, facing };
+            }
+        }
+        let _ = unit;
     }
 
     fn produce(&mut self, dt: f32) {
@@ -350,7 +552,10 @@ impl Dominion {
             while self.planets[i].build >= 1.0 {
                 self.planets[i].build -= 1.0;
                 match self.fleets.iter().position(|f| f.home == Some(i) && f.owner == owner) {
-                    Some(g) => self.fleets[g].ships += 1,
+                    Some(g) => {
+                        crate::sim::add_ships(&mut self.world, self.fleets[g].division, 1);
+                        self.fleets[g].ships += 1;
+                    }
                     None => {
                         let facing = (Vec2::new(self.cfg.w as f32, self.cfg.h as f32) * 0.5 - pos).to_angle();
                         self.spawn(owner, pos, facing, 1, Some(i));
@@ -360,110 +565,11 @@ impl Dominion {
         }
     }
 
-    fn move_fleets(&mut self, dt: f32) {
-        let speed = self.tuning.speed * self.scale();
-        let range = self.range();
-        let turn = 1.5 * dt;
-        let snapshot: Vec<(Owner, Vec2)> = self.fleets.iter().map(|f| (f.owner, f.pos)).collect();
-        let ships: Vec<Vec<Vec2>> = self.fleets.iter().map(|f| self.ship_positions(f)).collect();
-        for (i, f) in self.fleets.iter_mut().enumerate() {
-            // Like the battle's stop distance: a moving fleet halts and faces
-            // a hostile fleet once any of its ships is within 60% of range.
-            let blocker = (0..snapshot.len())
-                .filter(|j| *j != i && f.owner.hostile(snapshot[*j].0))
-                .filter_map(|j| ships[j].iter().map(|s| s.distance(f.pos)).reduce(f32::min).map(|d| (j, d)))
-                .filter(|(_, d)| *d <= range * 0.6)
-                .min_by(|a, b| a.1.total_cmp(&b.1));
-            if let (Some(_), Some((j, _))) = (f.dest, blocker) {
-                f.facing = turn_toward(f.facing, (snapshot[j].1 - f.pos).to_angle(), turn * 2.0);
-                continue;
-            }
-            if let Some(dest) = f.dest {
-                let to = dest - f.pos;
-                let step = speed * dt;
-                if to.length() <= step {
-                    f.pos = dest;
-                    f.dest = None;
-                } else {
-                    f.pos += to.normalize() * step;
-                    f.facing = turn_toward(f.facing, to.to_angle(), turn * 2.0);
-                }
-            } else if let Some(enemy) = snapshot
-                .iter()
-                .filter(|(o, p)| f.owner.hostile(*o) && p.distance(f.pos) <= range * 3.0)
-                .min_by(|a, b| a.1.distance(f.pos).total_cmp(&b.1.distance(f.pos)))
-            {
-                // Idle: turn to face the nearest enemy close by.
-                f.facing = turn_toward(f.facing, (enemy.1 - f.pos).to_angle(), turn);
-            }
-        }
-    }
-
-    /// Expected damage per second `a`'s ships deal to `b`'s, with the
-    /// battle's rules: each ship shoots the nearest enemy ship inside its
-    /// gun cone and range; hit chance by arc (front/flank/rear) and range;
-    /// one shot per reload.
-    pub fn fire_rate(&self, a: &Fleet, a_ships: &[Vec2], b: &Fleet, b_ships: &[Vec2]) -> f32 {
-        let (range, unit) = (self.range(), self.unit());
-        let mut rate = 0.0;
-        for s in a_ships {
-            let mut best: Option<(f32, Vec2)> = None;
-            for t in b_ships {
-                let d = s.distance(*t);
-                if d > range || best.is_some_and(|(bd, _)| bd <= d) {
-                    continue;
-                }
-                if angle_diff(a.facing, (*t - *s).to_angle()).abs() > self.battle.fire_arc {
-                    continue;
-                }
-                best = Some((d, *t));
-            }
-            if let Some((d, t)) = best {
-                let arc = incoming_arc(t, b.facing, *s);
-                rate += hit_chance(&self.battle, arc, d / unit) / self.battle.cooldown * self.tuning.combat_speed;
-            }
-        }
-        rate
-    }
-
-    fn fight(&mut self, dt: f32) {
-        let range = self.range();
-        let ships: Vec<Vec<Vec2>> = self.fleets.iter().map(|f| self.ship_positions(f)).collect();
-        let radius: Vec<f32> = self
-            .fleets
-            .iter()
-            .zip(&ships)
-            .map(|(f, s)| s.iter().map(|p| p.distance(f.pos)).fold(0.0, f32::max))
-            .collect();
-        let mut taken = vec![0.0f32; self.fleets.len()];
-        let mut dealt = vec![0.0f32; self.fleets.len()];
-        for a in 0..self.fleets.len() {
-            for b in 0..self.fleets.len() {
-                let (fa, fb) = (&self.fleets[a], &self.fleets[b]);
-                if !fa.owner.hostile(fb.owner) || fa.pos.distance(fb.pos) > radius[a] + radius[b] + range {
-                    continue;
-                }
-                let dmg = self.fire_rate(fa, &ships[a], fb, &ships[b]) * dt;
-                taken[b] += dmg;
-                dealt[a] += dmg;
-            }
-        }
-        let hull = self.battle.hull;
-        for (i, f) in self.fleets.iter_mut().enumerate() {
-            f.dealt = dealt[i];
-            f.taken = taken[i];
-            f.damage += taken[i];
-            let lost = ((f.damage / hull).floor() as u32).min(f.ships);
-            f.ships -= lost;
-            f.damage -= lost as f32 * hull;
-        }
-    }
-
     fn capture(&mut self, dt: f32) {
         let r = self.capture_radius();
         for i in 0..self.planets.len() {
             let (owner, pos) = (self.planets[i].owner, self.planets[i].pos);
-            let near = |o: Owner| self.fleets.iter().any(|f| f.owner == o && f.pos.distance(pos) <= r);
+            let near = |o: Owner| self.fleets.iter().any(|f| f.owner == o && f.morale != Morale::Routed && f.pos.distance(pos) <= r);
             if near(owner) {
                 self.planets[i].hold = None;
                 continue;
@@ -588,6 +694,8 @@ const WHITE: Rgb = [240, 240, 240];
 const INK: Rgb = [10, 10, 14];
 const GOLD: Rgb = [235, 190, 80];
 const HIT: Rgb = [255, 230, 150];
+const SHAKEN: Rgb = [255, 209, 102];
+const ROUTED: Rgb = [93, 100, 120];
 
 pub fn owner_color(o: Owner) -> Rgb {
     match o {
@@ -815,34 +923,41 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: DrawOptions)
         c.dashed_line(a, b, 6.0, 5.0, GOLD, 0.9);
         c.circle(b, 5.0, GOLD, 1.0);
     }
-    // Ships: the battle's darts at their formation slots, drawn at screen scale.
+    // Shots, then ships (each ECS ship where it is), then explosions.
+    for (from, to, side, hit, age) in &d.shots {
+        let col = if *side < 2 { mix(SIDE_COLORS[*side], WHITE, 0.3) } else { CONTESTED };
+        let a = (1.0 - age / SHOT_SECS).clamp(0.0, 1.0) * if *hit { 0.95 } else { 0.35 };
+        c.line(view.to_screen(*from), view.to_screen(*to), if *hit { 1.5 } else { 1.0 }, col, a);
+    }
     let dart_scale = (0.32 * d.scale() * z).max(0.35);
     for (i, f) in d.fleets.iter().enumerate() {
-        let ships: Vec<Vec2> = d.ship_positions(f).iter().map(|s| view.to_screen(*s)).collect();
+        let ships: Vec<(Vec2, f32)> = f.ship_px.iter().map(|(p, h)| (view.to_screen(*p), *h)).collect();
         let centre = view.to_screen(f.pos);
-        let facing = Vec2::from_angle(f.facing);
         if opts.selected == Some(f.id) {
-            let r = ships.iter().map(|s| s.distance(centre)).fold(0.0, f32::max) + 7.0;
+            let r = ships.iter().map(|s| s.0.distance(centre)).fold(0.0, f32::max) + 7.0;
             c.circle(centre, r, GOLD, 1.0);
             c.circle(centre, r + 1.0, GOLD, 1.0);
         }
-        let flash = f.taken > 0.0;
-        let flag = (0..ships.len()).min_by(|a, b| ships[*a].distance(centre).total_cmp(&ships[*b].distance(centre)));
-        for (k, s) in ships.iter().enumerate() {
+        let flag = (0..ships.len()).min_by(|a, b| ships[*a].0.distance(centre).total_cmp(&ships[*b].0.distance(centre)));
+        let tone = match f.morale {
+            Morale::Steady => mix(tones[i], WHITE, 0.25),
+            Morale::Shaken => SHAKEN,
+            Morale::Routed => ROUTED,
+        };
+        for (k, (s, heading)) in ships.iter().enumerate() {
             if s.x < -10.0 || s.y < -10.0 || s.x > w as f32 + 10.0 || s.y > h as f32 + 10.0 {
                 continue;
             }
-            let col = if Some(k) == flag && f.controllable() {
-                WHITE
-            } else if flash && k % 7 == (d.time * 10.0) as usize % 7 {
-                HIT
-            } else {
-                mix(tones[i], WHITE, 0.25)
-            };
+            let col = if Some(k) == flag && f.controllable() { WHITE } else { tone };
+            let facing = Vec2::from_angle(*heading);
             let pts = |k: f32| -> Vec<Vec2> { SHIP_DART.iter().map(|p| *s + facing.rotate(*p * dart_scale * k)).collect() };
             c.polygon_fill(&pts(1.45), INK, 1.0);
             c.polygon_fill(&pts(1.0), col, 1.0);
         }
+    }
+    for (p, age) in &d.booms {
+        let k = age / BOOM_SECS;
+        c.circle(view.to_screen(*p), (3.0 + 9.0 * k) * (z * d.scale()).clamp(0.6, 2.0), HIT, (1.0 - k) * 0.9);
     }
     c
 }
@@ -870,16 +985,20 @@ pub fn status(d: &Dominion, selected: Option<u32>) -> String {
                 Owner::Side(side) => format!("{} fleet {}", SIDE_NAMES[side], d.fleet_number(i)),
                 Owner::Independent(_) => "Independent garrison".into(),
             };
-            let order = if f.dest.is_some() {
+            let order = if f.morale == Morale::Routed {
+                "fleeing"
+            } else if f.dest.is_some() {
                 "moving"
             } else if f.home.is_some() {
                 "garrisoning"
             } else {
                 "holding"
             };
-            let fight = if f.dealt > 0.0 || f.taken > 0.0 { " · ENGAGED" } else { "" };
-            s.push_str(&format!("\nSelected: {who}, {} ships, {}, {order}{fight}.", f.ships, f.formation.name()));
-            if !f.controllable() {
+            let fight = if f.engaged { " · ENGAGED" } else { "" };
+            s.push_str(&format!("\nSelected: {who}, {} ships, {}, {}, {order}{fight}.", f.ships, f.formation.name(), f.morale.name()));
+            if f.morale == Morale::Routed {
+                s.push_str(" Routed: it no longer takes orders.");
+            } else if !f.controllable() {
                 s.push_str(&format!(" Takes orders at {CONTROL_MIN} ships."));
             } else {
                 s.push_str(" Click the map to move it · keys 1–6 set its formation.");

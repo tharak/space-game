@@ -335,10 +335,8 @@ fn set_slider(param: SliderParam, v: f32, cfg: &mut VoronoiConfig, labs: &mut La
             }
         }
         SliderParam::FleetShips => {
-            if let Some(id) = proto.selected
-                && let Some(i) = proto.d.fleet_index(id)
-            {
-                proto.d.fleets[i].ships = v.round() as u32;
+            if let Some(id) = proto.selected {
+                proto.d.set_ships(id, v.round() as u32);
             }
         }
         SliderParam::WeightPerShip => proto.d.tuning.weight_per_ship = v,
@@ -430,9 +428,10 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                     p,
                     "prototype01 — Fleet dominion",
                     "Real time. Every planet builds ships into its own garrison fleet (richer planets faster); \
-                     independent planets only defend. Blue and Red fleets take orders once they have 10 ships. Fleets \
-                     in range fight automatically with the battle's rules: range, gun cone, front/flank/rear hit \
-                     chances, reload and hull, so formation and facing matter. Keys 1–6 set the selected fleet's \
+                     independent planets only defend. Blue and Red fleets take orders once they have 10 ships. Every \
+                     ship is an entity in the battle's ECS, run by the battle's own systems: gun range and cone, \
+                     front/flank/rear hit chances, reload, hull, closing ranks and morale, so formation and facing \
+                     matter and a beaten fleet turns shaken (gold), routs (grey) and flees off the map. Keys 1–6 set the selected fleet's \
                      formation. A planet changes hands once its garrison is gone and an enemy fleet holds it for 3 s \
                      (ring). Patches show each fleet's influence (ships × weight per ship, reach × weight).",
                 );

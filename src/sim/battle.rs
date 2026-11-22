@@ -276,11 +276,19 @@ pub struct Battle {
     pub ai_timer: f32,
     /// Ships lost (destroyed, fled, or in a routed division) at the end.
     pub lost: [u32; 2],
+    /// Never ends (a map that keeps running, like prototype01).
+    pub endless: bool,
 }
 
 impl Battle {
     pub fn over(&self) -> bool {
         self.result.is_some()
+    }
+
+    /// A side's modifiers. Sides past Blue (0) and Red (1), such as
+    /// prototype01's independents (2), fight with none.
+    pub fn mods_of(&self, side: usize) -> SideMods {
+        self.mods.get(side).copied().unwrap_or_default()
     }
 
     /// Fraction of `side`'s fleet still fighting (not destroyed, fled or routed).
