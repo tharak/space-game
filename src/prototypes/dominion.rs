@@ -882,7 +882,7 @@ pub fn status(d: &Dominion, selected: Option<u32>) -> String {
             if !f.controllable() {
                 s.push_str(&format!(" Takes orders at {CONTROL_MIN} ships."));
             } else {
-                s.push_str(" Click the map to move it.");
+                s.push_str(" Click the map to move it · keys 1–6 set its formation.");
             }
         }
         None => s.push_str("\nClick a fleet with 10+ ships to select it, then click the map to send it there."),

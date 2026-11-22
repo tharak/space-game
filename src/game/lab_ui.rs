@@ -107,6 +107,8 @@ pub enum LabAction {
     Back,
     /// To the Voronoi labs page.
     OpenLabs,
+    /// To the ECS systems page.
+    OpenEcs,
     /// prototype01 map size.
     ProtoSize(u32, u32),
     /// To the fleet battle and campaign menu.
@@ -123,8 +125,6 @@ pub enum LabAction {
     ProtoSpeed(u32),
     /// Zoom the prototype map by a factor (around its centre); 0 = fit.
     ProtoZoom(i8),
-    /// Set a fleet's formation (from the menu by the fleet).
-    FleetFormation(u32, Formation),
     ProtoReset,
     ProtoRegions,
     ProtoBorders,
@@ -419,6 +419,7 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
             c.spawn(Node { align_items: AlignItems::Center, column_gap: Val::Px(16.0), ..row() }).with_children(|r| {
                 r.spawn(text("Successor Stars", 26.0, TEXT));
                 button_for(r, "Voronoi labs →", LabAction::OpenLabs, BtnKind::Normal);
+                button_for(r, "ECS systems →", LabAction::OpenEcs, BtnKind::Normal);
                 button_for(r, "Fleet battle & campaign →", LabAction::Game, BtnKind::Primary);
             });
             c.spawn((text("Prototypes built on the Voronoi toolkit.", 14.0, DIM), Node { margin: UiRect::bottom(Val::Px(10.0)), ..default() }));
@@ -431,8 +432,8 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                     "Real time. Every planet builds ships into its own garrison fleet (richer planets faster); \
                      independent planets only defend. Blue and Red fleets take orders once they have 10 ships. Fleets \
                      in range fight automatically with the battle's rules: range, gun cone, front/flank/rear hit \
-                     chances, reload and hull, so formation and facing matter. Pick a formation from the menu under \
-                     each fleet. A planet changes hands once its garrison is gone and an enemy fleet holds it for 3 s \
+                     chances, reload and hull, so formation and facing matter. Keys 1–6 set the selected fleet's \
+                     formation. A planet changes hands once its garrison is gone and an enemy fleet holds it for 3 s \
                      (ring). Patches show each fleet's influence (ships × weight per ship, reach × weight).",
                 );
                 p.spawn(row()).with_children(|r| {
@@ -458,12 +459,7 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                         flex_shrink: 0.0,
                         ..default()
                     },
-                ))
-                .with_children(|img| {
-                    for slot in 0..MAX_MENUS {
-                        fleet_menu(img, slot);
-                    }
-                });
+                ));
                 let sizes: Vec<(String, LabAction)> =
                     PROTO_SIZES.iter().map(|(w, h)| (format!("{w}×{h}"), LabAction::ProtoSize(*w, *h))).collect();
                 choice_row(p, "Map size", &sizes);
@@ -478,7 +474,7 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                 slider(p, "Reach per weight", SliderParam::ReachPerWeight);
                 p.spawn(text(
                     "Click a fleet to select it, then click the map to send it · or drag from a fleet to where it should go · \
-                     wheel over the map: zoom · right- or middle-drag: pan.",
+                     1 Line · 2 Wedge · 3 Crescent · 4 Echelon L · 5 Echelon R · 6 Column · wheel over the map: zoom · right- or middle-drag: pan.",
                     12.5,
                     DIM,
                 ));
@@ -542,68 +538,6 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
             });
         });
     });
-}
-
-/// Formation menus available at once (one per commandable fleet).
-const MAX_MENUS: usize = 48;
-
-/// A small formation menu that follows a fleet on the prototype map.
-#[derive(Component)]
-pub struct FleetMenu(usize);
-/// A button in a fleet's formation menu.
-#[derive(Component)]
-pub struct FleetMenuButton;
-
-fn short_name(f: Formation) -> &'static str {
-    match f {
-        Formation::Line => "Line",
-        Formation::Wedge => "Wedge",
-        Formation::Crescent => "Cresc",
-        Formation::EchelonLeft => "Ech L",
-        Formation::EchelonRight => "Ech R",
-        Formation::Column => "Col",
-        _ => "?",
-    }
-}
-
-fn fleet_menu(parent: &mut ChildSpawnerCommands, slot: usize) {
-    parent
-        .spawn((
-            FleetMenu(slot),
-            Node {
-                position_type: PositionType::Absolute,
-                display: Display::None,
-                flex_direction: FlexDirection::Row,
-                column_gap: Val::Px(2.0),
-                padding: UiRect::all(Val::Px(2.0)),
-                border_radius: BorderRadius::all(Val::Px(4.0)),
-                ..default()
-            },
-            BackgroundColor(BG.with_alpha(0.75)),
-        ))
-        .with_children(|m| {
-            for f in Formation::PLAYER {
-                let mut labels = Vec::new();
-                let mut b = m.spawn((
-                    Button,
-                    Node {
-                        padding: UiRect::axes(Val::Px(4.0), Val::Px(1.0)),
-                        border: UiRect::all(Val::Px(1.0)),
-                        border_radius: BorderRadius::all(Val::Px(3.0)),
-                        ..default()
-                    },
-                    BackgroundColor(PANEL2),
-                    BorderColor::all(LINE),
-                    LabAction::FleetFormation(0, f),
-                    FleetMenuButton,
-                    BtnKind::Choice,
-                    Enabled(true),
-                    Selected(false),
-                ));
-                b.with_children(|t| labels.push(t.spawn(text(short_name(f), 10.5, TEXT)).id()));
-                b.insert(BtnLabel::new(labels));
-            }
-        });
 }
 
 fn page_root() -> Node {
@@ -757,6 +691,9 @@ pub fn handle_lab_buttons(
             LabAction::OpenLabs => {
                 requests.write(AppRequest::LabsPage);
             }
+            LabAction::OpenEcs => {
+                requests.write(AppRequest::EcsPage);
+            }
             LabAction::ProtoSize(w, h) => {
                 if labs.proto.size != (w, h) {
                     labs.proto.size = (w, h);
@@ -780,10 +717,6 @@ pub fn handle_lab_buttons(
             LabAction::ProtoSpeed(m) => {
                 labs.proto.speed = m;
                 labs.proto.paused = false;
-            }
-            LabAction::FleetFormation(id, f) => {
-                labs.proto.d.set_formation(id, f);
-                labs.proto.selected = Some(id);
             }
             LabAction::ProtoReset => labs.proto.rebuild(&cfg.0),
             LabAction::ProtoZoom(dir) => {
@@ -979,9 +912,9 @@ pub fn lab_pointer(
 #[allow(clippy::too_many_arguments)]
 pub fn proto_pointer(
     mouse: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
     mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
     image: Query<&RelativeCursorPosition, With<PrototypeImage>>,
-    menu_buttons: Query<&Interaction, With<FleetMenuButton>>,
     phase: Res<Phase>,
     mut labs: ResMut<Labs>,
 ) {
@@ -990,6 +923,13 @@ pub fn proto_pointer(
         proto.drag = None;
         proto.pan_from = None;
         return;
+    }
+    // Keys 1–6 set the selected fleet's formation.
+    const KEYS: [KeyCode; 6] = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4, KeyCode::Digit5, KeyCode::Digit6];
+    if let Some(id) = proto.selected
+        && let Some(k) = KEYS.iter().position(|k| keys.just_pressed(*k))
+    {
+        proto.d.set_formation(id, Formation::PLAYER[k]);
     }
     let Ok(cursor) = image.single() else { return };
     let Some(n) = cursor.normalized else { return };
@@ -1021,9 +961,7 @@ pub fn proto_pointer(
             proto.pan_from = None;
         }
     }
-    // Clicks on a fleet's formation menu are not map clicks.
-    let on_menu = menu_buttons.iter().any(|i| *i != Interaction::None);
-    if mouse.just_pressed(MouseButton::Left) && over && !on_menu {
+    if mouse.just_pressed(MouseButton::Left) && over {
         // About 10 picture pixels, in world units.
         match proto.d.fleet_at(p, 10.0 / proto.camera.zoom) {
             Some(id) => {
@@ -1052,58 +990,6 @@ pub fn step_proto(time: Res<Time>, phase: Res<Phase>, mut labs: ResMut<Labs>) {
     }
     let dt = time.delta_secs().min(0.1) * proto.speed as f32;
     proto.d.step(dt);
-}
-
-/// Places each commandable fleet's formation menu under it.
-pub fn update_fleet_menus(
-    phase: Res<Phase>,
-    labs: Res<Labs>,
-    mut menus: Query<(&FleetMenu, &mut Node, &Children)>,
-    mut buttons: Query<&mut LabAction, With<FleetMenuButton>>,
-) {
-    if !on_start(&phase) {
-        return;
-    }
-    let d = &labs.proto.d;
-    let cam = labs.proto.camera;
-    let (w, h) = (VIEW_W as f32, VIEW_H as f32);
-    // Only fleets on screen get a menu.
-    let fleets: Vec<&dominion::Fleet> = d
-        .fleets
-        .iter()
-        .filter(|f| f.controllable())
-        .filter(|f| {
-            let s = cam.to_screen(f.pos);
-            s.x >= 0.0 && s.y >= 0.0 && s.x <= w && s.y <= h
-        })
-        .take(MAX_MENUS)
-        .collect();
-    for (menu, mut node, children) in &mut menus {
-        let Some(f) = fleets.get(menu.0) else {
-            if node.display != Display::None {
-                node.display = Display::None;
-            }
-            continue;
-        };
-        let radius = d.ship_positions(f).iter().map(|s| s.distance(f.pos)).fold(0.0, f32::max) * cam.zoom;
-        let at = cam.to_screen(f.pos);
-        let (left, top) = (Val::Percent(at.x / w * 100.0), Val::Percent(((at.y + radius + 8.0) / h * 100.0).min(96.0)));
-        if node.display != Display::Flex || node.left != left || node.top != top {
-            node.display = Display::Flex;
-            node.left = left;
-            node.top = top;
-            // Centre the ~170 px menu under the fleet.
-            node.margin = UiRect::left(Val::Px(-85.0));
-        }
-        for child in children.iter() {
-            if let Ok(mut action) = buttons.get_mut(child)
-                && let LabAction::FleetFormation(id, form) = *action
-                && id != f.id
-            {
-                *action = LabAction::FleetFormation(f.id, form);
-            }
-        }
-    }
 }
 
 /// Play: grow the seeds, or run Lloyd rounds until nothing moves.
@@ -1304,7 +1190,6 @@ pub fn lab_button_state(
         let on = match *action {
             LabAction::ProtoPause => proto.paused,
             LabAction::ProtoSpeed(m) => !proto.paused && proto.speed == m,
-            LabAction::FleetFormation(id, f) => proto.d.fleet(id).is_some_and(|g| g.formation == f),
             LabAction::ProtoSize(w, h) => size == (w, h),
             LabAction::ProtoRegions => proto.regions,
             LabAction::ProtoBorders => proto.borders,

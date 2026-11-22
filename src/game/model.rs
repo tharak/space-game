@@ -71,7 +71,7 @@ pub fn build_model(world: &mut World) {
         ..default()
     };
     m.has_save = world.resource::<super::ui::SaveExists>().0;
-    if matches!(phase, Phase::Menu | Phase::Start | Phase::Labs) {
+    if matches!(phase, Phase::Menu | Phase::Start | Phase::Labs | Phase::Ecs) {
         *world.resource_mut::<UiModel>() = m;
         return;
     }

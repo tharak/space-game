@@ -5,6 +5,7 @@
 pub mod autoplay;
 pub mod camera;
 pub mod campaign_ui;
+pub mod ecs_lab;
 pub mod flow;
 pub mod input;
 pub mod lab_ui;
@@ -74,7 +75,7 @@ impl Plugin for GamePlugin {
             .configure_sets(Update, (Stage::Input, Stage::Apply, Stage::Model, Stage::Present).chain())
             .add_systems(
                 Startup,
-                (camera::setup_camera, view::setup_view, ui::setup_ui, lab_ui::setup_labs, ui::setup_campaign_ui, campaign_ui::setup_campaign_map),
+                (camera::setup_camera, view::setup_view, ui::setup_ui, lab_ui::setup_labs, ecs_lab::setup_ecs_labs, ui::setup_campaign_ui, campaign_ui::setup_campaign_map),
             )
             .add_systems(FixedUpdate, flow::run_sim)
             .add_systems(
@@ -85,7 +86,10 @@ impl Plugin for GamePlugin {
                     model::build_model.in_set(Stage::Model),
                     (lab_ui::handle_lab_buttons, lab_ui::drag_sliders, lab_ui::lab_pointer, lab_ui::proto_pointer, lab_ui::scroll_labs).chain().in_set(Stage::Input),
                     (lab_ui::animate_labs, lab_ui::step_proto).in_set(Stage::Apply),
-                    (lab_ui::render_labs, lab_ui::update_lab_ui, lab_ui::update_fleet_menus, lab_ui::lab_button_state).chain().in_set(Stage::Present).before(ui::style_buttons),
+                    (ecs_lab::handle_ecs_buttons, ecs_lab::scroll_ecs_labs).in_set(Stage::Input),
+                    ecs_lab::step_ecs_labs.in_set(Stage::Apply),
+                    (ecs_lab::render_ecs_labs, ecs_lab::ecs_button_state).chain().in_set(Stage::Present).before(ui::style_buttons),
+                    (lab_ui::render_labs, lab_ui::update_lab_ui, lab_ui::lab_button_state).chain().in_set(Stage::Present).before(ui::style_buttons),
                     (
                         flow::log_events,
                         view::collect_fx,

@@ -13,7 +13,7 @@ The start page's prototype, in real time (Pause, 1×, 2×, 4×). Code: `src/prot
 - **Planets:** some of the Voronoi regions hold a planet (Sites and Planets sliders). Each builds ships into its own garrison fleet: one every 15 s ÷ the planet's value (1–3), set by the Production slider.
 - **Independent planets:** they start with 10 ships, build up to 30, and only defend.
 - **Fleets:** Blue and Red each start with a home planet and 1–8 fleets of 50 ships (Fleets slider). A fleet takes orders once it has 10 ships. Click a fleet, then click the map to send it, or drag from a fleet to where it should go. Both sides are controlled by hand.
-- **Formations:** a small menu under each commandable fleet picks one of the battle's formations (Line, Wedge, Crescent, Echelon L/R, Column). Ships sit at the battle's formation slots.
+- **Formations:** keys 1–6 set the selected fleet's formation (1 Line, 2 Wedge, 3 Crescent, 4 Echelon L, 5 Echelon R, 6 Column). Ships sit at the battle's formation slots.
 - **Combat:** fleets in range fight automatically with the battle's rules: gun range, gun cone, front, flank and rear hit chances, range falloff, reload and hull. It's resolved as expected damage, scaled by the Combat speed slider. A moving fleet stops short of an enemy and faces it, as in the battle, so formation and facing matter.
 - **Capture:** a planet changes hands once its garrison is gone and a single enemy side has held it for 3 s (a ring shows the progress).
 - **Patches:** like lab 1's growing seeds, they show each fleet's influence (weight = ships × weight per ship, reach = reach per weight × weight, scaled to the map).
