@@ -109,6 +109,7 @@ pub enum LabAction {
     OpenLabs,
     /// To the ECS systems page.
     OpenEcs,
+    OpenBoard,
     /// prototype01 map size.
     ProtoSize(u32, u32),
     /// To the fleet battle and campaign menu.
@@ -418,6 +419,7 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                 r.spawn(text("Successor Stars", 26.0, TEXT));
                 button_for(r, "Voronoi labs →", LabAction::OpenLabs, BtnKind::Normal);
                 button_for(r, "ECS systems →", LabAction::OpenEcs, BtnKind::Normal);
+                button_for(r, "Hex board →", LabAction::OpenBoard, BtnKind::Normal);
                 button_for(r, "Fleet battle & campaign →", LabAction::Game, BtnKind::Primary);
             });
             c.spawn((text("Prototypes built on the Voronoi toolkit.", 14.0, DIM), Node { margin: UiRect::bottom(Val::Px(10.0)), ..default() }));
@@ -692,6 +694,9 @@ pub fn handle_lab_buttons(
             }
             LabAction::OpenEcs => {
                 requests.write(AppRequest::EcsPage);
+            }
+            LabAction::OpenBoard => {
+                requests.write(AppRequest::BoardPage);
             }
             LabAction::ProtoSize(w, h) => {
                 if labs.proto.size != (w, h) {

@@ -21,6 +21,8 @@ pub enum Phase {
     Labs,
     /// The ECS systems page.
     Ecs,
+    /// The hex board prototype page.
+    Board,
     /// The fleet battle and campaign menu.
     Menu,
     Battle,
@@ -61,6 +63,8 @@ pub enum AppRequest {
     LabsPage,
     /// The ECS systems page.
     EcsPage,
+    /// The hex board page.
+    BoardPage,
     Menu,
     NewCampaign,
     ContinueCampaign,
@@ -112,6 +116,7 @@ pub fn apply_requests(world: &mut World) {
             AppRequest::Home => *world.resource_mut::<Phase>() = Phase::Start,
             AppRequest::LabsPage => *world.resource_mut::<Phase>() = Phase::Labs,
             AppRequest::EcsPage => *world.resource_mut::<Phase>() = Phase::Ecs,
+            AppRequest::BoardPage => *world.resource_mut::<Phase>() = Phase::Board,
             AppRequest::Menu => {
                 *world.resource_mut::<Phase>() = Phase::Menu;
                 world.resource_mut::<super::ui::SaveExists>().0 = crate::campaign::save::load().is_some();

@@ -23,6 +23,18 @@ The start page's prototype, in real time (Pause, 1×, 2×, 4×). Code: `src/prot
 
 Tests: `cargo test prototypes`. `cargo run --release --example prototype01_dump -- <dir>` plays a minute and writes frames, a 4× close-up of each, and render timings.
 
+## Hex board — BattleStars v0.2.1
+
+The **Hex board →** button on the start page opens the alternating-activation hex rules, the one design that passed a paper playtest. Rules: `src/board/` (headless, on its own ECS `World`, squadrons are entities). Page: `src/game/board_page.rs`.
+
+- 27×27 hex board, 5–12 squadrons a side (strength 4 each), one flagship per side; nine scenarios (Spindle vs Wide Line, supply handicaps, flagship hunt, …).
+- Play Blue, Play Red, hotseat or spectate (Step / Auto). Deploy in the scenario's formation or place squadrons by hand.
+- Click one of your squadrons to activate it, then Q/E turn, W forward, S back (full MP only), F or click a red-outlined enemy to fire, Space ends. Within 4 hexes of your flagship (tinted) you may move AND fire; outside it, move OR fire.
+- Fire: range 3, forward arc, line of sight blocked by any squadron; to-hit 5+ front, 4+ flank, 3+ rear. Hits cost strength and force morale checks; Shaken squadrons fire half dice and won't close; Routed ones flee off their own edge. A fleet breaks after losing half; otherwise turn 15 ends it on surviving strength.
+- AIs: doctrine (keeps its flagship back, faces threats, prefers flank shots) and the original baseline.
+
+Tests: `cargo test board`.
+
 ## Voronoi labs
 
 The **Voronoi labs →** button on the start page opens a separate page with every lab, its controls and its image. Labs only render while that page is open. A shared **Config** at the top (seed, site count, distance metric, Lloyd rounds) feeds all nine labs, after the gamegeniuslab tutorial *Voronoi diagrams in game development*:
