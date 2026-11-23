@@ -18,7 +18,7 @@ fn main() {
         let t = std::time::Instant::now();
         let bg = render_background(d, &view, true, 1);
         let t_bg = t.elapsed();
-        let opts = DrawOptions { selected: d.fleets.first().map(|f| f.id).into_iter().collect(), ..Default::default() };
+        let opts = DrawOptions { selected: d.fleets.first().map(|f| f.ship_ids.clone()).unwrap_or_default(), ..Default::default() };
         let t = std::time::Instant::now();
         let frame = render(d, &bg, &view, &opts);
         println!("{name}: background {:.1} ms, frame {:.1} ms", t_bg.as_secs_f32() * 1e3, t.elapsed().as_secs_f32() * 1e3);

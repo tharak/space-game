@@ -157,6 +157,36 @@ pub fn remove_ships(world: &mut World, division: Entity, n: usize) {
     reform(world, division);
 }
 
+/// Moves `ships` (same side as `to`) into division `to`, moving their
+/// counts with them, and re-forms every division touched. Divisions left
+/// empty stay (the caller despawns them).
+pub fn transfer_ships(world: &mut World, ships: &[Entity], to: Entity) {
+    let mut touched = vec![to];
+    let mut moved = 0u32;
+    for &e in ships {
+        let Some(from) = world.get::<InDivision>(e).map(|d| d.0) else { continue };
+        if from == to {
+            continue;
+        }
+        world.entity_mut(e).insert(InDivision(to));
+        if let Some(mut d) = world.get_mut::<Division>(from) {
+            d.alive = d.alive.saturating_sub(1);
+            d.start = d.start.saturating_sub(1);
+        }
+        if !touched.contains(&from) {
+            touched.push(from);
+        }
+        moved += 1;
+    }
+    if let Some(mut d) = world.get_mut::<Division>(to) {
+        d.alive += moved;
+        d.start += moved;
+    }
+    for d in touched {
+        reform(world, d);
+    }
+}
+
 /// Re-forms a division in its current formation (even a routed one).
 fn reform(world: &mut World, division: Entity) {
     let Some(d) = world.get::<Division>(division).cloned() else { return };

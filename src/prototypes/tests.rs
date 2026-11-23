@@ -18,6 +18,8 @@ fn duel(a: (Owner, Vec2, f32, u32), b: (Owner, Vec2, f32, u32)) -> (Dominion, u3
     for p in &mut d.planets {
         p.value = 0;
     }
+    // Combat only: credits never run out.
+    d.credits.fill(1e6);
     let ia = d.add_fleet(a.0, a.1, a.2, a.3, None);
     let ib = d.add_fleet(b.0, b.1, b.2, b.3, None);
     (d, ia, ib)
@@ -36,14 +38,17 @@ fn the_world_starts_with_home_planets_fleets_and_garrisons() {
     let d = world();
     let (planets, fleets, ships, free) = d.tally();
     assert_eq!(planets, [1, 1]);
-    assert_eq!(fleets, [3, 3]);
-    assert_eq!(ships, [3 * START_SHIPS, 3 * START_SHIPS]);
+    // Three start fleets each, plus the home planet's garrison.
+    assert_eq!(fleets, [4, 4]);
+    for (side, n) in ships.iter().enumerate() {
+        let home = d.planets.iter().find(|p| p.owner == Owner::Side(side)).unwrap();
+        assert_eq!(*n, 3 * START_SHIPS + home.value);
+    }
     assert_eq!(free, 10);
+    // Every planet starts with as many ships as its size.
     for (i, p) in d.planets.iter().enumerate() {
-        if let Owner::Independent(_) = p.owner {
-            let g = d.fleets.iter().find(|f| f.home == Some(i)).expect("garrison");
-            assert_eq!((g.owner, g.ships), (p.owner, INDEPENDENT_START));
-        }
+        let g = d.fleets.iter().find(|f| f.home == Some(i)).expect("garrison");
+        assert_eq!((g.owner, g.ships), (p.owner, p.value));
     }
     // Every fleet's ships are ECS entities.
     let total: usize = d.fleets.iter().map(|f| f.ship_px.len()).sum();
@@ -54,19 +59,19 @@ fn the_world_starts_with_home_planets_fleets_and_garrisons() {
 fn planets_build_ships_into_their_garrison() {
     let mut d = world();
     d.tuning.secs_per_ship = 6.0;
-    // Build mechanics only: upkeep would stop Blue's lone planet building.
+    // Build mechanics only: no costs.
     d.tuning.upkeep = 0.0;
+    d.tuning.ship_cost = 0.0;
     let home = d.planets.iter().position(|p| p.owner == BLUE).unwrap();
     d.planets[home].value = 2;
-    // Blue's home has no garrison yet: the first ship starts one.
+    let g = d.fleets.iter().find(|f| f.home == Some(home)).expect("a garrison");
+    let (id, start) = (g.id, g.ships);
     d.step(3.05);
-    let g = d.fleets.iter().find(|f| f.home == Some(home)).expect("a new garrison");
-    let id = g.id;
-    assert_eq!(g.ships, 1);
+    assert_eq!(ships(&d, id), start + 1);
     d.step(21.0);
     let g = d.fleet(id).unwrap();
-    assert_eq!(g.ships, 8);
-    assert_eq!(g.ship_px.len(), 8);
+    assert_eq!(g.ships, start + 8);
+    assert_eq!(g.ship_px.len() as u32, start + 8);
     // Ordered away, it stops garrisoning and the planet starts a new one.
     d.set_ships(id, 12);
     assert!(d.order_move(id, Vec2::new(360.0, 200.0)));
@@ -82,7 +87,10 @@ fn independents_never_take_orders_and_cap_their_garrison() {
     assert!(!d.controllable_id(g.id));
     assert!(!d.order_move(g.id, Vec2::ZERO));
     d.step(60.0);
-    assert!(d.fleets.iter().filter(|f| matches!(f.owner, Owner::Independent(_))).all(|f| f.ships <= INDEPENDENT_CAP));
+    assert!(d.fleets.iter().filter(|f| matches!(f.owner, Owner::Independent(_))).all(|f| {
+        let size = d.planets[f.home.unwrap()].value;
+        f.ships <= INDEPENDENT_CAP_PER_SIZE * size
+    }));
 }
 
 #[test]
@@ -269,8 +277,8 @@ fn planets_earn_by_size_minus_population() {
     d.tuning.ship_cost = 1e6;
     d.credits[0] = 0.0;
     d.step(10.0);
-    // Size 2 × (10 − 2) a second for 10 s.
-    assert!((d.credits_of(BLUE) - 160.0).abs() < 1.0, "{}", d.credits_of(BLUE));
+    // Size 2 × (1 − 0.2) a second for 10 s.
+    assert!((d.credits_of(BLUE) - 16.0).abs() < 0.1, "{}", d.credits_of(BLUE));
 }
 
 #[test]
@@ -278,9 +286,9 @@ fn upkeep_caps_the_fleet_at_what_planets_can_pay() {
     let (mut d, _) = economy();
     d.tuning.ship_cost = 1.0;
     d.credits[0] = 10_000.0;
-    // 16 credits a second pay for 160 ships at 0.1 each.
-    d.step(120.0);
-    assert_eq!(d.ships_of(BLUE), 160);
+    // 1.6 credits a second pay for 32 ships at 0.05 each.
+    d.step(60.0);
+    assert_eq!(d.ships_of(BLUE), 32);
     assert!(d.net_income(BLUE) >= 0.0);
 }
 
@@ -288,25 +296,26 @@ fn upkeep_caps_the_fleet_at_what_planets_can_pay() {
 fn unpaid_upkeep_makes_ships_desert() {
     let (mut d, _) = economy();
     d.tuning.ship_cost = 1e6;
-    let id = d.add_fleet(BLUE, Vec2::new(360.0, 200.0), 0.0, 300, None);
+    let id = d.add_fleet(BLUE, Vec2::new(360.0, 200.0), 0.0, 64, None);
     d.credits[0] = 0.0;
-    // 300 ships cost 30 a second against an income of 16.
-    d.step(MAINTENANCE_SECS * 6.0 + 0.05);
-    let left = ships(&d, id);
-    assert!((150..300).contains(&left), "{left}");
+    // 64 ships cost 3.2 a second against an income of 1.6.
+    d.step(MAINTENANCE_SECS + 0.05);
+    assert!(ships(&d, id) < 64);
     assert!(d.deserted[0] > 0);
-    // It settles near what the planet pays for.
-    d.step(120.0);
-    assert!((155..=165).contains(&ships(&d, id)), "{}", ships(&d, id));
+    // It settles at what the planet pays for.
+    d.step(60.0);
+    assert!((31..=33).contains(&ships(&d, id)), "{}", ships(&d, id));
 }
 
 #[test]
 fn shots_cost_credits_and_a_broke_side_cannot_fire() {
     let (mut d, a, b) = duel((BLUE, Vec2::new(300.0, 200.0), 0.0, 30), (RED, Vec2::new(325.0, 200.0), WEST, 30));
     d.tuning.upkeep = 0.0;
+    d.credits[0] = 1000.0;
     d.credits[1] = 0.0;
+    let before = d.credits_of(BLUE);
     d.step(20.0);
-    assert!(d.credits_of(BLUE) < START_CREDITS);
+    assert!(d.credits_of(BLUE) < before);
     assert!(d.shots.iter().all(|s| s.2 == 0), "Red fired with no credits");
     assert!(ships(&d, b) < 30);
     assert_eq!(ships(&d, a), 30);
@@ -325,7 +334,69 @@ fn the_maintenance_phase_repairs_fleets_out_of_combat() {
     let before = d.credits_of(BLUE);
     d.step(MAINTENANCE_SECS + 0.05);
     assert!(d.world.query::<&Ship>().iter(&d.world).all(|s| s.hull == s.max_hull));
-    // 10 ships × 4 hull points × 2 credits, less the income meanwhile.
-    let income = 16.0 * (MAINTENANCE_SECS + 0.05);
-    assert!((before + income - d.credits_of(BLUE) - 80.0).abs() < 2.0, "{}", d.credits_of(BLUE));
+    // 10 ships × 4 hull points × 0.2 credits, less the income meanwhile.
+    let income = 1.6 * (MAINTENANCE_SECS + 0.05);
+    assert!((before + income - d.credits_of(BLUE) - 8.0).abs() < 0.2, "{}", d.credits_of(BLUE));
+}
+
+fn ids(d: &Dominion, id: u32) -> Vec<bevy::prelude::Entity> {
+    d.fleet(id).unwrap().ship_ids.clone()
+}
+
+#[test]
+fn one_whole_fleet_selected_just_moves() {
+    let (mut d, a, _) = duel((BLUE, Vec2::new(100.0, 100.0), 0.0, 10), (RED, Vec2::new(650.0, 350.0), WEST, 10));
+    let to = Vec2::new(200.0, 100.0);
+    assert_eq!(d.form_fleet(&ids(&d, a), to), Some(a));
+    assert_eq!(d.fleets.len(), 2);
+    assert_eq!(d.fleet(a).unwrap().dest, Some(to));
+}
+
+#[test]
+fn selected_fleets_merge_into_the_biggest() {
+    let (mut d, a, _) = duel((BLUE, Vec2::new(100.0, 100.0), 0.0, 12), (RED, Vec2::new(650.0, 350.0), WEST, 10));
+    let b = d.add_fleet(BLUE, Vec2::new(100.0, 250.0), 0.0, 5, None);
+    let mut sel = ids(&d, a);
+    sel.extend(ids(&d, b));
+    let to = Vec2::new(250.0, 180.0);
+    assert_eq!(d.form_fleet(&sel, to), Some(a));
+    assert!(d.fleet(b).is_none(), "the smaller fleet is absorbed");
+    assert_eq!(ships(&d, a), 17);
+    assert_eq!(d.fleet(a).unwrap().dest, Some(to));
+    d.step(10.0);
+    assert_eq!(ships(&d, a), 17);
+}
+
+#[test]
+fn part_of_a_fleet_splits_off() {
+    let (mut d, a, _) = duel((BLUE, Vec2::new(100.0, 100.0), 0.0, 10), (RED, Vec2::new(650.0, 350.0), WEST, 10));
+    let part: Vec<_> = ids(&d, a).into_iter().take(4).collect();
+    let new = d.form_fleet(&part, Vec2::new(100.0, 300.0)).unwrap();
+    assert_ne!(new, a);
+    assert_eq!((ships(&d, a), ships(&d, new)), (6, 4));
+    assert!(d.fleet(a).unwrap().dest.is_none());
+    assert!(d.fleet(new).unwrap().ship_ids.iter().all(|e| part.contains(e)));
+    d.step(5.0);
+    assert_eq!((ships(&d, a), ships(&d, new)), (6, 4));
+}
+
+#[test]
+fn a_mixed_selection_only_moves_one_owner_and_never_independents() {
+    let (mut d, a, b) = duel((BLUE, Vec2::new(100.0, 100.0), 0.0, 10), (RED, Vec2::new(650.0, 350.0), WEST, 10));
+    let mut sel = ids(&d, a);
+    sel.extend(ids(&d, b));
+    assert_eq!(d.form_fleet(&sel, Vec2::new(300.0, 200.0)), Some(a));
+    assert_eq!((ships(&d, a), ships(&d, b)), (10, 10));
+    assert!(d.fleet(b).unwrap().dest.is_none());
+    let ind = d.add_fleet(Owner::Independent(0), Vec2::new(400.0, 100.0), 0.0, 3, None);
+    assert_eq!(d.form_fleet(&ids(&d, ind), Vec2::ZERO), None);
+}
+
+#[test]
+fn a_box_takes_ships_of_one_side_only() {
+    let (d, a, b) = duel((BLUE, Vec2::new(300.0, 200.0), 0.0, 10), (RED, Vec2::new(340.0, 200.0), WEST, 20));
+    let all = d.ships_in_box(Vec2::new(0.0, 0.0), Vec2::new(720.0, 400.0));
+    assert_eq!(all, ids(&d, b));
+    let left = d.ships_in_box(Vec2::new(0.0, 0.0), Vec2::new(320.0, 400.0));
+    assert_eq!(left, ids(&d, a));
 }

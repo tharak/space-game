@@ -34,14 +34,12 @@ use crate::voronoi::rng::ParkMiller;
 use crate::voronoi::sites::VoronoiConfig;
 
 pub const MAX_FLEETS_PER_SIDE: usize = 8;
-pub const START_SHIPS: u32 = 50;
+pub const START_SHIPS: u32 = 10;
 pub const MIN_SHIPS: u32 = 1;
-pub const MAX_SHIPS: u32 = 300;
-/// A Blue or Red fleet can take orders once it has this many ships.
-pub const CONTROL_MIN: u32 = 10;
-/// Independent planets start with this garrison and build up to the cap.
-pub const INDEPENDENT_START: u32 = 10;
-pub const INDEPENDENT_CAP: u32 = 30;
+pub const MAX_SHIPS: u32 = 100;
+/// Independent garrisons build up to this many ships per point of size
+/// (every planet starts with `size` ships).
+pub const INDEPENDENT_CAP_PER_SIZE: u32 = 5;
 /// Seconds an attacker must hold an ungarrisoned planet to take it.
 pub const HOLD_SECS: f32 = 3.0;
 /// Battle units to map pixels on a 720-wide map (range 150 → 30 px).
@@ -56,9 +54,9 @@ pub const SIDE_NAMES: [&str; 2] = ["Blue", "Red"];
 /// Seconds between maintenance phases (upkeep and repairs).
 pub const MAINTENANCE_SECS: f32 = 5.0;
 /// Credits Blue and Red start with.
-pub const START_CREDITS: f32 = 500.0;
+pub const START_CREDITS: f32 = 50.0;
 /// Credits each independent planet starts with.
-pub const INDEPENDENT_CREDITS: f32 = 100.0;
+pub const INDEPENDENT_CREDITS: f32 = 10.0;
 const SIDE_COLORS: [Rgb; 2] = [[70, 130, 220], [215, 80, 70]];
 
 /// The prototype's sliders.
@@ -75,13 +73,14 @@ pub struct Tuning {
     /// Multiplies the battle's rate of fire, so map fights take seconds,
     /// not minutes; the rules' proportions are unchanged.
     pub combat_speed: f32,
-    /// Credits a second a planet earns per point of size (value 1–3).
+    /// Income multiplier: a planet of size x earns x × this credits a second.
     pub income: f32,
     /// Credits a second its population needs per point of size.
     pub population: f32,
     /// Credits to build one ship.
     pub ship_cost: f32,
-    /// Credits a second each ship costs, paid at the maintenance phase.
+    /// Credits a second each ship costs (debts are settled at the
+    /// maintenance phase: unpaid ships desert).
     pub upkeep: f32,
     /// Credits per shot fired.
     pub shot_cost: f32,
@@ -99,12 +98,12 @@ impl Default for Tuning {
             secs_per_ship: 15.0,
             speed: 30.0,
             combat_speed: 3.0,
-            income: 10.0,
-            population: 2.0,
-            ship_cost: 50.0,
-            upkeep: 0.1,
-            shot_cost: 0.05,
-            repair_cost: 2.0,
+            income: 1.0,
+            population: 0.2,
+            ship_cost: 10.0,
+            upkeep: 0.05,
+            shot_cost: 0.01,
+            repair_cost: 0.2,
         }
     }
 }
@@ -169,6 +168,8 @@ pub struct Fleet {
     pub home: Option<usize>,
     /// Each ship's position (map pixels) and heading.
     pub ship_px: Vec<(Vec2, f32)>,
+    /// Each ship's entity, in the same order as `ship_px`.
+    pub ship_ids: Vec<Entity>,
     /// Fired or was fired on in the last second or so.
     pub engaged: bool,
 }
@@ -178,9 +179,9 @@ impl Fleet {
         self.ships as f32 * t.weight_per_ship
     }
 
-    /// Blue and Red fleets with 10+ ships, or that already left home, unless routed.
+    /// Blue and Red fleets, unless routed.
     pub fn controllable(&self) -> bool {
-        matches!(self.owner, Owner::Side(_)) && self.morale != Morale::Routed && (self.ships >= CONTROL_MIN || self.home.is_none())
+        matches!(self.owner, Owner::Side(_)) && self.morale != Morale::Routed
     }
 }
 
@@ -320,11 +321,11 @@ impl Dominion {
                 d.spawn(Owner::Side(side), pos, facing, START_SHIPS, None);
             }
         }
+        // Every planet starts with a garrison of `size` ships.
         for i in 0..d.planets.len() {
-            if let Owner::Independent(_) = d.planets[i].owner {
-                let (owner, pos) = (d.planets[i].owner, d.planets[i].pos);
-                d.spawn(owner, pos, 0.0, INDEPENDENT_START, Some(i));
-            }
+            let (owner, pos, size) = (d.planets[i].owner, d.planets[i].pos, d.planets[i].value);
+            let facing = (Vec2::new(cfg.w as f32, cfg.h as f32) * 0.5 - pos).to_angle();
+            d.spawn(owner, pos, facing, size, Some(i));
         }
         d.sync();
         d
@@ -372,6 +373,7 @@ impl Dominion {
             morale: Morale::Steady,
             home,
             ship_px: Vec::new(),
+            ship_ids: Vec::new(),
             engaged: false,
         });
         id
@@ -462,6 +464,83 @@ impl Dominion {
         true
     }
 
+    /// The fleet a ship belongs to.
+    pub fn fleet_of_ship(&self, ship: Entity) -> Option<&Fleet> {
+        self.fleets.iter().find(|f| f.ship_ids.contains(&ship))
+    }
+
+    /// Ships of controllable fleets inside the box (map pixels). With both
+    /// sides inside, only the side with more ships there.
+    pub fn ships_in_box(&self, a: Vec2, b: Vec2) -> Vec<Entity> {
+        let (lo, hi) = (a.min(b), a.max(b));
+        let mut found: [Vec<Entity>; 2] = [Vec::new(), Vec::new()];
+        for f in self.fleets.iter().filter(|f| f.controllable()) {
+            let side = f.owner.side();
+            for (p, e) in f.ship_px.iter().zip(&f.ship_ids) {
+                if p.0.cmpge(lo).all() && p.0.cmple(hi).all() {
+                    found[side].push(*e);
+                }
+            }
+        }
+        let [blue, red] = found;
+        if red.len() > blue.len() { red } else { blue }
+    }
+
+    /// Fleets every one of whose ships is in `ships`.
+    pub fn whole_fleets(&self, ships: &[Entity]) -> Vec<u32> {
+        self.fleets.iter().filter(|f| !f.ship_ids.is_empty() && f.ship_ids.iter().all(|e| ships.contains(e))).map(|f| f.id).collect()
+    }
+
+    /// Right-click with `ships` selected: they become one fleet sent to `to`.
+    /// One whole fleet just moves. Otherwise the biggest wholly selected
+    /// fleet takes in the rest (merge), or, if none is whole, the ships
+    /// split off into a new fleet. Only one owner's controllable ships
+    /// count. Returns the fleet that moves.
+    pub fn form_fleet(&mut self, ships: &[Entity], to: Vec2) -> Option<u32> {
+        let mut picked: Vec<(Entity, Owner)> = ships
+            .iter()
+            .filter_map(|e| self.fleet_of_ship(*e).filter(|f| f.controllable()).map(|f| (*e, f.owner)))
+            .collect();
+        let owner = picked.first()?.1;
+        picked.retain(|p| p.1 == owner);
+        let ships: Vec<Entity> = picked.iter().map(|p| p.0).collect();
+        let whole = self.whole_fleets(&ships);
+        let sources: Vec<u32> = {
+            let mut v: Vec<u32> = ships.iter().filter_map(|e| self.fleet_of_ship(*e)).map(|f| f.id).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let target = if sources.len() == 1 && whole.len() == 1 {
+            whole[0]
+        } else if let Some(&big) = whole.iter().max_by_key(|id| self.fleet(**id).map_or(0, |f| f.ships)) {
+            big
+        } else {
+            // A new fleet where the ships are, facing like their first fleet.
+            let unit = self.unit();
+            let centre = self
+                .world
+                .query::<(Entity, &Pos)>()
+                .iter(&self.world)
+                .filter(|(e, _)| ships.contains(e))
+                .map(|(_, p)| p.0 * unit)
+                .sum::<Vec2>()
+                / ships.len() as f32;
+            let first = self.fleet_of_ship(ships[0])?;
+            let (facing, formation) = (first.facing, first.formation);
+            let id = self.spawn(owner, centre, facing, 0, None);
+            if let Some(e) = self.fleet(id).map(|f| f.division) {
+                crate::sim::set_formation(&mut self.world, e, formation);
+            }
+            id
+        };
+        let division = self.fleet(target)?.division;
+        crate::sim::transfer_ships(&mut self.world, &ships, division);
+        self.sync();
+        self.order_move(target, to);
+        Some(target)
+    }
+
     pub fn set_formation(&mut self, id: u32, formation: Formation) -> bool {
         let Some(f) = self.fleet(id).filter(|f| f.controllable()) else { return false };
         let e = f.division;
@@ -549,12 +628,18 @@ impl Dominion {
         }
     }
 
-    /// Planets earn income and feed their population, every tick.
+    /// Every tick planets earn income and feed their population, and
+    /// fleets pay their upkeep.
     fn earn(&mut self, dt: f32) {
         let t = self.tuning;
         for p in &self.planets {
             if let Some(c) = self.credits.get_mut(Self::purse(p.owner)) {
                 *c += dt * p.value as f32 * (t.income - t.population);
+            }
+        }
+        for f in &self.fleets {
+            if let Some(c) = self.credits.get_mut(Self::purse(f.owner)) {
+                *c -= dt * f.ships as f32 * t.upkeep;
             }
         }
     }
@@ -589,15 +674,15 @@ impl Dominion {
         }
     }
 
-    /// The maintenance phase: every owner pays its fleets' upkeep (ships it
-    /// can't pay for desert, from its biggest fleets), then repairs the
-    /// damaged ships of fleets out of combat while credits last.
+    /// The maintenance phase: an owner in debt loses the ships it couldn't
+    /// pay for since the last phase (they desert, from its biggest fleets),
+    /// then damaged ships of fleets out of combat are repaired while
+    /// credits last.
     fn maintain(&mut self) {
         let per_ship = self.tuning.upkeep * MAINTENANCE_SECS;
         for purse in 0..self.credits.len() {
             let owner = if purse < 2 { Owner::Side(purse) } else { Owner::Independent(purse - 2) };
             let ships = self.ships_of(owner);
-            self.credits[purse] -= ships as f32 * per_ship;
             if self.credits[purse] >= 0.0 {
                 continue;
             }
@@ -650,9 +735,9 @@ impl Dominion {
     /// Reads every fleet back from its division; drops the empty ones.
     fn sync(&mut self) {
         let unit = self.unit();
-        let mut ships: std::collections::HashMap<Entity, Vec<(Vec2, f32)>> = std::collections::HashMap::new();
-        for (p, h, d) in self.world.query::<(&Pos, &Heading, &InDivision)>().iter(&self.world) {
-            ships.entry(d.0).or_default().push((p.0 * unit, h.0));
+        let mut ships: std::collections::HashMap<Entity, Vec<(Vec2, f32, Entity)>> = std::collections::HashMap::new();
+        for (e, p, h, d) in self.world.query::<(Entity, &Pos, &Heading, &InDivision)>().iter(&self.world) {
+            ships.entry(d.0).or_default().push((p.0 * unit, h.0, e));
         }
         let mut gone = Vec::new();
         let mut arrived = Vec::new();
@@ -661,14 +746,16 @@ impl Dominion {
                 gone.push(f.division);
                 continue;
             };
-            let list = ships.remove(&f.division).unwrap_or_default();
+            let mut list = ships.remove(&f.division).unwrap_or_default();
             if list.is_empty() {
                 gone.push(f.division);
                 continue;
             }
+            list.sort_by_key(|s| s.2);
             f.pos = list.iter().map(|s| s.0).sum::<Vec2>() / list.len() as f32;
             f.ships = list.len() as u32;
-            f.ship_px = list;
+            f.ship_px = list.iter().map(|s| (s.0, s.1)).collect();
+            f.ship_ids = list.iter().map(|s| s.2).collect();
             f.facing = d.facing;
             f.formation = d.formation;
             f.morale = d.morale;
@@ -732,7 +819,8 @@ impl Dominion {
         for i in 0..self.planets.len() {
             let (owner, value, pos) = (self.planets[i].owner, self.planets[i].value, self.planets[i].pos);
             let garrison = self.fleets.iter().position(|f| f.home == Some(i) && f.owner == owner);
-            let full = matches!(owner, Owner::Independent(_)) && garrison.is_some_and(|g| self.fleets[g].ships >= INDEPENDENT_CAP);
+            let full = matches!(owner, Owner::Independent(_))
+                && garrison.is_some_and(|g| self.fleets[g].ships >= INDEPENDENT_CAP_PER_SIZE * value);
             if full {
                 self.planets[i].build = 0.0;
                 continue;
@@ -870,8 +958,8 @@ impl Influence {
 pub struct DrawOptions {
     pub regions: bool,
     pub borders: bool,
-    /// Selected fleet ids.
-    pub selected: Vec<u32>,
+    /// Selected ships.
+    pub selected: Vec<Entity>,
     /// A selection box being dragged, two corners in picture pixels.
     pub marquee: Option<(Vec2, Vec2)>,
     /// Patch sampling step in pixels.
@@ -1113,8 +1201,9 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
         c.disc(at, r + 1.0, INK, 1.0);
         c.disc(at, r, [230, 220, 170], 1.0);
     }
-    // Destinations of the selected fleets.
-    for f in opts.selected.iter().filter_map(|id| d.fleet(*id)) {
+    // Destinations of the wholly selected fleets.
+    let whole = d.whole_fleets(&opts.selected);
+    for f in whole.iter().filter_map(|id| d.fleet(*id)) {
         if let Some(dest) = f.dest {
             let (a, b) = (view.to_screen(f.pos), view.to_screen(dest));
             c.dashed_line(a, b, 6.0, 5.0, GOLD, 0.9);
@@ -1131,7 +1220,7 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
     for (i, f) in d.fleets.iter().enumerate() {
         let ships: Vec<(Vec2, f32)> = f.ship_px.iter().map(|(p, h)| (view.to_screen(*p), *h)).collect();
         let centre = view.to_screen(f.pos);
-        if opts.selected.contains(&f.id) {
+        if whole.contains(&f.id) {
             let r = ships.iter().map(|s| s.0.distance(centre)).fold(0.0, f32::max) + 7.0;
             c.circle(centre, r, GOLD, 1.0);
             c.circle(centre, r + 1.0, GOLD, 1.0);
@@ -1149,6 +1238,10 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
             let col = if Some(k) == flag && f.controllable() { WHITE } else { tone };
             let facing = Vec2::from_angle(*heading);
             let pts = |k: f32| -> Vec<Vec2> { SHIP_DART.iter().map(|p| *s + facing.rotate(*p * dart_scale * k)).collect() };
+            // Selected ships get a gold outline.
+            if f.ship_ids.get(k).is_some_and(|e| opts.selected.contains(e)) {
+                c.polygon_fill(&pts(2.0), GOLD, 1.0);
+            }
             c.polygon_fill(&pts(1.45), INK, 1.0);
             c.polygon_fill(&pts(1.0), col, 1.0);
         }
@@ -1169,7 +1262,7 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
 }
 
 /// The status lines for the page.
-pub fn status(d: &Dominion, selected: &[u32]) -> String {
+pub fn status(d: &Dominion, selected: &[Entity]) -> String {
     let (planets, fleets, ships, free) = d.tally();
     let secs = d.time as u32;
     let mut s = format!(
@@ -1198,10 +1291,17 @@ pub fn status(d: &Dominion, selected: &[u32]) -> String {
             d.ships_of(o) as f32 * d.tuning.upkeep,
         ));
     }
-    let picked: Vec<usize> = selected.iter().filter_map(|id| d.fleet_index(*id)).collect();
-    match picked[..] {
-        [] => s.push_str("\nLeft-drag a box around fleets (or click one) to select them, then right-click the map to send them there."),
-        [i] => {
+    let whole = d.whole_fleets(selected);
+    let mut from: Vec<u32> = selected.iter().filter_map(|e| d.fleet_of_ship(*e)).map(|f| f.id).collect();
+    from.sort();
+    from.dedup();
+    match (&from[..], &whole[..]) {
+        ([], _) => s.push_str(
+            "\nLeft-drag a box around ships (or click a fleet) to select them, then right-click the map: \
+             ships from several fleets merge into one, part of a fleet splits off.",
+        ),
+        ([one], [w]) if one == w => {
+            let i = d.fleet_index(*one).unwrap();
             let f = &d.fleets[i];
             let who = match f.owner {
                 Owner::Side(side) => format!("{} fleet {}", SIDE_NAMES[side], d.fleet_number(i)),
@@ -1221,17 +1321,15 @@ pub fn status(d: &Dominion, selected: &[u32]) -> String {
             if f.morale == Morale::Routed {
                 s.push_str(" Routed: it no longer takes orders.");
             } else if !f.controllable() {
-                s.push_str(&format!(" Takes orders at {CONTROL_MIN} ships."));
+                s.push_str(" Independents only defend.");
             } else {
                 s.push_str(" Right-click the map to move it · keys 1–6 set its formation.");
             }
         }
         _ => {
-            let ships: u32 = picked.iter().map(|i| d.fleets[*i].ships).sum();
-            s.push_str(&format!(
-                "\nSelected: {} fleets, {ships} ships. Right-click the map to move them · keys 1–6 set their formation.",
-                picked.len()
-            ));
+            let n = selected.iter().filter(|e| d.fleet_of_ship(**e).is_some()).count();
+            let what = if from.len() == 1 { "split them off as a new fleet" } else { "form them into one fleet" };
+            s.push_str(&format!("\nSelected: {n} ships from {} fleets. Right-click the map to {what} and send it there.", from.len()));
         }
     }
     s

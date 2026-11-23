@@ -56,8 +56,8 @@ struct Proto {
     planets: usize,
     /// Fleets per side.
     fleets: usize,
-    /// Selected fleet ids.
-    selected: Vec<u32>,
+    /// Selected ships.
+    selected: Vec<Entity>,
     /// Left button held on the map: where the press started and where the
     /// cursor is now (picture pixels), and whether it became a box drag.
     drag: Option<(MapVec, MapVec, bool)>,
@@ -178,18 +178,18 @@ impl SliderParam {
             SliderParam::Sites => (3.0, 250.0, 1.0),
             SliderParam::Planets => (1.0, cfg.sites as f32, 1.0),
             SliderParam::Fleets => (1.0, MAX_FLEETS_PER_SIDE as f32, 1.0),
-            SliderParam::FleetShips => (MIN_SHIPS as f32, MAX_SHIPS as f32, 5.0),
+            SliderParam::FleetShips => (MIN_SHIPS as f32, MAX_SHIPS as f32, 1.0),
             SliderParam::WeightPerShip => (0.01, 1.0, 0.01),
             SliderParam::ReachPerWeight => (1.0, 100.0, 1.0),
             SliderParam::Production => (0.5, 30.0, 0.5),
             SliderParam::FleetSpeed => (5.0, 150.0, 1.0),
             SliderParam::CombatSpeed => (0.25, 20.0, 0.25),
-            SliderParam::Income => (0.0, 50.0, 0.5),
-            SliderParam::Population => (0.0, 20.0, 0.5),
-            SliderParam::ShipCost => (5.0, 300.0, 5.0),
-            SliderParam::Upkeep => (0.0, 2.0, 0.01),
-            SliderParam::ShotCost => (0.0, 1.0, 0.01),
-            SliderParam::RepairCost => (0.0, 20.0, 0.5),
+            SliderParam::Income => (0.0, 5.0, 0.05),
+            SliderParam::Population => (0.0, 2.0, 0.05),
+            SliderParam::ShipCost => (1.0, 50.0, 1.0),
+            SliderParam::Upkeep => (0.0, 0.5, 0.01),
+            SliderParam::ShotCost => (0.0, 0.1, 0.005),
+            SliderParam::RepairCost => (0.0, 2.0, 0.05),
             SliderParam::GrowRadius => (0.0, LabState::grow_max(cfg), 1.0),
             SliderParam::Crack => (0.5, 10.0, 0.1),
             SliderParam::Weight(_) => (0.2, 4.0, 0.1),
@@ -201,7 +201,9 @@ impl SliderParam {
             SliderParam::Sites => cfg.sites as f32,
             SliderParam::Planets => proto.planets.min(cfg.sites) as f32,
             SliderParam::Fleets => proto.fleets as f32,
-            SliderParam::FleetShips => proto.selected.first().and_then(|id| proto.d.fleet(*id)).map_or(MIN_SHIPS as f32, |f| f.ships as f32),
+            SliderParam::FleetShips => {
+                proto.d.whole_fleets(&proto.selected).first().and_then(|id| proto.d.fleet(*id)).map_or(MIN_SHIPS as f32, |f| f.ships as f32)
+            }
             SliderParam::WeightPerShip => proto.d.tuning.weight_per_ship,
             SliderParam::ReachPerWeight => proto.d.tuning.reach_per_weight,
             SliderParam::Production => proto.d.tuning.secs_per_ship,
@@ -230,12 +232,12 @@ impl SliderParam {
             SliderParam::Production => format!("{v:.1} s a ship (÷ planet value)"),
             SliderParam::FleetSpeed => format!("{v:.0} px/s (at 720 wide)"),
             SliderParam::CombatSpeed => format!("{v:.2}× the battle's rate of fire"),
-            SliderParam::Income => format!("{v:.1} credits/s per planet size"),
-            SliderParam::Population => format!("{v:.1} credits/s per planet size"),
+            SliderParam::Income => format!("{v:.2}× planet size credits/s"),
+            SliderParam::Population => format!("{v:.2} credits/s per planet size"),
             SliderParam::ShipCost => format!("{v:.0} credits a ship"),
             SliderParam::Upkeep => format!("{v:.2} credits/s a ship"),
-            SliderParam::ShotCost => format!("{v:.2} credits a shot"),
-            SliderParam::RepairCost => format!("{v:.1} credits a hull point"),
+            SliderParam::ShotCost => format!("{v:.3} credits a shot"),
+            SliderParam::RepairCost => format!("{v:.2} credits a hull point"),
             SliderParam::GrowRadius => format!("{v:.0} px"),
             SliderParam::Crack => format!("{v:.1}"),
             SliderParam::Weight(_) => format!("{v:.1}×"),
@@ -361,7 +363,7 @@ fn set_slider(param: SliderParam, v: f32, cfg: &mut VoronoiConfig, labs: &mut La
             }
         }
         SliderParam::FleetShips => {
-            for &id in &proto.selected {
+            for id in proto.d.whole_fleets(&proto.selected) {
                 proto.d.set_ships(id, v.round() as u32);
             }
         }
@@ -461,10 +463,10 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                     p,
                     "prototype01 — Fleet dominion",
                     "Real time. Every planet builds ships into its own garrison fleet (richer planets faster); \
-                     independent planets only defend. Blue and Red fleets take orders once they have 10 ships. Every \
+                     independent planets only defend. Every planet starts with as many ships as its size. Every \
                      ship is an entity in the battle's ECS, run by the battle's own systems: gun range and cone, \
                      front/flank/rear hit chances, reload, hull, closing ranks and morale, so formation and facing \
-                     matter and a beaten fleet turns shaken (gold), routs (grey) and flees off the map. Keys 1–6 set the selected fleet's \
+                     matter and a beaten fleet turns shaken (gold), routs (grey) and flees off the map. Keys 1–6 set the selected fleets' \
                      formation. A planet changes hands once its garrison is gone and an enemy fleet holds it for 3 s \
                      (ring). Patches show each fleet's influence (ships × weight per ship, reach × weight).",
                 );
@@ -511,7 +513,8 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                 slider(p, "Weight per ship", SliderParam::WeightPerShip);
                 slider(p, "Reach per weight", SliderParam::ReachPerWeight);
                 p.spawn(text(
-                    "Left-drag a box (or click a fleet) to select · Shift adds · right-click the map to send the selection there · \
+                    "Left-drag a box around ships (or click a fleet) to select · Shift adds · right-click the map to send them there: \
+                     ships from several fleets merge into one fleet, part of a fleet splits off · \
                      1 Line · 2 Wedge · 3 Crescent · 4 Echelon L · 5 Echelon R · 6 Column · wheel over the map: zoom · middle-drag: pan.",
                     12.5,
                     DIM,
@@ -967,11 +970,11 @@ pub fn proto_pointer(
     }
     // Fleets that are gone drop out of the selection.
     let d = &proto.d;
-    proto.selected.retain(|id| d.fleet(*id).is_some());
-    // Keys 1–6 set the selected fleets' formation.
+    proto.selected.retain(|e| d.fleet_of_ship(*e).is_some());
+    // Keys 1–6 set the wholly selected fleets' formation.
     const KEYS: [KeyCode; 6] = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4, KeyCode::Digit5, KeyCode::Digit6];
     if let Some(k) = KEYS.iter().position(|k| keys.just_pressed(*k)) {
-        for &id in &proto.selected {
+        for id in proto.d.whole_fleets(&proto.selected) {
             proto.d.set_formation(id, Formation::PLAYER[k]);
         }
     }
@@ -1021,44 +1024,36 @@ pub fn proto_pointer(
             if !shift {
                 proto.selected.clear();
             }
-            let picked: Vec<u32> = if boxed {
-                // Controllable fleets with a ship (or their centre) inside the box.
-                let (a, b) = (proto.camera.to_world(from), proto.camera.to_world(screen));
-                let (lo, hi) = (a.min(b), a.max(b));
-                let inside = |q: MapVec| q.cmpge(lo).all() && q.cmple(hi).all();
-                proto
-                    .d
-                    .fleets
-                    .iter()
-                    .filter(|f| f.controllable() && (inside(f.pos) || f.ship_px.iter().any(|s| inside(s.0))))
-                    .map(|f| f.id)
-                    .collect()
-            } else {
-                // About 10 picture pixels, in world units.
-                proto.d.fleet_at(proto.camera.to_world(from), 10.0 / proto.camera.zoom).into_iter().collect()
-            };
-            for id in picked {
-                match proto.selected.iter().position(|s| *s == id) {
-                    // Shift-click on a selected fleet takes it out.
-                    Some(i) if shift && !boxed => {
-                        proto.selected.remove(i);
+            if boxed {
+                // Ships of controllable fleets inside the box.
+                let ships = proto.d.ships_in_box(proto.camera.to_world(from), proto.camera.to_world(screen));
+                for e in ships {
+                    if !proto.selected.contains(&e) {
+                        proto.selected.push(e);
                     }
-                    Some(_) => {}
-                    None => proto.selected.push(id),
+                }
+            } else if let Some(f) = proto.d.fleet_at(proto.camera.to_world(from), 10.0 / proto.camera.zoom).and_then(|id| proto.d.fleet(id))
+            {
+                // A click takes the whole fleet (about 10 picture pixels).
+                // Shift-click on a fully selected fleet takes it out.
+                let ids = f.ship_ids.clone();
+                if shift && ids.iter().all(|e| proto.selected.contains(e)) {
+                    proto.selected.retain(|e| !ids.contains(e));
+                } else {
+                    for e in ids {
+                        if !proto.selected.contains(&e) {
+                            proto.selected.push(e);
+                        }
+                    }
                 }
             }
         }
     }
-    // Right click: the selection moves there, keeping its spacing.
+    // Right click: the selected ships become one fleet and go there
+    // (several fleets merge, part of a fleet splits off).
     if mouse.just_pressed(MouseButton::Right) && over {
-        let movers: Vec<(u32, MapVec)> =
-            proto.selected.iter().filter_map(|id| proto.d.fleet(*id)).filter(|f| f.controllable()).map(|f| (f.id, f.pos)).collect();
-        if !movers.is_empty() {
-            let centre = movers.iter().map(|m| m.1).sum::<MapVec>() / movers.len() as f32;
-            for (id, pos) in movers {
-                proto.d.order_move(id, p + (pos - centre));
-            }
-        }
+        let ships = proto.selected.clone();
+        proto.d.form_fleet(&ships, p);
     }
 }
 
@@ -1242,7 +1237,7 @@ pub fn update_lab_ui(
         }
     }
     for (v, mut t) in &mut values {
-        let s = if v.0 == SliderParam::FleetShips && labs.proto.selected.first().and_then(|id| labs.proto.d.fleet(*id)).is_none() {
+        let s = if v.0 == SliderParam::FleetShips && labs.proto.d.whole_fleets(&labs.proto.selected).is_empty() {
             "select a fleet".to_string()
         } else {
             v.0.label(v.0.get(&c, st, &labs.proto))
