@@ -161,6 +161,12 @@ pub enum SliderParam {
     Production,
     FleetSpeed,
     CombatSpeed,
+    Income,
+    Population,
+    ShipCost,
+    Upkeep,
+    ShotCost,
+    RepairCost,
     GrowRadius,
     Crack,
     Weight(usize),
@@ -178,6 +184,12 @@ impl SliderParam {
             SliderParam::Production => (0.5, 30.0, 0.5),
             SliderParam::FleetSpeed => (5.0, 150.0, 1.0),
             SliderParam::CombatSpeed => (0.25, 20.0, 0.25),
+            SliderParam::Income => (0.0, 50.0, 0.5),
+            SliderParam::Population => (0.0, 20.0, 0.5),
+            SliderParam::ShipCost => (5.0, 300.0, 5.0),
+            SliderParam::Upkeep => (0.0, 2.0, 0.01),
+            SliderParam::ShotCost => (0.0, 1.0, 0.01),
+            SliderParam::RepairCost => (0.0, 20.0, 0.5),
             SliderParam::GrowRadius => (0.0, LabState::grow_max(cfg), 1.0),
             SliderParam::Crack => (0.5, 10.0, 0.1),
             SliderParam::Weight(_) => (0.2, 4.0, 0.1),
@@ -195,6 +207,12 @@ impl SliderParam {
             SliderParam::Production => proto.d.tuning.secs_per_ship,
             SliderParam::FleetSpeed => proto.d.tuning.speed,
             SliderParam::CombatSpeed => proto.d.tuning.combat_speed,
+            SliderParam::Income => proto.d.tuning.income,
+            SliderParam::Population => proto.d.tuning.population,
+            SliderParam::ShipCost => proto.d.tuning.ship_cost,
+            SliderParam::Upkeep => proto.d.tuning.upkeep,
+            SliderParam::ShotCost => proto.d.tuning.shot_cost,
+            SliderParam::RepairCost => proto.d.tuning.repair_cost,
             SliderParam::GrowRadius => st.grow_radius,
             SliderParam::Crack => st.crack,
             SliderParam::Weight(i) => st.weights[i],
@@ -212,6 +230,12 @@ impl SliderParam {
             SliderParam::Production => format!("{v:.1} s a ship (÷ planet value)"),
             SliderParam::FleetSpeed => format!("{v:.0} px/s (at 720 wide)"),
             SliderParam::CombatSpeed => format!("{v:.2}× the battle's rate of fire"),
+            SliderParam::Income => format!("{v:.1} credits/s per planet size"),
+            SliderParam::Population => format!("{v:.1} credits/s per planet size"),
+            SliderParam::ShipCost => format!("{v:.0} credits a ship"),
+            SliderParam::Upkeep => format!("{v:.2} credits/s a ship"),
+            SliderParam::ShotCost => format!("{v:.2} credits a shot"),
+            SliderParam::RepairCost => format!("{v:.1} credits a hull point"),
             SliderParam::GrowRadius => format!("{v:.0} px"),
             SliderParam::Crack => format!("{v:.1}"),
             SliderParam::Weight(_) => format!("{v:.1}×"),
@@ -346,6 +370,12 @@ fn set_slider(param: SliderParam, v: f32, cfg: &mut VoronoiConfig, labs: &mut La
         SliderParam::Production => proto.d.tuning.secs_per_ship = v,
         SliderParam::FleetSpeed => proto.d.tuning.speed = v,
         SliderParam::CombatSpeed => proto.d.tuning.combat_speed = v,
+        SliderParam::Income => proto.d.tuning.income = v,
+        SliderParam::Population => proto.d.tuning.population = v,
+        SliderParam::ShipCost => proto.d.tuning.ship_cost = v,
+        SliderParam::Upkeep => proto.d.tuning.upkeep = v,
+        SliderParam::ShotCost => proto.d.tuning.shot_cost = v,
+        SliderParam::RepairCost => proto.d.tuning.repair_cost = v,
         SliderParam::GrowRadius => {
             labs.state.grow_radius = v;
             if labs.playing == Some(LabId::Grow) {
@@ -471,6 +501,12 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                 slider(p, "Production", SliderParam::Production);
                 slider(p, "Fleet speed", SliderParam::FleetSpeed);
                 slider(p, "Combat speed", SliderParam::CombatSpeed);
+                slider(p, "Income", SliderParam::Income);
+                slider(p, "Population", SliderParam::Population);
+                slider(p, "Ship cost", SliderParam::ShipCost);
+                slider(p, "Upkeep", SliderParam::Upkeep);
+                slider(p, "Shot cost", SliderParam::ShotCost);
+                slider(p, "Repair cost", SliderParam::RepairCost);
                 slider(p, "Selected ships", SliderParam::FleetShips);
                 slider(p, "Weight per ship", SliderParam::WeightPerShip);
                 slider(p, "Reach per weight", SliderParam::ReachPerWeight);

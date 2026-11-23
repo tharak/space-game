@@ -54,6 +54,8 @@ fn the_world_starts_with_home_planets_fleets_and_garrisons() {
 fn planets_build_ships_into_their_garrison() {
     let mut d = world();
     d.tuning.secs_per_ship = 6.0;
+    // Build mechanics only: upkeep would stop Blue's lone planet building.
+    d.tuning.upkeep = 0.0;
     let home = d.planets.iter().position(|p| p.owner == BLUE).unwrap();
     d.planets[home].value = 2;
     // Blue's home has no garrison yet: the first ship starts one.
@@ -233,4 +235,97 @@ fn a_fleet_sent_at_a_planet_takes_it() {
     assert!(d.order_move(blue, p.pos));
     d.step(90.0);
     assert_eq!(d.planets[i].owner, BLUE);
+}
+
+/// Blue's home planet of size 2 and nothing else on the map.
+fn economy() -> (Dominion, usize) {
+    let mut d = world();
+    d.clear_fleets();
+    let home = d.planets.iter().position(|p| p.owner == BLUE).unwrap();
+    for (i, p) in d.planets.iter_mut().enumerate() {
+        p.value = if i == home { 2 } else { 0 };
+    }
+    d.tuning.secs_per_ship = 0.5;
+    (d, home)
+}
+
+#[test]
+fn ships_cost_credits_and_wait_when_short() {
+    let (mut d, _) = economy();
+    d.tuning.upkeep = 0.0;
+    d.tuning.ship_cost = 100.0;
+    d.credits[0] = 250.0;
+    d.tuning.income = 0.0;
+    d.tuning.population = 0.0;
+    d.step(10.0);
+    // Two ships bought, then the planet waits for credits.
+    assert_eq!(d.ships_of(BLUE), 2);
+    assert!((d.credits_of(BLUE) - 50.0).abs() < 1e-3);
+}
+
+#[test]
+fn planets_earn_by_size_minus_population() {
+    let (mut d, _) = economy();
+    d.tuning.ship_cost = 1e6;
+    d.credits[0] = 0.0;
+    d.step(10.0);
+    // Size 2 × (10 − 2) a second for 10 s.
+    assert!((d.credits_of(BLUE) - 160.0).abs() < 1.0, "{}", d.credits_of(BLUE));
+}
+
+#[test]
+fn upkeep_caps_the_fleet_at_what_planets_can_pay() {
+    let (mut d, _) = economy();
+    d.tuning.ship_cost = 1.0;
+    d.credits[0] = 10_000.0;
+    // 16 credits a second pay for 160 ships at 0.1 each.
+    d.step(120.0);
+    assert_eq!(d.ships_of(BLUE), 160);
+    assert!(d.net_income(BLUE) >= 0.0);
+}
+
+#[test]
+fn unpaid_upkeep_makes_ships_desert() {
+    let (mut d, _) = economy();
+    d.tuning.ship_cost = 1e6;
+    let id = d.add_fleet(BLUE, Vec2::new(360.0, 200.0), 0.0, 300, None);
+    d.credits[0] = 0.0;
+    // 300 ships cost 30 a second against an income of 16.
+    d.step(MAINTENANCE_SECS * 6.0 + 0.05);
+    let left = ships(&d, id);
+    assert!((150..300).contains(&left), "{left}");
+    assert!(d.deserted[0] > 0);
+    // It settles near what the planet pays for.
+    d.step(120.0);
+    assert!((155..=165).contains(&ships(&d, id)), "{}", ships(&d, id));
+}
+
+#[test]
+fn shots_cost_credits_and_a_broke_side_cannot_fire() {
+    let (mut d, a, b) = duel((BLUE, Vec2::new(300.0, 200.0), 0.0, 30), (RED, Vec2::new(325.0, 200.0), WEST, 30));
+    d.tuning.upkeep = 0.0;
+    d.credits[1] = 0.0;
+    d.step(20.0);
+    assert!(d.credits_of(BLUE) < START_CREDITS);
+    assert!(d.shots.iter().all(|s| s.2 == 0), "Red fired with no credits");
+    assert!(ships(&d, b) < 30);
+    assert_eq!(ships(&d, a), 30);
+}
+
+#[test]
+fn the_maintenance_phase_repairs_fleets_out_of_combat() {
+    use crate::sim::components::Ship;
+    let (mut d, _) = economy();
+    d.tuning.ship_cost = 1e6;
+    d.tuning.upkeep = 0.0;
+    d.add_fleet(BLUE, Vec2::new(360.0, 200.0), 0.0, 10, None);
+    for mut s in d.world.query::<&mut Ship>().iter_mut(&mut d.world) {
+        s.hull = 1.0;
+    }
+    let before = d.credits_of(BLUE);
+    d.step(MAINTENANCE_SECS + 0.05);
+    assert!(d.world.query::<&Ship>().iter(&d.world).all(|s| s.hull == s.max_hull));
+    // 10 ships × 4 hull points × 2 credits, less the income meanwhile.
+    let income = 16.0 * (MAINTENANCE_SECS + 0.05);
+    assert!((before + income - d.credits_of(BLUE) - 80.0).abs() < 2.0, "{}", d.credits_of(BLUE));
 }

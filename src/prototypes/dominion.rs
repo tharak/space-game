@@ -10,12 +10,18 @@
 //! garrison is gone and an enemy fleet has held it for a few seconds.
 //! Influence patches (weight = ships × weight per ship, reach = reach per
 //! weight × weight) show who dominates where.
+//!
+//! Economy: one resource (credits), a stockpile per owner. Planets earn
+//! income and feed their population by size; a ship costs credits to
+//! build, every shot costs credits, and every few seconds a maintenance
+//! phase pays the fleets' upkeep (unpaid ships desert) and repairs damaged
+//! ships out of combat. An owner out of credits can't fire.
 
 use bevy::ecs::message::Messages;
 use bevy::prelude::{Entity, Rect, World};
 
 use crate::sim::battle::{Battle, DT, SimEvent, Tuning as BattleTuning};
-use crate::sim::components::{Division, Heading, InDivision, Morale, Order, Pos};
+use crate::sim::components::{Division, Heading, InDivision, Morale, Order, Pos, Ship, Weapon};
 pub use crate::sim::formation::Formation;
 use crate::sim::formation::SHIP_DART;
 use crate::voronoi::Vec2;
@@ -47,6 +53,12 @@ pub const REFERENCE_WIDTH: f32 = 720.0;
 /// The other side's best fleet within this fraction contests the ground.
 pub const CONTEST_MARGIN: f32 = 0.10;
 pub const SIDE_NAMES: [&str; 2] = ["Blue", "Red"];
+/// Seconds between maintenance phases (upkeep and repairs).
+pub const MAINTENANCE_SECS: f32 = 5.0;
+/// Credits Blue and Red start with.
+pub const START_CREDITS: f32 = 500.0;
+/// Credits each independent planet starts with.
+pub const INDEPENDENT_CREDITS: f32 = 100.0;
 const SIDE_COLORS: [Rgb; 2] = [[70, 130, 220], [215, 80, 70]];
 
 /// The prototype's sliders.
@@ -63,13 +75,37 @@ pub struct Tuning {
     /// Multiplies the battle's rate of fire, so map fights take seconds,
     /// not minutes; the rules' proportions are unchanged.
     pub combat_speed: f32,
+    /// Credits a second a planet earns per point of size (value 1–3).
+    pub income: f32,
+    /// Credits a second its population needs per point of size.
+    pub population: f32,
+    /// Credits to build one ship.
+    pub ship_cost: f32,
+    /// Credits a second each ship costs, paid at the maintenance phase.
+    pub upkeep: f32,
+    /// Credits per shot fired.
+    pub shot_cost: f32,
+    /// Credits per hull point repaired at the maintenance phase.
+    pub repair_cost: f32,
 }
 
 impl Default for Tuning {
     fn default() -> Self {
         // Building must stay slower than a fleet in range can kill: 60 ships
         // firing at the front kill about 0.5 ships a second.
-        Self { weight_per_ship: 0.1, reach_per_weight: 14.0, secs_per_ship: 15.0, speed: 30.0, combat_speed: 3.0 }
+        Self {
+            weight_per_ship: 0.1,
+            reach_per_weight: 14.0,
+            secs_per_ship: 15.0,
+            speed: 30.0,
+            combat_speed: 3.0,
+            income: 10.0,
+            population: 2.0,
+            ship_cost: 50.0,
+            upkeep: 0.1,
+            shot_cost: 0.05,
+            repair_cost: 2.0,
+        }
     }
 }
 
@@ -105,7 +141,7 @@ impl Owner {
 pub struct Planet {
     pub site: usize,
     pub pos: Vec2,
-    /// Build rate multiplier, 1 (poor) to 3 (rich).
+    /// Size, 1 (small) to 3 (large): build rate, income and population.
     pub value: u32,
     pub owner: Owner,
     /// Progress toward the next ship, 0..1.
@@ -170,6 +206,13 @@ pub struct Dominion {
     pub shots: Vec<Shot>,
     /// Explosions: where (pixels) and age.
     pub booms: Vec<(Vec2, f32)>,
+    /// Credits per owner: Blue, Red, then each planet's independents
+    /// (see `purse`). Below zero only between maintenance phases.
+    pub credits: Vec<f32>,
+    /// Seconds since the last maintenance phase.
+    pub maintenance_timer: f32,
+    /// Ships lost to unpaid upkeep, per side (Blue, Red).
+    pub deserted: [u32; 2],
     next_id: u32,
     pub time: f32,
     /// Leftover time below one tick.
@@ -243,12 +286,16 @@ impl Dominion {
             world,
             shots: Vec::new(),
             booms: Vec::new(),
+            credits: Vec::new(),
+            maintenance_timer: 0.0,
+            deserted: [0; 2],
             next_id: 1,
             time: 0.0,
             pending: 0.0,
             applied: Some(tuning),
             face_timer: 0.0,
         };
+        d.credits = [START_CREDITS; 2].into_iter().chain(std::iter::repeat_n(INDEPENDENT_CREDITS, d.planets.len())).collect();
         if d.planets.len() < 2 {
             return d;
         }
@@ -349,6 +396,33 @@ impl Dominion {
         25.0 * self.scale()
     }
 
+    /// Index of an owner's stockpile in `credits`.
+    pub fn purse(owner: Owner) -> usize {
+        match owner {
+            Owner::Side(s) => s,
+            Owner::Independent(i) => 2 + i,
+        }
+    }
+
+    pub fn credits_of(&self, owner: Owner) -> f32 {
+        self.credits.get(Self::purse(owner)).copied().unwrap_or(0.0)
+    }
+
+    /// Credits a second an owner's planets earn after feeding their people.
+    pub fn planet_income(&self, owner: Owner) -> f32 {
+        let t = &self.tuning;
+        self.planets.iter().filter(|p| p.owner == owner).map(|p| p.value as f32 * (t.income - t.population)).sum()
+    }
+
+    pub fn ships_of(&self, owner: Owner) -> u32 {
+        self.fleets.iter().filter(|f| f.owner == owner).map(|f| f.ships).sum()
+    }
+
+    /// Credits a second after planets and upkeep (shots not counted).
+    pub fn net_income(&self, owner: Owner) -> f32 {
+        self.planet_income(owner) - self.ships_of(owner) as f32 * self.tuning.upkeep
+    }
+
     pub fn fleet(&self, id: u32) -> Option<&Fleet> {
         self.fleets.iter().find(|f| f.id == id)
     }
@@ -437,7 +511,9 @@ impl Dominion {
             self.applied = Some(self.tuning);
         }
         self.time += DT;
+        self.earn(DT);
         self.produce(DT);
+        self.hold_fire();
         self.face_timer += DT;
         if self.face_timer >= 0.5 {
             self.face_timer = 0.0;
@@ -456,13 +532,119 @@ impl Dominion {
         let events: Vec<SimEvent> = self.world.resource_mut::<Messages<SimEvent>>().drain().collect();
         for ev in events {
             match ev {
-                SimEvent::Shot { from, to, side, hit } => self.shots.push((from * unit, to * unit, side, hit, 0.0)),
+                SimEvent::Shot { from, to, side, hit } => {
+                    self.pay_for_shot(from * unit, side);
+                    self.shots.push((from * unit, to * unit, side, hit, 0.0));
+                }
                 SimEvent::Destroyed { pos, .. } => self.booms.push((pos * unit, 0.0)),
                 _ => {}
             }
         }
         self.sync();
         self.capture(DT);
+        self.maintenance_timer += DT;
+        if self.maintenance_timer >= MAINTENANCE_SECS - 1e-4 {
+            self.maintenance_timer = 0.0;
+            self.maintain();
+        }
+    }
+
+    /// Planets earn income and feed their population, every tick.
+    fn earn(&mut self, dt: f32) {
+        let t = self.tuning;
+        for p in &self.planets {
+            if let Some(c) = self.credits.get_mut(Self::purse(p.owner)) {
+                *c += dt * p.value as f32 * (t.income - t.population);
+            }
+        }
+    }
+
+    /// The shooter's owner pays for the shot (independents: the nearest
+    /// independent fleet's planet).
+    fn pay_for_shot(&mut self, from: Vec2, side: usize) {
+        let owner = if side < 2 {
+            Some(Owner::Side(side))
+        } else {
+            self.fleets
+                .iter()
+                .filter(|f| f.owner.side() == side)
+                .min_by(|a, b| a.pos.distance(from).total_cmp(&b.pos.distance(from)))
+                .map(|f| f.owner)
+        };
+        if let Some(c) = owner.and_then(|o| self.credits.get_mut(Self::purse(o))) {
+            *c -= self.tuning.shot_cost;
+        }
+    }
+
+    /// Owners out of credits can't fire: their guns stay unloaded.
+    fn hold_fire(&mut self) {
+        let broke: Vec<Entity> = self.fleets.iter().filter(|f| self.credits_of(f.owner) <= 0.0).map(|f| f.division).collect();
+        if broke.is_empty() {
+            return;
+        }
+        for (d, mut w) in self.world.query::<(&InDivision, &mut Weapon)>().iter_mut(&mut self.world) {
+            if broke.contains(&d.0) {
+                w.cooldown = w.cooldown.max(2.0 * DT);
+            }
+        }
+    }
+
+    /// The maintenance phase: every owner pays its fleets' upkeep (ships it
+    /// can't pay for desert, from its biggest fleets), then repairs the
+    /// damaged ships of fleets out of combat while credits last.
+    fn maintain(&mut self) {
+        let per_ship = self.tuning.upkeep * MAINTENANCE_SECS;
+        for purse in 0..self.credits.len() {
+            let owner = if purse < 2 { Owner::Side(purse) } else { Owner::Independent(purse - 2) };
+            let ships = self.ships_of(owner);
+            self.credits[purse] -= ships as f32 * per_ship;
+            if self.credits[purse] >= 0.0 {
+                continue;
+            }
+            let short = -self.credits[purse];
+            self.credits[purse] = 0.0;
+            if per_ship <= 0.0 {
+                continue;
+            }
+            let mut cut = ((short / per_ship).ceil() as u32).min(ships);
+            if let Owner::Side(s) = owner {
+                self.deserted[s] += cut;
+            }
+            // One at a time from whichever fleet is biggest.
+            let mut fleets: Vec<(Entity, u32)> = self.fleets.iter().filter(|f| f.owner == owner).map(|f| (f.division, f.ships)).collect();
+            let mut take = vec![0u32; fleets.len()];
+            while cut > 0 {
+                let Some(i) = (0..fleets.len()).filter(|i| fleets[*i].1 > 0).max_by_key(|i| fleets[*i].1) else { break };
+                fleets[i].1 -= 1;
+                take[i] += 1;
+                cut -= 1;
+            }
+            for (i, (e, _)) in fleets.iter().enumerate() {
+                if take[i] > 0 {
+                    crate::sim::remove_ships(&mut self.world, *e, take[i] as usize);
+                }
+            }
+        }
+        // Repairs, for fleets not fighting.
+        let owners: std::collections::HashMap<Entity, Owner> =
+            self.fleets.iter().filter(|f| !f.engaged).map(|f| (f.division, f.owner)).collect();
+        let cost = self.tuning.repair_cost;
+        let credits = &mut self.credits;
+        for (d, mut ship) in self.world.query::<(&InDivision, &mut Ship)>().iter_mut(&mut self.world) {
+            let Some(owner) = owners.get(&d.0) else { continue };
+            let missing = ship.max_hull - ship.hull;
+            if missing <= 0.0 {
+                continue;
+            }
+            let c = &mut credits[Self::purse(*owner)];
+            let fix = if cost > 0.0 { missing.min(*c / cost) } else { missing };
+            if fix <= 0.0 {
+                continue;
+            }
+            ship.hull += fix;
+            *c -= fix * cost;
+        }
+        self.sync();
     }
 
     /// Reads every fleet back from its division; drops the empty ones.
@@ -538,6 +720,13 @@ impl Dominion {
         let _ = unit;
     }
 
+    /// Whether an owner can pay for one more ship now and keep paying its
+    /// upkeep from its planets' income.
+    fn can_build(&self, owner: Owner) -> bool {
+        let t = &self.tuning;
+        self.credits_of(owner) >= t.ship_cost && self.planet_income(owner) >= (self.ships_of(owner) + 1) as f32 * t.upkeep
+    }
+
     fn produce(&mut self, dt: f32) {
         let secs = self.tuning.secs_per_ship.max(0.1);
         for i in 0..self.planets.len() {
@@ -550,7 +739,13 @@ impl Dominion {
             }
             self.planets[i].build += dt * value as f32 / secs;
             while self.planets[i].build >= 1.0 {
+                // Short of credits or of income for its upkeep: the ship waits.
+                if !self.can_build(owner) {
+                    self.planets[i].build = 1.0;
+                    break;
+                }
                 self.planets[i].build -= 1.0;
+                self.credits[Self::purse(owner)] -= self.tuning.ship_cost;
                 match self.fleets.iter().position(|f| f.home == Some(i) && f.owner == owner) {
                     Some(g) => {
                         crate::sim::add_ships(&mut self.world, self.fleets[g].division, 1);
@@ -989,6 +1184,20 @@ pub fn status(d: &Dominion, selected: &[u32]) -> String {
         ships[1],
         free
     );
+    for (side, name) in SIDE_NAMES.iter().enumerate() {
+        let o = Owner::Side(side);
+        let net = d.net_income(o);
+        let broke = if d.credits_of(o) <= 0.0 { " · OUT OF CREDITS, can't fire" } else { "" };
+        let gone = if d.deserted[side] > 0 { format!(" · {} ships deserted", d.deserted[side]) } else { String::new() };
+        s.push_str(&format!(
+            "\n{}: {:.0} credits, {:+.1}/s (planets {:+.1}, upkeep −{:.1}){broke}{gone}",
+            name,
+            d.credits_of(o),
+            net,
+            d.planet_income(o),
+            d.ships_of(o) as f32 * d.tuning.upkeep,
+        ));
+    }
     let picked: Vec<usize> = selected.iter().filter_map(|id| d.fleet_index(*id)).collect();
     match picked[..] {
         [] => s.push_str("\nLeft-drag a box around fleets (or click one) to select them, then right-click the map to send them there."),
