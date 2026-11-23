@@ -182,12 +182,12 @@ fn deterministic_and_renders() {
     // A fixed-size picture, whatever the map size or zoom.
     let mut view = View::fit(&a.cfg, VIEW_W, VIEW_H);
     let bg = render_background(&a, &view, true, 1);
-    let c = render(&a, &bg, &view, DrawOptions::default());
+    let c = render(&a, &bg, &view, &DrawOptions::default());
     assert_eq!(render_background(&a, &view, true, 2).px.len(), bg.px.len());
     assert_eq!((c.w, c.h), (VIEW_W, VIEW_H));
     view.zoom_at(Vec2::new(700.0, 400.0), 4.0, &a.cfg);
     let bg = render_background(&a, &view, true, 1);
-    assert_eq!(render(&a, &bg, &view, DrawOptions::default()).px.len(), c.px.len());
+    assert_eq!(render(&a, &bg, &view, &DrawOptions::default()).px.len(), c.px.len());
 }
 
 #[test]

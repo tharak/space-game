@@ -18,9 +18,9 @@ fn main() {
         let t = std::time::Instant::now();
         let bg = render_background(d, &view, true, 1);
         let t_bg = t.elapsed();
-        let opts = DrawOptions { selected: d.fleets.first().map(|f| f.id), ..Default::default() };
+        let opts = DrawOptions { selected: d.fleets.first().map(|f| f.id).into_iter().collect(), ..Default::default() };
         let t = std::time::Instant::now();
-        let frame = render(d, &bg, &view, opts);
+        let frame = render(d, &bg, &view, &opts);
         println!("{name}: background {:.1} ms, frame {:.1} ms", t_bg.as_secs_f32() * 1e3, t.elapsed().as_secs_f32() * 1e3);
         std::fs::write(format!("{dir}/{name}.ppm"), frame.to_ppm()).expect("write ppm");
         // And a 4× close-up of Blue's first fleet.
@@ -29,8 +29,8 @@ fn main() {
             close.zoom_at(view.to_screen(f.pos), 4.0, &d.cfg);
         }
         let bg = render_background(d, &close, true, 1);
-        std::fs::write(format!("{dir}/{name}-zoom.ppm"), render(d, &bg, &close, opts).to_ppm()).expect("write ppm");
-        println!("{name}: {}", status(d, None).replace('\n', " | "));
+        std::fs::write(format!("{dir}/{name}-zoom.ppm"), render(d, &bg, &close, &opts).to_ppm()).expect("write ppm");
+        println!("{name}: {}", status(d, &[]).replace('\n', " | "));
     };
     // Every commandable fleet goes for the nearest independent planet.
     let orders: Vec<(u32, _)> = d

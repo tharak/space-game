@@ -671,18 +671,21 @@ impl Influence {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DrawOptions {
     pub regions: bool,
     pub borders: bool,
-    pub selected: Option<u32>,
+    /// Selected fleet ids.
+    pub selected: Vec<u32>,
+    /// A selection box being dragged, two corners in picture pixels.
+    pub marquee: Option<(Vec2, Vec2)>,
     /// Patch sampling step in pixels.
     pub step: u32,
 }
 
 impl Default for DrawOptions {
     fn default() -> Self {
-        Self { regions: true, borders: true, selected: None, step: 3 }
+        Self { regions: true, borders: true, selected: Vec::new(), marquee: None, step: 3 }
     }
 }
 
@@ -827,7 +830,7 @@ pub fn tones(d: &Dominion) -> Vec<Rgb> {
 }
 
 /// Patches, planets and ships over a cached background, through `view`.
-pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: DrawOptions) -> Canvas {
+pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions) -> Canvas {
     let (w, h) = (view.w, view.h);
     let mut c = background.clone();
     let tones = tones(d);
@@ -915,13 +918,13 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: DrawOptions)
         c.disc(at, r + 1.0, INK, 1.0);
         c.disc(at, r, [230, 220, 170], 1.0);
     }
-    // Destination of the selected fleet.
-    if let Some(f) = opts.selected.and_then(|id| d.fleet(id))
-        && let Some(dest) = f.dest
-    {
-        let (a, b) = (view.to_screen(f.pos), view.to_screen(dest));
-        c.dashed_line(a, b, 6.0, 5.0, GOLD, 0.9);
-        c.circle(b, 5.0, GOLD, 1.0);
+    // Destinations of the selected fleets.
+    for f in opts.selected.iter().filter_map(|id| d.fleet(*id)) {
+        if let Some(dest) = f.dest {
+            let (a, b) = (view.to_screen(f.pos), view.to_screen(dest));
+            c.dashed_line(a, b, 6.0, 5.0, GOLD, 0.9);
+            c.circle(b, 5.0, GOLD, 1.0);
+        }
     }
     // Shots, then ships (each ECS ship where it is), then explosions.
     for (from, to, side, hit, age) in &d.shots {
@@ -933,7 +936,7 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: DrawOptions)
     for (i, f) in d.fleets.iter().enumerate() {
         let ships: Vec<(Vec2, f32)> = f.ship_px.iter().map(|(p, h)| (view.to_screen(*p), *h)).collect();
         let centre = view.to_screen(f.pos);
-        if opts.selected == Some(f.id) {
+        if opts.selected.contains(&f.id) {
             let r = ships.iter().map(|s| s.0.distance(centre)).fold(0.0, f32::max) + 7.0;
             c.circle(centre, r, GOLD, 1.0);
             c.circle(centre, r + 1.0, GOLD, 1.0);
@@ -959,11 +962,19 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: DrawOptions)
         let k = age / BOOM_SECS;
         c.circle(view.to_screen(*p), (3.0 + 9.0 * k) * (z * d.scale()).clamp(0.6, 2.0), HIT, (1.0 - k) * 0.9);
     }
+    // The selection box being dragged.
+    if let Some((a, b)) = opts.marquee {
+        let (lo, hi) = (a.min(b), a.max(b));
+        let corners = [lo, Vec2::new(hi.x, lo.y), hi, Vec2::new(lo.x, hi.y)];
+        for k in 0..4 {
+            c.line(corners[k], corners[(k + 1) % 4], 1.0, [120, 220, 140], 0.9);
+        }
+    }
     c
 }
 
 /// The status lines for the page.
-pub fn status(d: &Dominion, selected: Option<u32>) -> String {
+pub fn status(d: &Dominion, selected: &[u32]) -> String {
     let (planets, fleets, ships, free) = d.tally();
     let secs = d.time as u32;
     let mut s = format!(
@@ -978,8 +989,10 @@ pub fn status(d: &Dominion, selected: Option<u32>) -> String {
         ships[1],
         free
     );
-    match selected.and_then(|id| d.fleet_index(id)) {
-        Some(i) => {
+    let picked: Vec<usize> = selected.iter().filter_map(|id| d.fleet_index(*id)).collect();
+    match picked[..] {
+        [] => s.push_str("\nLeft-drag a box around fleets (or click one) to select them, then right-click the map to send them there."),
+        [i] => {
             let f = &d.fleets[i];
             let who = match f.owner {
                 Owner::Side(side) => format!("{} fleet {}", SIDE_NAMES[side], d.fleet_number(i)),
@@ -1001,10 +1014,16 @@ pub fn status(d: &Dominion, selected: Option<u32>) -> String {
             } else if !f.controllable() {
                 s.push_str(&format!(" Takes orders at {CONTROL_MIN} ships."));
             } else {
-                s.push_str(" Click the map to move it · keys 1–6 set its formation.");
+                s.push_str(" Right-click the map to move it · keys 1–6 set its formation.");
             }
         }
-        None => s.push_str("\nClick a fleet with 10+ ships to select it, then click the map to send it there."),
+        _ => {
+            let ships: u32 = picked.iter().map(|i| d.fleets[*i].ships).sum();
+            s.push_str(&format!(
+                "\nSelected: {} fleets, {ships} ships. Right-click the map to move them · keys 1–6 set their formation.",
+                picked.len()
+            ));
+        }
     }
     s
 }

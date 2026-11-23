@@ -56,10 +56,11 @@ struct Proto {
     planets: usize,
     /// Fleets per side.
     fleets: usize,
-    /// Selected fleet id.
-    selected: Option<u32>,
-    /// A press on a fleet: its id and where the press started.
-    drag: Option<(u32, MapVec)>,
+    /// Selected fleet ids.
+    selected: Vec<u32>,
+    /// Left button held on the map: where the press started and where the
+    /// cursor is now (picture pixels), and whether it became a box drag.
+    drag: Option<(MapVec, MapVec, bool)>,
     regions: bool,
     borders: bool,
     paused: bool,
@@ -72,7 +73,7 @@ struct Proto {
     since_render: f32,
     /// The camera: the picture is always VIEW_W × VIEW_H.
     camera: View,
-    /// Panning with the right or middle button: last cursor position.
+    /// Panning with the middle button: last cursor position.
     pan_from: Option<Vec2>,
     /// Seconds since the camera last moved (coarse background until it settles).
     camera_still: f32,
@@ -83,7 +84,7 @@ impl Proto {
     /// A fresh world (after a size, count or config change) and a fitted camera.
     fn rebuild(&mut self, cfg: &VoronoiConfig) {
         self.d = Dominion::new(&proto_cfg(cfg, self.size), self.planets, self.fleets, self.d.tuning);
-        self.selected = None;
+        self.selected.clear();
         self.camera = View::fit(&self.d.cfg, VIEW_W, VIEW_H);
     }
 }
@@ -188,7 +189,7 @@ impl SliderParam {
             SliderParam::Sites => cfg.sites as f32,
             SliderParam::Planets => proto.planets.min(cfg.sites) as f32,
             SliderParam::Fleets => proto.fleets as f32,
-            SliderParam::FleetShips => proto.selected.and_then(|id| proto.d.fleet(id)).map_or(MIN_SHIPS as f32, |f| f.ships as f32),
+            SliderParam::FleetShips => proto.selected.first().and_then(|id| proto.d.fleet(*id)).map_or(MIN_SHIPS as f32, |f| f.ships as f32),
             SliderParam::WeightPerShip => proto.d.tuning.weight_per_ship,
             SliderParam::ReachPerWeight => proto.d.tuning.reach_per_weight,
             SliderParam::Production => proto.d.tuning.secs_per_ship,
@@ -336,7 +337,7 @@ fn set_slider(param: SliderParam, v: f32, cfg: &mut VoronoiConfig, labs: &mut La
             }
         }
         SliderParam::FleetShips => {
-            if let Some(id) = proto.selected {
+            for &id in &proto.selected {
                 proto.d.set_ships(id, v.round() as u32);
             }
         }
@@ -386,7 +387,7 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
         size,
         planets,
         fleets,
-        selected: None,
+        selected: Vec::new(),
         drag: None,
         regions: true,
         borders: true,
@@ -474,8 +475,8 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                 slider(p, "Weight per ship", SliderParam::WeightPerShip);
                 slider(p, "Reach per weight", SliderParam::ReachPerWeight);
                 p.spawn(text(
-                    "Click a fleet to select it, then click the map to send it · or drag from a fleet to where it should go · \
-                     1 Line · 2 Wedge · 3 Crescent · 4 Echelon L · 5 Echelon R · 6 Column · wheel over the map: zoom · right- or middle-drag: pan.",
+                    "Left-drag a box (or click a fleet) to select · Shift adds · right-click the map to send the selection there · \
+                     1 Line · 2 Wedge · 3 Crescent · 4 Echelon L · 5 Echelon R · 6 Column · wheel over the map: zoom · middle-drag: pan.",
                     12.5,
                     DIM,
                 ));
@@ -911,8 +912,8 @@ pub fn lab_pointer(
     }
 }
 
-/// prototype01: click a fleet to select it; click the map to send the
-/// selected fleet there, or drag from a fleet to where it should go.
+/// prototype01, RTS style: left-drag a box to select fleets (or click one,
+/// Shift adds), right-click to send the selection there, middle-drag pans.
 #[allow(clippy::too_many_arguments)]
 pub fn proto_pointer(
     mouse: Res<ButtonInput<MouseButton>>,
@@ -928,12 +929,18 @@ pub fn proto_pointer(
         proto.pan_from = None;
         return;
     }
-    // Keys 1–6 set the selected fleet's formation.
+    // Fleets that are gone drop out of the selection.
+    let d = &proto.d;
+    proto.selected.retain(|id| d.fleet(*id).is_some());
+    // Keys 1–6 set the selected fleets' formation.
     const KEYS: [KeyCode; 6] = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4, KeyCode::Digit5, KeyCode::Digit6];
-    if let Some(id) = proto.selected
-        && let Some(k) = KEYS.iter().position(|k| keys.just_pressed(*k))
-    {
-        proto.d.set_formation(id, Formation::PLAYER[k]);
+    if let Some(k) = KEYS.iter().position(|k| keys.just_pressed(*k)) {
+        for &id in &proto.selected {
+            proto.d.set_formation(id, Formation::PLAYER[k]);
+        }
+    }
+    if keys.just_pressed(KeyCode::Escape) {
+        proto.selected.clear();
     }
     let Ok(cursor) = image.single() else { return };
     let Some(n) = cursor.normalized else { return };
@@ -953,36 +960,69 @@ pub fn proto_pointer(
     if over && notches != 0.0 {
         proto.camera.zoom_at(screen, 1.2f32.powf(notches), &cfg);
     }
-    // Right or middle drag pans.
-    if over && (mouse.just_pressed(MouseButton::Right) || mouse.just_pressed(MouseButton::Middle)) {
+    // Middle drag pans.
+    if over && mouse.just_pressed(MouseButton::Middle) {
         proto.pan_from = Some(screen);
     }
     if let Some(from) = proto.pan_from {
-        if mouse.pressed(MouseButton::Right) || mouse.pressed(MouseButton::Middle) {
+        if mouse.pressed(MouseButton::Middle) {
             proto.camera.pan(screen - from, &cfg);
             proto.pan_from = Some(screen);
         } else {
             proto.pan_from = None;
         }
     }
+    let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    // Left: press, then a click selects one fleet or a drag selects a box.
     if mouse.just_pressed(MouseButton::Left) && over {
-        // About 10 picture pixels, in world units.
-        match proto.d.fleet_at(p, 10.0 / proto.camera.zoom) {
-            Some(id) => {
-                proto.selected = Some(id);
-                proto.drag = Some((id, screen));
+        proto.drag = Some((screen, screen, false));
+    }
+    if let Some((from, _, boxed)) = proto.drag {
+        let boxed = boxed || from.distance(screen) > 6.0;
+        proto.drag = Some((from, screen, boxed));
+        if !mouse.pressed(MouseButton::Left) {
+            proto.drag = None;
+            if !shift {
+                proto.selected.clear();
             }
-            None => {
-                if let Some(id) = proto.selected {
-                    proto.d.order_move(id, p);
+            let picked: Vec<u32> = if boxed {
+                // Controllable fleets with a ship (or their centre) inside the box.
+                let (a, b) = (proto.camera.to_world(from), proto.camera.to_world(screen));
+                let (lo, hi) = (a.min(b), a.max(b));
+                let inside = |q: MapVec| q.cmpge(lo).all() && q.cmple(hi).all();
+                proto
+                    .d
+                    .fleets
+                    .iter()
+                    .filter(|f| f.controllable() && (inside(f.pos) || f.ship_px.iter().any(|s| inside(s.0))))
+                    .map(|f| f.id)
+                    .collect()
+            } else {
+                // About 10 picture pixels, in world units.
+                proto.d.fleet_at(proto.camera.to_world(from), 10.0 / proto.camera.zoom).into_iter().collect()
+            };
+            for id in picked {
+                match proto.selected.iter().position(|s| *s == id) {
+                    // Shift-click on a selected fleet takes it out.
+                    Some(i) if shift && !boxed => {
+                        proto.selected.remove(i);
+                    }
+                    Some(_) => {}
+                    None => proto.selected.push(id),
                 }
             }
         }
-    } else if mouse.just_released(MouseButton::Left)
-        && let Some((id, from)) = proto.drag.take()
-        && from.distance(screen) > 12.0
-    {
-        proto.d.order_move(id, p);
+    }
+    // Right click: the selection moves there, keeping its spacing.
+    if mouse.just_pressed(MouseButton::Right) && over {
+        let movers: Vec<(u32, MapVec)> =
+            proto.selected.iter().filter_map(|id| proto.d.fleet(*id)).filter(|f| f.controllable()).map(|f| (f.id, f.pos)).collect();
+        if !movers.is_empty() {
+            let centre = movers.iter().map(|m| m.1).sum::<MapVec>() / movers.len() as f32;
+            for (id, pos) in movers {
+                proto.d.order_move(id, p + (pos - centre));
+            }
+        }
     }
 }
 
@@ -1047,7 +1087,8 @@ pub fn render_labs(
         }
         // Half-resolution regions while zooming or panning, sharp once still.
         let bg_step = if proto.camera_still < 0.25 { 2 } else { 1 };
-        let opts = DrawOptions { regions: proto.regions, borders: proto.borders, selected: proto.selected, step: 3 };
+        let marquee = proto.drag.filter(|d| d.2).map(|d| (d.0, d.1));
+        let opts = DrawOptions { regions: proto.regions, borders: proto.borders, selected: proto.selected.clone(), marquee, step: 3 };
         let key = format!(
             "{}|{:?}|{:?}|{bg_step}|{:?}|{:?}",
             proto.d.time,
@@ -1062,7 +1103,7 @@ pub fn render_labs(
                 proto.background = Some(dominion::render_background(&proto.d, &proto.camera, proto.regions, bg_step));
                 proto.background_key = bg_key;
             }
-            let rgba = dominion::render(&proto.d, proto.background.as_ref().unwrap(), &proto.camera, opts).to_rgba();
+            let rgba = dominion::render(&proto.d, proto.background.as_ref().unwrap(), &proto.camera, &opts).to_rgba();
             if let Some(mut img) = images.get_mut(&proto.view.image) {
                 img.data = Some(rgba);
             }
@@ -1150,7 +1191,7 @@ pub fn update_lab_ui(
     for (which, mut t) in &mut texts {
         let s = match which {
             LabText::Seed => c.seed.to_string(),
-            LabText::Proto => dominion::status(&labs.proto.d, labs.proto.selected),
+            LabText::Proto => dominion::status(&labs.proto.d, &labs.proto.selected),
             LabText::Status(l) => status(&c, *l, st),
         };
         if t.0 != s {
@@ -1165,7 +1206,7 @@ pub fn update_lab_ui(
         }
     }
     for (v, mut t) in &mut values {
-        let s = if v.0 == SliderParam::FleetShips && labs.proto.selected.and_then(|id| labs.proto.d.fleet(id)).is_none() {
+        let s = if v.0 == SliderParam::FleetShips && labs.proto.selected.first().and_then(|id| labs.proto.d.fleet(*id)).is_none() {
             "select a fleet".to_string()
         } else {
             v.0.label(v.0.get(&c, st, &labs.proto))
