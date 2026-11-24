@@ -377,7 +377,7 @@ impl Card {
             let events: Vec<SimEvent> = self.world.resource_mut::<Messages<SimEvent>>().drain().collect();
             for ev in events {
                 match ev {
-                    SimEvent::Shot { from, to, side, hit } => self.shots.push((from, to, side, hit, 0.0)),
+                    SimEvent::Shot { from, to, side, hit, .. } => self.shots.push((from, to, side, hit, 0.0)),
                     SimEvent::Destroyed { pos, .. } => self.booms.push((pos, 0.0)),
                     _ => {}
                 }

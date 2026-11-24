@@ -159,7 +159,7 @@ pub enum SliderParam {
     Fleets,
     FleetShips,
     WeightPerShip,
-    ReachPerWeight,
+    PlanetWeight,
     Production,
     FleetSpeed,
     CombatSpeed,
@@ -168,9 +168,9 @@ pub enum SliderParam {
     WarHardship,
     RevoltShare,
     ShipCost,
-    Upkeep,
-    ShotCost,
-    RepairCost,
+    FoodUse,
+    SupplyLoad,
+    PartRepair,
     GrowRadius,
     Crack,
     Weight(usize),
@@ -184,7 +184,7 @@ impl SliderParam {
             SliderParam::Fleets => (1.0, MAX_FLEETS_PER_SIDE as f32, 1.0),
             SliderParam::FleetShips => (MIN_SHIPS as f32, MAX_SHIPS as f32, 1.0),
             SliderParam::WeightPerShip => (0.01, 1.0, 0.01),
-            SliderParam::ReachPerWeight => (1.0, 100.0, 1.0),
+            SliderParam::PlanetWeight => (0.05, 3.0, 0.05),
             SliderParam::Production => (0.5, 30.0, 0.5),
             SliderParam::FleetSpeed => (5.0, 150.0, 1.0),
             SliderParam::CombatSpeed => (0.25, 20.0, 0.25),
@@ -193,9 +193,9 @@ impl SliderParam {
             SliderParam::WarHardship => (0.0, 1.0, 0.05),
             SliderParam::RevoltShare => (0.05, 1.0, 0.01),
             SliderParam::ShipCost => (1.0, 50.0, 1.0),
-            SliderParam::Upkeep => (0.0, 0.5, 0.01),
-            SliderParam::ShotCost => (0.0, 0.1, 0.005),
-            SliderParam::RepairCost => (0.0, 2.0, 0.05),
+            SliderParam::FoodUse => (0.0, 2.0, 0.05),
+            SliderParam::SupplyLoad => (5.0, 200.0, 5.0),
+            SliderParam::PartRepair => (0.5, 10.0, 0.5),
             SliderParam::GrowRadius => (0.0, LabState::grow_max(cfg), 1.0),
             SliderParam::Crack => (0.5, 10.0, 0.1),
             SliderParam::Weight(_) => (0.2, 4.0, 0.1),
@@ -211,7 +211,7 @@ impl SliderParam {
                 proto.d.whole_fleets(&proto.selected).first().and_then(|id| proto.d.fleet(*id)).map_or(MIN_SHIPS as f32, |f| f.ships as f32)
             }
             SliderParam::WeightPerShip => proto.d.tuning.weight_per_ship,
-            SliderParam::ReachPerWeight => proto.d.tuning.reach_per_weight,
+            SliderParam::PlanetWeight => proto.d.tuning.planet_weight,
             SliderParam::Production => proto.d.tuning.secs_per_ship,
             SliderParam::FleetSpeed => proto.d.tuning.speed,
             SliderParam::CombatSpeed => proto.d.tuning.combat_speed,
@@ -220,9 +220,9 @@ impl SliderParam {
             SliderParam::WarHardship => proto.d.tuning.war_hardship,
             SliderParam::RevoltShare => proto.d.tuning.revolt_share,
             SliderParam::ShipCost => proto.d.tuning.ship_cost,
-            SliderParam::Upkeep => proto.d.tuning.upkeep,
-            SliderParam::ShotCost => proto.d.tuning.shot_cost,
-            SliderParam::RepairCost => proto.d.tuning.repair_cost,
+            SliderParam::FoodUse => proto.d.tuning.food_per_phase,
+            SliderParam::SupplyLoad => proto.d.tuning.supply_load,
+            SliderParam::PartRepair => proto.d.tuning.hull_per_part,
             SliderParam::GrowRadius => st.grow_radius,
             SliderParam::Crack => st.crack,
             SliderParam::Weight(i) => st.weights[i],
@@ -236,18 +236,18 @@ impl SliderParam {
             SliderParam::Fleets => format!("{v:.0} a side"),
             SliderParam::FleetShips => format!("{v:.0} ships"),
             SliderParam::WeightPerShip => format!("{v:.2} a ship"),
-            SliderParam::ReachPerWeight => format!("{v:.0} × weight (px at 720 wide)"),
+            SliderParam::PlanetWeight => format!("{v:.2} × size (Voronoi weight)"),
             SliderParam::Production => format!("{v:.1} s a ship (÷ planet value)"),
             SliderParam::FleetSpeed => format!("{v:.0} px/s (at 720 wide)"),
             SliderParam::CombatSpeed => format!("{v:.2}× the battle's rate of fire"),
-            SliderParam::Income => format!("{v:.1}× planet size credits/s produced (owner takes the tax)"),
+            SliderParam::Income => format!("{v:.1} units/s per point of size (owner takes the tax)"),
             SliderParam::CopsPerShip => format!("{v:.0} cops a ship ÷ planet size"),
             SliderParam::WarHardship => format!("+{v:.2} hardship while fighting nearby"),
             SliderParam::RevoltShare => format!("revolt at {:.0}% rebels (smoothed)", v * 100.0),
-            SliderParam::ShipCost => format!("{v:.0} credits a ship"),
-            SliderParam::Upkeep => format!("{v:.2} credits/s a ship"),
-            SliderParam::ShotCost => format!("{v:.3} credits a shot"),
-            SliderParam::RepairCost => format!("{v:.2} credits a hull point"),
+            SliderParam::ShipCost => format!("{v:.0} parts a ship (from the planet's stock)"),
+            SliderParam::FoodUse => format!("{v:.2} food a ship every 5 s"),
+            SliderParam::SupplyLoad => format!("{v:.0} units a supply ship"),
+            SliderParam::PartRepair => format!("{v:.1} hull points a part"),
             SliderParam::GrowRadius => format!("{v:.0} px"),
             SliderParam::Crack => format!("{v:.1}"),
             SliderParam::Weight(_) => format!("{v:.1}×"),
@@ -378,7 +378,7 @@ fn set_slider(param: SliderParam, v: f32, cfg: &mut VoronoiConfig, labs: &mut La
             }
         }
         SliderParam::WeightPerShip => proto.d.tuning.weight_per_ship = v,
-        SliderParam::ReachPerWeight => proto.d.tuning.reach_per_weight = v,
+        SliderParam::PlanetWeight => proto.d.tuning.planet_weight = v,
         SliderParam::Production => proto.d.tuning.secs_per_ship = v,
         SliderParam::FleetSpeed => proto.d.tuning.speed = v,
         SliderParam::CombatSpeed => proto.d.tuning.combat_speed = v,
@@ -387,9 +387,9 @@ fn set_slider(param: SliderParam, v: f32, cfg: &mut VoronoiConfig, labs: &mut La
         SliderParam::WarHardship => proto.d.tuning.war_hardship = v,
         SliderParam::RevoltShare => proto.d.tuning.revolt_share = v,
         SliderParam::ShipCost => proto.d.tuning.ship_cost = v,
-        SliderParam::Upkeep => proto.d.tuning.upkeep = v,
-        SliderParam::ShotCost => proto.d.tuning.shot_cost = v,
-        SliderParam::RepairCost => proto.d.tuning.repair_cost = v,
+        SliderParam::FoodUse => proto.d.tuning.food_per_phase = v,
+        SliderParam::SupplyLoad => proto.d.tuning.supply_load = v,
+        SliderParam::PartRepair => proto.d.tuning.hull_per_part = v,
         SliderParam::GrowRadius => {
             labs.state.grow_radius = v;
             if labs.playing == Some(LabId::Grow) {
@@ -481,17 +481,22 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                      front/flank/rear hit chances, reload, hull, closing ranks and morale, so formation and facing \
                      matter and a beaten fleet turns shaken (gold), routs (grey) and flees off the map. Keys 1–6 set the selected fleets' \
                      formation. A planet changes hands once its garrison is gone and an enemy fleet holds it for 3 s \
-                     (ring). Patches show each fleet's influence (ships × weight per ship, reach × weight). \
-                     Each owned planet's people run Epstein's rebellion model: legitimacy is 1 − tax − occupation \
-                     (fresh conquests are resented), ships nearby are the cops, fighting adds hardship. Rebels strike \
-                     (red arc) and, past the revolt share, the planet goes independent with a rebel garrison.",
+                     (ring). Planets and fleets are the cells of one Voronoi diagram (a fleet's cell grows with its \
+                     ships). Fleets travel only along the highways, the Delaunay edges between planets. \
+                     Supply: each point of a planet's size makes ammo (red), food (green) or parts (grey) into its stock. \
+                     Fleets at a friendly planet draw from it; elsewhere supply ships (round) carry it to the nearest \
+                     fleet in need, trail it and empty as it uses them, and can be shot. No ammo: no shooting. No food: \
+                     ships desert. No parts: damaged ships may break up. Shortages shake morale. \
+                     Each owned planet's people (drawn inside it) run Epstein's rebellion model: legitimacy is \
+                     1 − tax − occupation (fresh conquests are resented), ships nearby are the cops, fighting adds \
+                     hardship. Rebels strike (red arc) and, past the revolt share, the planet goes independent.",
                 );
                 p.spawn(row()).with_children(|r| {
                     button_for(r, "Pause", LabAction::ProtoPause, BtnKind::Primary);
                     for m in [1, 2, 4] {
                         button_for(r, &format!("{m}×"), LabAction::ProtoSpeed(m), BtnKind::Choice);
                     }
-                    toggle(r, "Planet regions", LabAction::ProtoRegions);
+                    toggle(r, "Planet cells", LabAction::ProtoRegions);
                     toggle(r, "Patch edges", LabAction::ProtoBorders);
                     button_for(r, "Reset", LabAction::ProtoReset, BtnKind::Normal);
                     button_for(r, "Zoom −", LabAction::ProtoZoom(-1), BtnKind::Normal);
@@ -524,14 +529,14 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                 slider(p, "War hardship", SliderParam::WarHardship);
                 slider(p, "Revolt", SliderParam::RevoltShare);
                 slider(p, "Ship cost", SliderParam::ShipCost);
-                slider(p, "Upkeep", SliderParam::Upkeep);
-                slider(p, "Shot cost", SliderParam::ShotCost);
-                slider(p, "Repair cost", SliderParam::RepairCost);
+                slider(p, "Food use", SliderParam::FoodUse);
+                slider(p, "Supply load", SliderParam::SupplyLoad);
+                slider(p, "Part repair", SliderParam::PartRepair);
                 slider(p, "Selected ships", SliderParam::FleetShips);
                 slider(p, "Weight per ship", SliderParam::WeightPerShip);
-                slider(p, "Reach per weight", SliderParam::ReachPerWeight);
+                slider(p, "Planet weight", SliderParam::PlanetWeight);
                 p.spawn(text(
-                    "Left-drag a box around ships (or click a fleet) to select · Shift adds · right-click the map to send them there: \
+                    "Left-drag a box around ships (or click a fleet) to select · Shift adds · right-click the map to send them along the highways to the nearest point on one: \
                      ships from several fleets merge into one fleet, part of a fleet splits off · \
                      1 Line · 2 Wedge · 3 Crescent · 4 Echelon L · 5 Echelon R · 6 Column · wheel over the map: zoom · middle-drag: pan · \
                      click a planet to see its people, [ and ] lower or raise its tax.",
@@ -1167,9 +1172,9 @@ pub fn render_labs(
             proto.d.fleets.iter().map(|f| (f.id, f.pos, f.facing, f.ships, f.formation, f.dest)).collect::<Vec<_>>()
         );
         if key != proto.view.key && proto.since_render >= 0.04 {
-            let bg_key = format!("{}|{:?}|{bg_step}", proto.d.background_key(proto.regions), proto.camera);
+            let bg_key = format!("{}|{:?}|{bg_step}", proto.d.background_key(), proto.camera);
             if bg_key != proto.background_key || proto.background.is_none() {
-                proto.background = Some(dominion::render_background(&proto.d, &proto.camera, proto.regions, bg_step));
+                proto.background = Some(dominion::render_background(&proto.d, &proto.camera, bg_step));
                 proto.background_key = bg_key;
             }
             let rgba = dominion::render(&proto.d, proto.background.as_ref().unwrap(), &proto.camera, &opts).to_rgba();

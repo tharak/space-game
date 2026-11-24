@@ -43,6 +43,16 @@ pub struct Weapon {
     pub aim: Option<Vec2>,
 }
 
+/// A supply ship (prototype01): carries cargo (ammo, food, parts), never
+/// fires, and trails its division at a distance instead of taking a
+/// formation slot. Enemies can still shoot it.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Supply(pub [f32; 3]);
+
+/// What a combat ship carries for itself (prototype01): ammo, food, parts.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Stores(pub [f32; 3]);
+
 /// The fleet commander's ship. Losing it shakes the whole fleet.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct FleetFlagship;

@@ -127,6 +127,35 @@ fn spawn_ships(world: &mut World, division: Entity, points: &[Vec2]) {
     }
 }
 
+/// How far behind a division's rear rank its supply ships trail, in gun ranges.
+pub const SUPPLY_TRAIL: f32 = 1.5;
+
+/// A supply ship carrying `cargo` joins `division` at `at`; returns it.
+pub fn add_supply(world: &mut World, division: Entity, at: Vec2, cargo: [f32; 3]) -> Option<Entity> {
+    let before: Vec<Entity> = world.query_filtered::<Entity, With<Ship>>().iter(world).collect();
+    spawn_ships(world, division, &[at]);
+    let e = world.query_filtered::<Entity, With<Ship>>().iter(world).find(|e| !before.contains(e))?;
+    world.entity_mut(e).insert(Supply(cargo));
+    reform(world, division);
+    Some(e)
+}
+
+/// Despawns these ships of a division (not counted as losses) and re-forms it.
+pub fn despawn_ships(world: &mut World, division: Entity, ships: &[Entity]) {
+    let mut n = 0u32;
+    for &e in ships {
+        if world.get::<InDivision>(e).is_some_and(|d| d.0 == division) {
+            world.despawn(e);
+            n += 1;
+        }
+    }
+    if let Some(mut d) = world.get_mut::<Division>(division) {
+        d.alive = d.alive.saturating_sub(n);
+        d.start = d.start.saturating_sub(n);
+    }
+    reform(world, division);
+}
+
 /// Adds `n` fresh ships to a division at its anchor and re-forms it, as if
 /// they had always been there (no change to its losses or morale).
 pub fn add_ships(world: &mut World, division: Entity, n: usize) {
@@ -225,13 +254,15 @@ pub fn set_formation(world: &mut World, division: Entity, formation: Formation) 
     if d.morale == Morale::Routed {
         return;
     }
-    let mut ships: Vec<(Entity, Vec2)> = world
-        .query::<(Entity, &Pos, &InDivision)>()
-        .iter(world)
-        .filter(|(_, _, div)| div.0 == division)
-        .map(|(e, p, _)| (e, d.to_local(p.0)))
-        .collect();
+    let mut ships: Vec<(Entity, Vec2)> = Vec::new();
+    let mut supply: Vec<(Entity, Vec2)> = Vec::new();
+    for (e, p, div, s) in world.query::<(Entity, &Pos, &InDivision, Has<Supply>)>().iter(world) {
+        if div.0 == division {
+            if s { &mut supply } else { &mut ships }.push((e, d.to_local(p.0)));
+        }
+    }
     ships.sort_by_key(|s| s.0);
+    supply.sort_by(|a, b| a.1.y.total_cmp(&b.1.y).then(a.0.cmp(&b.0)));
     let mut slots = formation::layout(formation, ships.len(), spacing);
     let (depth, half_width) = formation::extent(&slots);
     slots.sort_by(|a, b| b.x.total_cmp(&a.x).then(a.y.total_cmp(&b.y)));
@@ -245,9 +276,17 @@ pub fn set_formation(world: &mut World, division: Entity, formation: Formation) 
             world.entity_mut(ships[i].0).insert(Slot(slot));
         }
     }
+    // Supply ships trail on a line behind the rear rank, out of the fight.
+    // (A convoy of supply ships alone keeps them at its anchor.)
+    let gap = if ships.is_empty() { 0.0 } else { world.resource::<Tuning>().range * SUPPLY_TRAIL };
+    let n = supply.len() as f32;
+    for (k, (e, _)) in supply.iter().enumerate() {
+        let y = (k as f32 - (n - 1.0) / 2.0) * spacing * 1.5;
+        world.entity_mut(*e).insert(Slot(Vec2::new(depth - gap, y)));
+    }
     if let Some(mut d) = world.get_mut::<Division>(division) {
         d.formation = formation;
-        d.slots = ships.len() as u32;
+        d.slots = (ships.len() + supply.len()) as u32;
         d.depth = depth;
         d.half_width = half_width;
     }

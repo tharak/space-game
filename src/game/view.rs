@@ -198,7 +198,7 @@ pub fn sync_labels(
 pub fn collect_fx(mut events: MessageReader<SimEvent>, mut fx: ResMut<Fx>) {
     for event in events.read() {
         match event {
-            SimEvent::Shot { from, to, side, hit } => {
+            SimEvent::Shot { from, to, side, hit, .. } => {
                 if fx.lasers.len() < MAX_LASERS {
                     fx.lasers.push(Laser { from: *from, to: *to, side: *side, hit: *hit, age: 0.0 });
                 }

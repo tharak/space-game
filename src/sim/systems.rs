@@ -284,7 +284,7 @@ pub fn hit_chance(tuning: &Tuning, arc: usize, dist: f32) -> f32 {
 #[allow(clippy::too_many_arguments)]
 pub fn fire(
     mut commands: Commands,
-    mut shooters: Query<(&Pos, &Heading, &Side, &InDivision, &mut Weapon)>,
+    mut shooters: Query<(&Pos, &Heading, &Side, &InDivision, &mut Weapon), Without<Supply>>,
     mut hulls: Query<(&mut Ship, Has<FleetFlagship>)>,
     mut divs: Query<&mut Division>,
     hash: Res<SpatialHash>,
@@ -370,7 +370,7 @@ pub fn fire(
         let slow = if d.morale == Morale::Shaken { tuning.shaken_cooldown } else { 1.0 };
         weapon.cooldown = tuning.cooldown * slow / battle.mods_of(s).fire_rate.max(0.1) * rng.range(0.85, 1.15);
         weapon.aim = Some(target.pos - p);
-        events.write(SimEvent::Shot { from: p, to: target.pos, side: s, hit });
+        events.write(SimEvent::Shot { from: p, to: target.pos, side: s, hit, shooter: me.entity });
         contact.push(div.0);
         contact.push(target.division);
         if hit {

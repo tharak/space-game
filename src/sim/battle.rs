@@ -299,7 +299,7 @@ impl Battle {
 
 #[derive(Message, Clone, Debug)]
 pub enum SimEvent {
-    Shot { from: Vec2, to: Vec2, side: usize, hit: bool },
+    Shot { from: Vec2, to: Vec2, side: usize, hit: bool, shooter: Entity },
     Destroyed { pos: Vec2, side: usize, flagship: bool, division: String },
     MoraleChanged { side: usize, division: String, from: Morale, to: Morale },
     FlagshipLost { side: usize },

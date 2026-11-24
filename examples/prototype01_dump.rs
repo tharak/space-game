@@ -16,7 +16,7 @@ fn main() {
     let write = |d: &Dominion, name: &str| {
         let view = View::fit(&d.cfg, VIEW_W, VIEW_H);
         let t = std::time::Instant::now();
-        let bg = render_background(d, &view, true, 1);
+        let bg = render_background(d, &view, 1);
         let t_bg = t.elapsed();
         // Blue's most restless planet shows its people.
         let planet = (0..d.planets.len())
@@ -33,7 +33,7 @@ fn main() {
         if let Some(f) = d.fleets.iter().find(|f| f.owner == Owner::Side(0)) {
             close.zoom_at(view.to_screen(f.pos), 4.0, &d.cfg);
         }
-        let bg = render_background(d, &close, true, 1);
+        let bg = render_background(d, &close, 1);
         std::fs::write(format!("{dir}/{name}-zoom.ppm"), render(d, &bg, &close, &opts).to_ppm()).expect("write ppm");
         println!("{name}: {}", status(d, &[], planet).replace('\n', " | "));
     };

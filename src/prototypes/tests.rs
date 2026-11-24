@@ -1,5 +1,6 @@
 use super::dominion::*;
-use crate::sim::components::Morale;
+use super::highways::closest_on_segment;
+use crate::sim::components::{Morale, Ship, Stores, Supply};
 use crate::voronoi::Vec2;
 use crate::voronoi::sites::VoronoiConfig;
 
@@ -18,8 +19,9 @@ fn duel(a: (Owner, Vec2, f32, u32), b: (Owner, Vec2, f32, u32)) -> (Dominion, u3
     for p in &mut d.planets {
         p.value = 0;
     }
-    // Combat only: credits never run out.
-    d.credits.fill(1e6);
+    // Combat only: supplies never run out.
+    d.tuning.ammo_per_shot = 0.0;
+    d.tuning.food_per_phase = 0.0;
     let ia = d.add_fleet(a.0, a.1, a.2, a.3, None);
     let ib = d.add_fleet(b.0, b.1, b.2, b.3, None);
     (d, ia, ib)
@@ -28,6 +30,29 @@ fn duel(a: (Owner, Vec2, f32, u32), b: (Owner, Vec2, f32, u32)) -> (Dominion, u3
 const BLUE: Owner = Owner::Side(0);
 const RED: Owner = Owner::Side(1);
 const WEST: f32 = std::f32::consts::PI;
+
+/// Sets what every combat ship of a fleet carries.
+fn set_stores(d: &mut Dominion, id: u32, per_ship: Stock) {
+    for e in d.fleet(id).unwrap().ship_ids.clone() {
+        if let Some(mut s) = d.world.get_mut::<Stores>(e) {
+            s.0 = per_ship;
+        }
+    }
+}
+
+/// The ends of the longest highway.
+fn long_road(d: &Dominion) -> (Vec2, Vec2) {
+    let &(a, b) = d
+        .highways
+        .edges
+        .iter()
+        .max_by(|x, y| {
+            let l = |e: &(usize, usize)| d.highways.nodes[e.0].distance(d.highways.nodes[e.1]);
+            l(x).total_cmp(&l(y))
+        })
+        .unwrap();
+    (d.highways.nodes[a], d.highways.nodes[b])
+}
 
 fn ships(d: &Dominion, id: u32) -> u32 {
     d.fleet(id).map_or(0, |f| f.ships)
@@ -42,17 +67,26 @@ fn the_world_starts_with_home_planets_fleets_and_garrisons() {
     assert_eq!(fleets, [4, 4]);
     for (side, n) in ships.iter().enumerate() {
         let home = d.planets.iter().find(|p| p.owner == Owner::Side(side)).unwrap();
+        assert_eq!(home.value, MAX_PLANET_SIZE);
+        assert_eq!(home.produces, [AMMO, FOOD, PARTS]);
         assert_eq!(*n, 3 * START_SHIPS + home.value);
     }
+    assert_eq!(START_SHIPS, MAX_PLANET_SIZE);
     assert_eq!(free, 10);
     // Every planet starts with as many ships as its size.
     for (i, p) in d.planets.iter().enumerate() {
         let g = d.fleets.iter().find(|f| f.home == Some(i)).expect("garrison");
-        assert_eq!((g.owner, g.ships), (p.owner, p.value));
+        assert_eq!((g.owner, g.ships, g.supply), (p.owner, p.value, 0));
+    }
+    // Start fleets carry a supply ship each, out on the highways.
+    for f in d.fleets.iter().filter(|f| f.home.is_none()) {
+        assert_eq!((f.ships, f.supply), (START_SHIPS, 1));
+        let s = d.highways.snap(f.pos).unwrap();
+        assert!(s.point.distance(f.pos) < 3.0, "{:?} is off the highways", f.pos);
     }
     // Every fleet's ships are ECS entities.
     let total: usize = d.fleets.iter().map(|f| f.ship_px.len()).sum();
-    assert_eq!(total as u32, d.fleets.iter().map(|f| f.ships).sum::<u32>());
+    assert_eq!(total as u32, d.fleets.iter().map(|f| f.ships + f.supply).sum::<u32>());
 }
 
 #[test]
@@ -61,7 +95,6 @@ fn planets_build_ships_into_their_garrison() {
     d.tuning.secs_per_ship = 6.0;
     // Build mechanics only: no costs, no strikes.
     d.rebellion.threshold = 2.0;
-    d.tuning.upkeep = 0.0;
     d.tuning.ship_cost = 0.0;
     let home = d.planets.iter().position(|p| p.owner == BLUE).unwrap();
     d.planets[home].value = 2;
@@ -95,16 +128,54 @@ fn independents_never_take_orders_and_cap_their_garrison() {
 }
 
 #[test]
-fn fleets_move_at_the_set_speed_and_stop_there() {
-    let (mut d, a, _) = duel((BLUE, Vec2::new(100.0, 100.0), 0.0, 20), (RED, Vec2::new(650.0, 350.0), WEST, 10));
-    assert!(d.order_move(a, Vec2::new(250.0, 100.0)));
+fn fleets_move_at_the_set_speed_along_a_highway_and_stop_there() {
+    let mut d = world();
+    d.clear_fleets();
+    d.tuning.food_per_phase = 0.0;
+    let (from, to) = long_road(&d);
+    let a = d.add_fleet(BLUE, from, (to - from).to_angle(), 10, None);
+    assert!(d.order_move(a, to));
     d.step(2.0);
-    let x = d.fleet(a).unwrap().pos.x;
-    assert!(x > 120.0 && x < 100.0 + 2.0 * d.tuning.speed + 5.0, "{x}");
-    d.step(15.0);
+    let gone = d.fleet(a).unwrap().pos.distance(from);
+    assert!(gone > 20.0 && gone < 2.0 * d.tuning.speed + 5.0, "{gone}");
+    d.step(from.distance(to) / d.tuning.speed + 10.0);
     let f = d.fleet(a).unwrap();
     assert!(f.dest.is_none());
-    assert!(f.pos.distance(Vec2::new(250.0, 100.0)) < 6.0, "{:?}", f.pos);
+    assert!(f.pos.distance(to) < 6.0, "{:?}", f.pos);
+}
+
+#[test]
+fn fleets_only_travel_on_highways() {
+    let mut d = world();
+    d.clear_fleets();
+    d.tuning.food_per_phase = 0.0;
+    let home = d.planets.iter().position(|p| p.owner == BLUE).unwrap();
+    let far = d.planets.iter().position(|p| p.owner == RED).unwrap();
+    d.tuning.secs_per_ship = 1e6;
+    let a = d.add_fleet(BLUE, d.planets[home].pos, 0.0, 6, None);
+    // Ordered to empty space: it goes to the nearest point on a highway.
+    let goal = d.planets[far].pos + Vec2::new(-30.0, 25.0);
+    assert!(d.order_move(a, goal));
+    let end = d.highways.snap(goal).unwrap().point;
+    assert_eq!(d.fleet(a).unwrap().dest, Some(end));
+    // Every waypoint after the first is a planet or the end.
+    let route = d.fleet(a).unwrap().route.clone();
+    for w in &route[..route.len() - 1] {
+        assert!(d.planets.iter().any(|p| p.pos.distance(*w) < 0.01), "{w:?}");
+    }
+    for _ in 0..200 {
+        d.step(0.5);
+        let f = d.fleet(a).unwrap();
+        let off = d.highways.edges.iter().map(|&(x, y)| closest_on_segment(d.highways.nodes[x], d.highways.nodes[y], f.pos).distance(f.pos)).fold(f32::INFINITY, f32::min);
+        assert!(off < 8.0, "{off} px off the highways at {:?}", f.pos);
+        if f.dest.is_none() {
+            break;
+        }
+    }
+    // Arrived: the ships close up on the anchor.
+    d.step(5.0);
+    let f = d.fleet(a).unwrap();
+    assert!(f.pos.distance(end) < 6.0, "{:?} {:?} {:?} {:?}", f.pos, end, f.dest, f.route);
 }
 
 #[test]
@@ -184,6 +255,24 @@ fn both_sides_present_stops_the_capture() {
 }
 
 #[test]
+fn planets_and_fleets_share_one_voronoi_map() {
+    let d = world();
+    let inf = Influence::new(&d);
+    for y in (0..400).step_by(17) {
+        for x in (0..720).step_by(23) {
+            let site = inf.at(Vec2::new(x as f32, y as f32)).expect("every point is in a cell");
+            match site {
+                Site::Planet(i) => assert!(i < d.planets.len()),
+                Site::Fleet(i) => assert!(d.fleets[i].armed()),
+            }
+        }
+    }
+    // At a fleet's centre (away from planets), the fleet's own cell.
+    let f = d.fleets.iter().position(|f| f.home.is_none()).unwrap();
+    assert_eq!(inf.at(d.fleets[f].pos), Some(Site::Fleet(f)));
+}
+
+#[test]
 fn deterministic_and_renders() {
     let mut a = world();
     let mut b = world();
@@ -192,12 +281,12 @@ fn deterministic_and_renders() {
     assert_eq!(a.fleets, b.fleets);
     // A fixed-size picture, whatever the map size or zoom.
     let mut view = View::fit(&a.cfg, VIEW_W, VIEW_H);
-    let bg = render_background(&a, &view, true, 1);
+    let bg = render_background(&a, &view, 1);
     let c = render(&a, &bg, &view, &DrawOptions::default());
-    assert_eq!(render_background(&a, &view, true, 2).px.len(), bg.px.len());
+    assert_eq!(render_background(&a, &view, 2).px.len(), bg.px.len());
     assert_eq!((c.w, c.h), (VIEW_W, VIEW_H));
     view.zoom_at(Vec2::new(700.0, 400.0), 4.0, &a.cfg);
-    let bg = render_background(&a, &view, true, 1);
+    let bg = render_background(&a, &view, 1);
     assert_eq!(render(&a, &bg, &view, &DrawOptions::default()).px.len(), c.px.len());
 }
 
@@ -225,8 +314,13 @@ fn the_view_zooms_around_the_cursor_and_stays_on_the_map() {
 
 #[test]
 fn a_moving_fleet_never_rams_an_enemy() {
-    let (mut d, a, b) = duel((BLUE, Vec2::new(100.0, 200.0), 0.0, 20), (RED, Vec2::new(300.0, 200.0), WEST, 30));
-    assert!(d.order_move(a, Vec2::new(500.0, 200.0)));
+    let (mut d, _, _) = duel((BLUE, Vec2::ZERO, 0.0, 1), (RED, Vec2::ZERO, 0.0, 1));
+    d.clear_fleets();
+    let (from, to) = long_road(&d);
+    let dir = (to - from).normalize();
+    let a = d.add_fleet(BLUE, from, dir.to_angle(), 20, None);
+    let b = d.add_fleet(RED, from + dir * 200.0_f32.min(from.distance(to) * 0.6), WEST + dir.to_angle(), 30, None);
+    assert!(d.order_move(a, to));
     d.step(12.0);
     let (fa, fb) = (d.fleet(a).unwrap(), d.fleet(b).unwrap());
     let gap = fa.ship_px.iter().flat_map(|s| fb.ship_px.iter().map(move |t| s.0.distance(t.0))).fold(f32::INFINITY, f32::min);
@@ -270,29 +364,31 @@ fn economy() -> (Dominion, usize) {
 }
 
 #[test]
-fn ships_cost_credits_and_wait_when_short() {
-    let (mut d, _) = economy();
-    d.tuning.upkeep = 0.0;
-    d.tuning.ship_cost = 100.0;
-    d.credits[0] = 250.0;
+fn ships_are_built_of_parts_and_wait_when_short() {
+    let (mut d, home) = economy();
+    d.tuning.ship_cost = 5.0;
     d.tuning.income = 0.0;
-    d.step(10.0);
-    // Two ships bought, then the planet waits for credits.
+    d.planets[home].stock = [50.0, 50.0, 12.0];
+    // (Before the maintenance phase, when the garrison would draw parts.)
+    d.step(3.0);
+    // Two ships built, then the planet waits for parts.
     assert_eq!(d.ships_of(BLUE), 2);
-    assert!((d.credits_of(BLUE) - 50.0).abs() < 1e-3);
+    assert!((d.planets[home].stock[PARTS] - 2.0).abs() < 1e-3);
 }
 
 #[test]
-fn planets_earn_their_tax_share_of_production() {
+fn planets_make_their_kinds_at_their_tax_share() {
     let (mut d, home) = economy();
     d.tuning.ship_cost = 1e6;
-    d.credits[0] = 0.0;
+    d.planets[home].produces = [AMMO, FOOD, PARTS];
+    d.planets[home].stock = [0.0; 3];
     d.step(10.0);
-    // Size 2 × income 4 × tax 0.2 a second for 10 s.
-    assert!((d.credits_of(BLUE) - 16.0).abs() < 0.1, "{}", d.credits_of(BLUE));
+    // Size 2: one point of ammo, one of food; income 4 × tax 0.2 a second.
+    let s = d.planets[home].stock;
+    assert!((s[AMMO] - 8.0).abs() < 0.1 && (s[FOOD] - 8.0).abs() < 0.1 && s[PARTS] == 0.0, "{s:?}");
     // Strikes take their share.
     d.planets[home].unrest = 0.5;
-    assert!((d.planet_income(BLUE) - 0.8).abs() < 1e-4);
+    assert!((d.planet_income(BLUE)[AMMO] - 0.4).abs() < 1e-4);
     d.set_tax(home, 2.0);
     assert_eq!(d.planets[home].tax, MAX_TAX);
 }
@@ -326,61 +422,112 @@ fn a_garrisoned_planet_at_a_fair_tax_stays_calm() {
 }
 
 #[test]
-fn upkeep_caps_the_fleet_at_what_planets_can_pay() {
+fn hungry_ships_desert_and_shake_the_fleet() {
     let (mut d, _) = economy();
-    d.tuning.ship_cost = 1.0;
-    d.credits[0] = 10_000.0;
-    // 1.6 credits a second pay for 32 ships at 0.05 each.
-    d.step(60.0);
-    assert_eq!(d.ships_of(BLUE), 32);
-    assert!(d.net_income(BLUE) >= 0.0);
-}
-
-#[test]
-fn unpaid_upkeep_makes_ships_desert() {
-    let (mut d, _) = economy();
-    d.tuning.ship_cost = 1e6;
-    let id = d.add_fleet(BLUE, Vec2::new(360.0, 200.0), 0.0, 64, None);
-    d.credits[0] = 0.0;
-    // 64 ships cost 3.2 a second against an income of 1.6.
+    d.tuning.desert_chance = 1.0;
+    let (from, _) = long_road(&d);
+    let id = d.add_fleet(BLUE, from + Vec2::new(0.0, 60.0), 0.0, 20, None);
+    set_stores(&mut d, id, [10.0, 0.0, 2.0]);
     d.step(MAINTENANCE_SECS + 0.05);
-    assert!(ships(&d, id) < 64);
+    assert!(ships(&d, id) < 20, "nobody deserted");
     assert!(d.deserted[0] > 0);
-    // It settles at what the planet pays for.
-    d.step(60.0);
-    assert!((31..=33).contains(&ships(&d, id)), "{}", ships(&d, id));
+    let e = d.fleet(id).map(|f| f.division);
+    if let Some(div) = e.and_then(|e| d.world.get::<crate::sim::components::Division>(e)) {
+        assert!(div.shock > 0.0);
+    }
 }
 
 #[test]
-fn shots_cost_credits_and_a_broke_side_cannot_fire() {
+fn ships_without_ammo_cannot_fire() {
     let (mut d, a, b) = duel((BLUE, Vec2::new(300.0, 200.0), 0.0, 30), (RED, Vec2::new(325.0, 200.0), WEST, 30));
-    d.tuning.upkeep = 0.0;
-    d.credits[0] = 1000.0;
-    d.credits[1] = 0.0;
-    let before = d.credits_of(BLUE);
+    d.tuning.ammo_per_shot = 0.1;
+    set_stores(&mut d, a, [10.0, 3.0, 2.0]);
+    set_stores(&mut d, b, [0.0, 3.0, 2.0]);
     d.step(20.0);
-    assert!(d.credits_of(BLUE) < before);
-    assert!(d.shots.iter().all(|s| s.2 == 0), "Red fired with no credits");
+    assert!(!d.shots.is_empty());
+    assert!(d.shots.iter().all(|s| s.2 == 0), "Red fired with no ammo");
     assert!(ships(&d, b) < 30);
     assert_eq!(ships(&d, a), 30);
+    // Blue spent some.
+    let (stores, _) = d.fleet_stores(d.fleet(a).unwrap());
+    assert!(stores[AMMO] < 300.0);
 }
 
 #[test]
-fn the_maintenance_phase_repairs_fleets_out_of_combat() {
-    use crate::sim::components::Ship;
+fn parts_repair_ships_and_without_them_damaged_ships_break_up() {
     let (mut d, _) = economy();
-    d.tuning.ship_cost = 1e6;
-    d.tuning.upkeep = 0.0;
-    d.add_fleet(BLUE, Vec2::new(360.0, 200.0), 0.0, 10, None);
+    d.tuning.food_per_phase = 0.0;
+    let (from, _) = long_road(&d);
+    let id = d.add_fleet(BLUE, from + Vec2::new(0.0, 60.0), 0.0, 10, None);
     for mut s in d.world.query::<&mut Ship>().iter_mut(&mut d.world) {
-        s.hull = 1.0;
+        s.hull = 3.0;
     }
-    let before = d.credits_of(BLUE);
+    // 10 ships × 2 parts × 2.5 hull: every ship mended (2 hull points each).
     d.step(MAINTENANCE_SECS + 0.05);
     assert!(d.world.query::<&Ship>().iter(&d.world).all(|s| s.hull == s.max_hull));
-    // 10 ships × 4 hull points × 0.2 credits, less the income meanwhile.
-    let income = 1.6 * (MAINTENANCE_SECS + 0.05);
-    assert!((before + income - d.credits_of(BLUE) - 8.0).abs() < 0.2, "{}", d.credits_of(BLUE));
+    let (stores, _) = d.fleet_stores(d.fleet(id).unwrap());
+    assert!((stores[PARTS] - 12.0).abs() < 0.01, "{stores:?}");
+    // No parts and badly hurt: they break up.
+    set_stores(&mut d, id, [10.0, 3.0, 0.0]);
+    for mut s in d.world.query::<&mut Ship>().iter_mut(&mut d.world) {
+        s.hull = 0.5;
+    }
+    d.tuning.wreck_chance = 1.0;
+    d.step(3.0 * MAINTENANCE_SECS);
+    assert!(ships(&d, id) < 10, "{}", ships(&d, id));
+}
+
+#[test]
+fn a_fleet_in_need_gets_a_convoy_that_joins_and_is_used_up() {
+    let (mut d, home) = economy();
+    d.tuning.ship_cost = 1e6;
+    // Enough for one supply ship, and no more coming.
+    d.tuning.income = 0.0;
+    d.planets[home].stock = [10.0; 3];
+    let start = d.planets[home].pos;
+    let far = d.highways.neighbors[home][0];
+    let at = d.planets[home].pos + (d.planets[far].pos - start) * 0.6;
+    let id = d.add_fleet(BLUE, at, 0.0, 6, None);
+    set_stores(&mut d, id, [1.0, 1.0, 0.5]);
+    d.step(MAINTENANCE_SECS + 0.05);
+    assert_eq!(d.convoys_sent[0], 1);
+    assert!(d.fleets.iter().any(|f| f.convoy == Some(id)));
+    assert!((d.planets[home].stock.iter().sum::<f32>() - 10.0).abs() < 0.01, "20 units loaded");
+    // It travels the highway and joins.
+    let mut joined = false;
+    for _ in 0..120 {
+        d.step(0.5);
+        if d.fleet(id).unwrap().supply > 0 {
+            joined = true;
+            break;
+        }
+    }
+    assert!(joined, "the convoy never joined");
+    // It trails behind, and its cargo is used up at the next phase.
+    d.step(MAINTENANCE_SECS + 0.05);
+    let f = d.fleet(id).unwrap();
+    let (stores, _) = d.fleet_stores(f);
+    assert!(stores[AMMO] > 6.0 && stores[FOOD] > 6.0 * 0.5, "{stores:?}");
+    // 6 ships hold 60 ammo, 18 food, 12 parts: 20 units all fit.
+    assert_eq!(f.supply, 0, "the empty supply ship is used up");
+    assert_eq!(d.convoys_sent[0], 1);
+}
+
+#[test]
+fn supply_ships_trail_their_fleet_and_can_be_shot() {
+    let (mut d, a, b) = duel((BLUE, Vec2::new(300.0, 200.0), 0.0, 10), (RED, Vec2::new(500.0, 200.0), WEST, 30));
+    assert!(d.add_supply_ship(a, [5.0; 3]));
+    d.step(6.0);
+    let f = d.fleet(a).unwrap();
+    let k = f.is_supply.iter().position(|s| *s).unwrap();
+    let behind = (f.ship_px[k].0 - f.pos).dot(Vec2::from_angle(f.facing));
+    assert!(behind < -d.range(), "{behind}");
+    assert!(d.world.get::<Supply>(f.ship_ids[k]).is_some());
+    // A lone supply ship next to an enemy fleet gets shot down.
+    let lone = d.add_convoy(BLUE, d.fleet(b).unwrap().pos + Vec2::new(-30.0, 0.0), [5.0; 3], None);
+    assert_eq!(d.fleet(lone).unwrap().supply, 1);
+    d.step(30.0);
+    assert!(d.fleet(lone).is_none(), "the supply ship survived");
 }
 
 fn ids(d: &Dominion, id: u32) -> Vec<bevy::prelude::Entity> {
@@ -393,7 +540,7 @@ fn one_whole_fleet_selected_just_moves() {
     let to = Vec2::new(200.0, 100.0);
     assert_eq!(d.form_fleet(&ids(&d, a), to), Some(a));
     assert_eq!(d.fleets.len(), 2);
-    assert_eq!(d.fleet(a).unwrap().dest, Some(to));
+    assert_eq!(d.fleet(a).unwrap().dest, Some(d.highways.snap(to).unwrap().point));
 }
 
 #[test]
@@ -406,7 +553,7 @@ fn selected_fleets_merge_into_the_biggest() {
     assert_eq!(d.form_fleet(&sel, to), Some(a));
     assert!(d.fleet(b).is_none(), "the smaller fleet is absorbed");
     assert_eq!(ships(&d, a), 17);
-    assert_eq!(d.fleet(a).unwrap().dest, Some(to));
+    assert_eq!(d.fleet(a).unwrap().dest, Some(d.highways.snap(to).unwrap().point));
     d.step(10.0);
     assert_eq!(ships(&d, a), 17);
 }

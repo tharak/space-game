@@ -11,11 +11,20 @@
 //! Influence patches (weight = ships × weight per ship, reach = reach per
 //! weight × weight) show who dominates where.
 //!
-//! Economy: one resource (credits), a stockpile per owner. A planet of
-//! size x produces x × income; its owner takes its tax share. A ship costs
-//! credits to build, every shot costs credits, and every few seconds a
-//! maintenance phase pays the fleets' upkeep (unpaid ships desert) and
-//! repairs damaged ships out of combat. An owner out of credits can't fire.
+//! One Voronoi diagram: planets and fleets are its sites (fleets move,
+//! weighted by ships, so a big fleet claims more space). Highways are the
+//! Delaunay edges between planets; fleets only travel along them.
+//!
+//! Supply: three resources, ammo, food and parts, with no global purse.
+//! Each point of a planet's size produces one kind (its icons) into the
+//! planet's stock, at income × tax. Ships carry their own stores, split
+//! evenly within a fleet: no ammo, no shooting; no food, ships desert;
+//! damaged ships without parts may break up; every shortage shakes morale.
+//! Fleets at a friendly planet draw from its stock; elsewhere supply ships
+//! bring it: planets load them for the nearest fleet in need, they travel
+//! the highways, join the fleet, trail it at a distance, empty as the
+//! fleet uses their cargo, and can be shot. A planet builds ships out of
+//! the parts in its stock.
 //!
 //! Unrest: every Blue or Red planet's people run Epstein's civil-violence
 //! model ([`super::rebellion`]). The owner's ships nearby are its cops,
@@ -29,20 +38,21 @@ use bevy::prelude::{Entity, Rect, World};
 
 use super::rebellion::{Rebellion, RebellionParams};
 use crate::sim::battle::{Battle, DT, SimEvent, Tuning as BattleTuning};
-use crate::sim::components::{Division, Heading, InDivision, Morale, Order, Pos, Ship, Weapon};
+use super::highways::Highways;
+use crate::sim::components::{Division, Heading, InDivision, Morale, Order, Pos, Ship, Stores, Supply, Weapon};
 pub use crate::sim::formation::Formation;
 use crate::sim::formation::SHIP_DART;
 use crate::voronoi::Vec2;
-use crate::voronoi::grid::{OwnerGrid, voronoi_grid};
+use crate::voronoi::grid::voronoi_grid;
 use crate::voronoi::influence::weighted_scores;
 use crate::voronoi::labs::cell_color;
-use crate::voronoi::metric::{Metric, distance};
+use crate::voronoi::metric::Metric;
 use crate::voronoi::raster::{Canvas, Rgb};
 use crate::voronoi::rng::ParkMiller;
 use crate::voronoi::sites::VoronoiConfig;
 
 pub const MAX_FLEETS_PER_SIDE: usize = 8;
-pub const START_SHIPS: u32 = 10;
+pub const START_SHIPS: u32 = MAX_PLANET_SIZE;
 pub const MIN_SHIPS: u32 = 1;
 pub const MAX_SHIPS: u32 = 100;
 /// Independent garrisons build up to this many ships per point of size
@@ -61,10 +71,24 @@ pub const CONTEST_MARGIN: f32 = 0.10;
 pub const SIDE_NAMES: [&str; 2] = ["Blue", "Red"];
 /// Seconds between maintenance phases (upkeep and repairs).
 pub const MAINTENANCE_SECS: f32 = 5.0;
-/// Credits Blue and Red start with.
-pub const START_CREDITS: f32 = 50.0;
-/// Credits each independent planet starts with.
-pub const INDEPENDENT_CREDITS: f32 = 10.0;
+/// Resources: indices into a stock.
+pub const AMMO: usize = 0;
+pub const FOOD: usize = 1;
+pub const PARTS: usize = 2;
+pub const RESOURCE_NAMES: [&str; 3] = ["ammo", "food", "parts"];
+/// A resource stock: ammo, food, parts.
+pub type Stock = [f32; 3];
+/// What one combat ship carries at most.
+pub const SHIP_CAP: Stock = [10.0, 3.0, 2.0];
+/// The largest planet size (and every starting fleet's ship count).
+pub const MAX_PLANET_SIZE: u32 = 3;
+/// Each kind a planet starts with: home planets, then the rest.
+pub const HOME_STOCK: f32 = 30.0;
+pub const PLANET_STOCK: f32 = 10.0;
+/// A fleet needs a kind when its ships hold less than this share of capacity.
+pub const NEED_SHARE: f32 = 0.5;
+/// Seconds between convoy re-routes.
+pub const CONVOY_SECS: f32 = 1.0;
 const SIDE_COLORS: [Rgb; 2] = [[70, 130, 220], [215, 80, 70]];
 /// A planet's tax until its owner changes it (legitimacy 0.8, near the
 /// NetLogo model's default of 0.82).
@@ -91,10 +115,10 @@ pub const REBELS_PER_SIZE: f32 = 10.0;
 /// The prototype's sliders.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tuning {
-    /// Influence weight each ship adds (patches).
+    /// Voronoi weight each ship adds to its fleet's cell.
     pub weight_per_ship: f32,
-    /// Patch reach per point of weight, in pixels of a 720-wide map.
-    pub reach_per_weight: f32,
+    /// Voronoi weight of a planet's cell per point of size.
+    pub planet_weight: f32,
     /// Seconds to build one ship at a value-1 planet (value 3 is 3× faster).
     pub secs_per_ship: f32,
     /// Fleet speed, pixels a second on a 720-wide map.
@@ -102,18 +126,25 @@ pub struct Tuning {
     /// Multiplies the battle's rate of fire, so map fights take seconds,
     /// not minutes; the rules' proportions are unchanged.
     pub combat_speed: f32,
-    /// Income multiplier: a planet of size x produces x × this credits a
-    /// second, of which its owner takes the planet's tax.
+    /// Units a second each point of a planet's size produces, of which its
+    /// owner takes the planet's tax.
     pub income: f32,
-    /// Credits to build one ship.
+    /// Parts to build one ship.
     pub ship_cost: f32,
-    /// Credits a second each ship costs (debts are settled at the
-    /// maintenance phase: unpaid ships desert).
-    pub upkeep: f32,
-    /// Credits per shot fired.
-    pub shot_cost: f32,
-    /// Credits per hull point repaired at the maintenance phase.
-    pub repair_cost: f32,
+    /// Ammo each shot uses.
+    pub ammo_per_shot: f32,
+    /// Food each ship eats every maintenance phase.
+    pub food_per_phase: f32,
+    /// Hull points one part repairs.
+    pub hull_per_part: f32,
+    /// Units a supply ship carries.
+    pub supply_load: f32,
+    /// Chance a ship without food deserts, each maintenance phase.
+    pub desert_chance: f32,
+    /// Chance (× its damage) a damaged ship without parts breaks up, each phase.
+    pub wreck_chance: f32,
+    /// Shock added to a fleet per maintenance phase, × its shortage (0..1).
+    pub shortage_shock: f32,
     /// Cops in a planet's rebellion model per ship nearby, divided by the
     /// planet's size (bigger populations need more ships).
     pub cops_per_ship: f32,
@@ -129,15 +160,19 @@ impl Default for Tuning {
         // firing at the front kill about 0.5 ships a second.
         Self {
             weight_per_ship: 0.1,
-            reach_per_weight: 14.0,
+            planet_weight: 0.5,
             secs_per_ship: 15.0,
             speed: 30.0,
             combat_speed: 3.0,
             income: 4.0,
-            ship_cost: 10.0,
-            upkeep: 0.05,
-            shot_cost: 0.01,
-            repair_cost: 0.2,
+            ship_cost: 5.0,
+            ammo_per_shot: 0.1,
+            food_per_phase: 0.25,
+            hull_per_part: 2.5,
+            supply_load: 20.0,
+            desert_chance: 0.25,
+            wreck_chance: 0.3,
+            shortage_shock: 0.4,
             cops_per_ship: 40.0,
             war_hardship: 0.3,
             revolt_share: 0.25,
@@ -177,8 +212,12 @@ impl Owner {
 pub struct Planet {
     pub site: usize,
     pub pos: Vec2,
-    /// Size, 1 (small) to 3 (large): build rate, income and population.
+    /// Size, 1 (small) to 3 (large): build rate, output and population.
     pub value: u32,
+    /// The kind each point of size produces (the first `value` count).
+    pub produces: [usize; 3],
+    /// Resources on hand.
+    pub stock: Stock,
     pub owner: Owner,
     /// Progress toward the next ship, 0..1.
     pub build: f32,
@@ -220,7 +259,14 @@ pub struct Fleet {
     /// Radians; 0 = +x.
     pub facing: f32,
     pub dest: Option<Vec2>,
+    /// Highway waypoints still ahead (the last one is `dest`).
+    pub route: Vec<Vec2>,
+    /// A convoy on its way to this fleet (by id) to join it.
+    pub convoy: Option<u32>,
+    /// Combat ships.
     pub ships: u32,
+    /// Supply ships.
+    pub supply: u32,
     pub formation: Formation,
     pub morale: Morale,
     /// The planet it garrisons (planets build into it).
@@ -229,6 +275,8 @@ pub struct Fleet {
     pub ship_px: Vec<(Vec2, f32)>,
     /// Each ship's entity, in the same order as `ship_px`.
     pub ship_ids: Vec<Entity>,
+    /// Whether each ship (same order) is a supply ship.
+    pub is_supply: Vec<bool>,
     /// Fired or was fired on in the last second or so.
     pub engaged: bool,
 }
@@ -236,6 +284,11 @@ pub struct Fleet {
 impl Fleet {
     pub fn weight(&self, t: &Tuning) -> f32 {
         self.ships as f32 * t.weight_per_ship
+    }
+
+    /// Has combat ships (a convoy of supply ships alone doesn't).
+    pub fn armed(&self) -> bool {
+        self.ships > 0
     }
 
     /// Blue and Red fleets, unless routed.
@@ -256,23 +309,25 @@ pub struct Dominion {
     pub tuning: Tuning,
     /// The battle tuning the ECS world runs with (from `tuning`).
     pub battle: BattleTuning,
+    /// The relaxed sites planets were picked from.
     pub sites: Vec<Vec2>,
-    pub regions: OwnerGrid,
-    pub planet_at: Vec<Option<usize>>,
     pub planets: Vec<Planet>,
+    /// Delaunay edges between planets: the only ways fleets travel.
+    pub highways: Highways,
     pub fleets: Vec<Fleet>,
     /// The ECS world every ship lives in.
     pub world: World,
     pub shots: Vec<Shot>,
     /// Explosions: where (pixels) and age.
     pub booms: Vec<(Vec2, f32)>,
-    /// Credits per owner: Blue, Red, then each planet's independents
-    /// (see `purse`). Below zero only between maintenance phases.
-    pub credits: Vec<f32>,
     /// Seconds since the last maintenance phase.
     pub maintenance_timer: f32,
-    /// Ships lost to unpaid upkeep, per side (Blue, Red).
+    /// Ships lost to shortages (deserted or broken up), per side.
     pub deserted: [u32; 2],
+    /// Supply ships loaded, per side.
+    pub convoys_sent: [u32; 2],
+    rng: ParkMiller,
+    convoy_timer: f32,
     /// Each planet's people (rebellion model), stepped while Blue or Red own it.
     pub people: Vec<Rebellion>,
     pub rebellion: RebellionParams,
@@ -307,9 +362,10 @@ pub fn battle_tuning(t: &Tuning) -> BattleTuning {
 
 impl Dominion {
     /// `planets` of the sites get a planet (inland first, seeded). Blue and
-    /// Red each own the planet nearest their edge and start with `fleets`
-    /// fleets of 50 ships there; every other planet is independent with a
-    /// garrison of 10.
+    /// Red each own the planet nearest their edge (size 3, producing all
+    /// three kinds) and start with `fleets` fleets of `START_SHIPS` ships on
+    /// its highways, each with a full supply ship; every planet starts with
+    /// a garrison of its size.
     pub fn new(cfg: &VoronoiConfig, planets: usize, fleets: usize, tuning: Tuning) -> Self {
         let sites = cfg.relaxed_sites();
         let regions = voronoi_grid(&sites, cfg.w, cfg.h, cfg.metric);
@@ -321,7 +377,6 @@ impl Dominion {
             order.swap(i, j.min(i));
         }
         order.sort_by_key(|i| edge.contains(&(*i as u32)));
-        let mut planet_at = vec![None; sites.len()];
         let mut list: Vec<Planet> = Vec::new();
         for &site in order.iter().take(planets.max(2).min(sites.len())) {
             let roll = rng.next_float();
@@ -332,11 +387,13 @@ impl Dominion {
             } else {
                 1
             };
-            planet_at[site] = Some(list.len());
+            let produces = std::array::from_fn(|_| ((rng.next_float() * 3.0) as usize).min(2));
             list.push(Planet {
                 site,
                 pos: sites[site],
                 value,
+                produces,
+                stock: [PLANET_STOCK; 3],
                 owner: Owner::Independent(list.len()),
                 build: 0.0,
                 hold: None,
@@ -348,6 +405,7 @@ impl Dominion {
             });
         }
         let list_len = list.len();
+        let highways = Highways::new(&list.iter().map(|p| p.pos).collect::<Vec<_>>());
         let battle = battle_tuning(&tuning);
         let unit = UNIT * map_scale(cfg);
         let bounds = Rect::new(0.0, 0.0, cfg.w as f32 / unit, cfg.h as f32 / unit);
@@ -358,16 +416,17 @@ impl Dominion {
             tuning,
             battle,
             sites,
-            regions,
-            planet_at,
             planets: list,
+            highways,
             fleets: Vec::new(),
             world,
             shots: Vec::new(),
             booms: Vec::new(),
-            credits: Vec::new(),
             maintenance_timer: 0.0,
             deserted: [0; 2],
+            convoys_sent: [0; 2],
+            rng: ParkMiller::new(cfg.seed as i64 * 7 + 3),
+            convoy_timer: 0.0,
             people: (0..list_len).map(|i| Rebellion::new(cfg.seed as i64 * 31 + i as i64 + 101)).collect(),
             rebellion: RebellionParams::default(),
             revolts: [0; 2],
@@ -378,29 +437,37 @@ impl Dominion {
             applied: Some(tuning),
             face_timer: 0.0,
         };
-        d.credits = [START_CREDITS; 2].into_iter().chain(std::iter::repeat_n(INDEPENDENT_CREDITS, d.planets.len())).collect();
         if d.planets.len() < 2 {
             return d;
         }
         // Home planets: the westernmost for Blue, the easternmost for Red.
         let west = (0..d.planets.len()).min_by(|a, b| d.planets[*a].pos.x.total_cmp(&d.planets[*b].pos.x)).unwrap();
         let east = (0..d.planets.len()).filter(|i| *i != west).max_by(|a, b| d.planets[*a].pos.x.total_cmp(&d.planets[*b].pos.x)).unwrap();
-        d.planets[west].owner = Owner::Side(0);
-        d.planets[east].owner = Owner::Side(1);
         let scale = map_scale(cfg);
         for (side, home) in [(0, west), (1, east)] {
-            let at = d.planets[home].pos;
-            let toward = Vec2::new(cfg.w as f32 * 0.5, cfg.h as f32 * 0.5) - at;
-            let facing = toward.to_angle();
+            let p = &mut d.planets[home];
+            p.owner = Owner::Side(side);
+            p.value = MAX_PLANET_SIZE;
+            p.produces = [AMMO, FOOD, PARTS];
+            p.stock = [HOME_STOCK; 3];
+            let at = p.pos;
             let n = fleets.clamp(1, MAX_FLEETS_PER_SIDE);
-            // Side by side in front of the home planet, a formation's width apart.
-            let width = crate::sim::formation::frontage(Formation::Line, START_SHIPS as usize, d.battle.spacing) * UNIT * scale + 8.0;
-            let ahead = at + Vec2::from_angle(facing) * 45.0 * scale;
-            let across = Vec2::from_angle(facing).perp();
+            // Out along the home planet's highways, one fleet per road
+            // (round the roads again if there are more fleets).
+            let mut roads: Vec<usize> = d.highways.neighbors[home].clone();
+            if roads.is_empty() {
+                roads.push(home);
+            }
             for k in 0..n {
-                let pos = ahead + across * (k as f32 - (n as f32 - 1.0) / 2.0) * width;
-                let pos = pos.clamp(Vec2::splat(10.0), Vec2::new(cfg.w as f32 - 10.0, cfg.h as f32 - 10.0));
-                d.spawn(Owner::Side(side), pos, facing, START_SHIPS, None);
+                let to = d.planets[roads[k % roads.len()]].pos;
+                let dir = (to - at).normalize_or_zero();
+                let out = (45.0 + 20.0 * (k / roads.len()) as f32) * scale;
+                let pos = at + dir * out.min(at.distance(to) * 0.5);
+                let id = d.spawn(Owner::Side(side), pos, dir.to_angle(), START_SHIPS, None);
+                let e = d.fleets.iter().find(|f| f.id == id).unwrap().division;
+                let load = d.tuning.supply_load / 3.0;
+                let at = pos / d.unit();
+                crate::sim::add_supply(&mut d.world, e, at, [load; 3]);
             }
         }
         // Every planet starts with a garrison of `size` ships.
@@ -468,6 +535,7 @@ impl Dominion {
         let unit = self.unit();
         let division =
             crate::sim::spawn_division(&mut self.world, owner.side(), Formation::Line, pos / unit, facing, ships as usize, Order::Hold);
+        self.equip(division, SHIP_CAP);
         self.fleets.push(Fleet {
             id,
             division,
@@ -475,15 +543,33 @@ impl Dominion {
             pos,
             facing,
             dest: None,
+            route: Vec::new(),
+            convoy: None,
             ships,
+            supply: 0,
             formation: Formation::Line,
             morale: Morale::Steady,
             home,
             ship_px: Vec::new(),
             ship_ids: Vec::new(),
+            is_supply: Vec::new(),
             engaged: false,
         });
         id
+    }
+
+    /// Gives the division's combat ships that have no stores yet `stores`.
+    fn equip(&mut self, division: Entity, stores: Stock) {
+        let bare: Vec<Entity> = self
+            .world
+            .query_filtered::<(Entity, &InDivision), (bevy::prelude::Without<Stores>, bevy::prelude::Without<Supply>)>()
+            .iter(&self.world)
+            .filter(|(_, d)| d.0 == division)
+            .map(|(e, _)| e)
+            .collect();
+        for e in bare {
+            self.world.entity_mut(e).insert(Stores(stores));
+        }
     }
 
     pub fn scale(&self) -> f32 {
@@ -510,27 +596,51 @@ impl Dominion {
         2.0 * self.capture_radius()
     }
 
-    /// Index of an owner's stockpile in `credits`.
-    pub fn purse(owner: Owner) -> usize {
-        match owner {
-            Owner::Side(s) => s,
-            Owner::Independent(i) => 2 + i,
+    /// Units a second a planet adds to its stock, by kind: its tax share
+    /// of what each point of size produces, less what strikes cost.
+    pub fn planet_output(&self, p: &Planet) -> Stock {
+        let mut out = [0.0; 3];
+        for &k in p.produces.iter().take(p.value as usize) {
+            out[k] += self.tuning.income * p.tax * p.working();
         }
+        out
     }
 
-    pub fn credits_of(&self, owner: Owner) -> f32 {
-        self.credits.get(Self::purse(owner)).copied().unwrap_or(0.0)
+    /// Units a second an owner's planets produce, by kind.
+    pub fn planet_income(&self, owner: Owner) -> Stock {
+        let mut out = [0.0; 3];
+        for p in self.planets.iter().filter(|p| p.owner == owner) {
+            for (o, v) in out.iter_mut().zip(self.planet_output(p)) {
+                *o += v;
+            }
+        }
+        out
     }
 
-    /// Credits a second a planet earns its owner: its tax share of what it
-    /// produces, less what strikes cost.
-    pub fn planet_earning(&self, p: &Planet) -> f32 {
-        p.value as f32 * self.tuning.income * p.tax * p.working()
+    /// Everything an owner's planets hold, by kind.
+    pub fn stock_of(&self, owner: Owner) -> Stock {
+        let mut out = [0.0; 3];
+        for p in self.planets.iter().filter(|p| p.owner == owner) {
+            for (o, v) in out.iter_mut().zip(p.stock) {
+                *o += v;
+            }
+        }
+        out
     }
 
-    /// Credits a second an owner's planets earn.
-    pub fn planet_income(&self, owner: Owner) -> f32 {
-        self.planets.iter().filter(|p| p.owner == owner).map(|p| self.planet_earning(p)).sum()
+    /// What a fleet's combat ships carry in all, and the cargo of its
+    /// supply ships.
+    pub fn fleet_stores(&self, f: &Fleet) -> (Stock, Stock) {
+        let (mut stores, mut cargo) = ([0.0; 3], [0.0; 3]);
+        for e in &f.ship_ids {
+            if let Some(s) = self.world.get::<Stores>(*e) {
+                (0..3).for_each(|k| stores[k] += s.0[k]);
+            }
+            if let Some(s) = self.world.get::<Supply>(*e) {
+                (0..3).for_each(|k| cargo[k] += s.0[k]);
+            }
+        }
+        (stores, cargo)
     }
 
     /// Sets a planet's tax (clamped to 0..=MAX_TAX).
@@ -551,11 +661,6 @@ impl Dominion {
         self.fleets.iter().filter(|f| f.owner == owner).map(|f| f.ships).sum()
     }
 
-    /// Credits a second after planets and upkeep (shots not counted).
-    pub fn net_income(&self, owner: Owner) -> f32 {
-        self.planet_income(owner) - self.ships_of(owner) as f32 * self.tuning.upkeep
-    }
-
     pub fn fleet(&self, id: u32) -> Option<&Fleet> {
         self.fleets.iter().find(|f| f.id == id)
     }
@@ -574,25 +679,65 @@ impl Dominion {
         self.fleet(id).is_some_and(Fleet::controllable)
     }
 
-    fn division_mut(&mut self, id: u32) -> Option<bevy::prelude::Mut<'_, Division>> {
-        let e = self.fleet(id)?.division;
-        self.world.get_mut::<Division>(e)
+    /// Orders a controllable fleet to the nearest point on a highway to
+    /// `to`, by the shortest way along the highways; it stops garrisoning
+    /// (and a convoy stops being one).
+    pub fn order_move(&mut self, id: u32, to: Vec2) -> bool {
+        let Some(i) = self.fleet_index(id).filter(|i| self.fleets[*i].controllable()) else { return false };
+        self.fleets[i].home = None;
+        self.fleets[i].convoy = None;
+        self.route_to(i, to)
     }
 
-    /// Orders a controllable fleet to move; it stops garrisoning.
-    pub fn order_move(&mut self, id: u32, to: Vec2) -> bool {
-        let (w, h) = (self.cfg.w as f32, self.cfg.h as f32);
+    /// Plans fleet `i`'s highway route to `to` and starts the first leg.
+    fn route_to(&mut self, i: usize, to: Vec2) -> bool {
+        let route = self.highways.route(self.fleets[i].pos, to);
+        self.fleets[i].dest = route.last().copied();
+        self.fleets[i].route = route;
+        self.next_leg(i);
+        self.fleets[i].dest.is_some()
+    }
+
+    /// Sends fleet `i` toward its next waypoint, facing along the leg.
+    fn next_leg(&mut self, i: usize) {
         let unit = self.unit();
-        let Some(i) = self.fleet_index(id).filter(|i| self.fleets[*i].controllable()) else { return false };
-        let to = to.clamp(Vec2::ZERO, Vec2::new(w, h));
-        let f = &mut self.fleets[i];
-        f.dest = Some(to);
-        f.home = None;
-        let facing = (to - f.pos).to_angle();
-        if let Some(mut d) = self.division_mut(id) {
-            d.order = Order::MoveTo { to: to / unit, facing };
+        let f = &self.fleets[i];
+        let (e, from) = (f.division, f.pos);
+        let Some(&next) = f.route.first() else { return };
+        let facing = if next.distance(from) > 0.5 { (next - from).to_angle() } else { f.facing };
+        if let Some(mut d) = self.world.get_mut::<Division>(e) {
+            d.order = Order::MoveTo { to: next / unit, facing };
         }
-        true
+    }
+
+    /// A new fleet of one supply ship carrying `cargo` at `pos`; with a
+    /// target, a convoy bound for that fleet.
+    pub fn add_convoy(&mut self, owner: Owner, pos: Vec2, cargo: Stock, target: Option<u32>) -> u32 {
+        let id = self.spawn(owner, pos, 0.0, 0, None);
+        let fi = self.fleets.len() - 1;
+        let at = pos / self.unit();
+        crate::sim::add_supply(&mut self.world, self.fleets[fi].division, at, cargo);
+        self.fleets[fi].convoy = target;
+        self.fleets[fi].supply = 1;
+        if let Some(to) = target.and_then(|t| self.fleet(t)).map(|f| f.pos) {
+            self.route_to(fi, to);
+        }
+        self.sync();
+        id
+    }
+
+    /// A supply ship carrying `cargo` joins fleet `id`.
+    pub fn add_supply_ship(&mut self, id: u32, cargo: Stock) -> bool {
+        let Some(f) = self.fleet(id) else { return false };
+        let (e, at) = (f.division, f.pos / self.unit());
+        let ok = crate::sim::add_supply(&mut self.world, e, at, cargo).is_some();
+        self.sync();
+        ok
+    }
+
+    /// Highway distance from `a` to `b`.
+    pub fn road_distance(&self, a: Vec2, b: Vec2) -> f32 {
+        self.highways.distance(a, b)
     }
 
     /// The fleet a ship belongs to.
@@ -660,6 +805,9 @@ impl Dominion {
             let first = self.fleet_of_ship(ships[0])?;
             let (facing, formation) = (first.facing, first.formation);
             let id = self.spawn(owner, centre, facing, 0, None);
+            if let Some(f) = self.fleets.iter_mut().find(|f| f.id == id) {
+                f.ships = 1; // not empty until the transfer lands
+            }
             if let Some(e) = self.fleet(id).map(|f| f.division) {
                 crate::sim::set_formation(&mut self.world, e, formation);
             }
@@ -687,8 +835,12 @@ impl Dominion {
         let n = n.max(1);
         if n > have {
             crate::sim::add_ships(&mut self.world, e, (n - have) as usize);
+            self.equip(e, SHIP_CAP);
         } else if n < have {
-            crate::sim::remove_ships(&mut self.world, e, (have - n) as usize);
+            // Combat ships only, the last ones first.
+            let cut: Vec<Entity> =
+                f.ship_ids.iter().zip(&f.is_supply).filter(|(_, s)| !**s).map(|(e, _)| *e).rev().take((have - n) as usize).collect();
+            crate::sim::despawn_ships(&mut self.world, e, &cut);
         }
         self.sync();
     }
@@ -742,8 +894,8 @@ impl Dominion {
         let events: Vec<SimEvent> = self.world.resource_mut::<Messages<SimEvent>>().drain().collect();
         for ev in events {
             match ev {
-                SimEvent::Shot { from, to, side, hit } => {
-                    self.pay_for_shot(from * unit, side);
+                SimEvent::Shot { from, to, side, hit, shooter } => {
+                    self.spend_ammo(shooter);
                     self.shots.push((from * unit, to * unit, side, hit, 0.0));
                 }
                 SimEvent::Destroyed { pos, .. } => self.booms.push((pos * unit, 0.0)),
@@ -753,6 +905,7 @@ impl Dominion {
         self.sync();
         self.capture(DT);
         self.unrest(DT);
+        self.run_convoys(DT);
         self.maintenance_timer += DT;
         if self.maintenance_timer >= MAINTENANCE_SECS - 1e-4 {
             self.maintenance_timer = 0.0;
@@ -760,121 +913,292 @@ impl Dominion {
         }
     }
 
-    /// Every tick planets earn their owners' share, and
-    /// fleets pay their upkeep.
+    /// Every tick each planet adds its output to its stock.
     fn earn(&mut self, dt: f32) {
-        let t = self.tuning;
         for i in 0..self.planets.len() {
-            let earned = self.planet_earning(&self.planets[i]);
-            if let Some(c) = self.credits.get_mut(Self::purse(self.planets[i].owner)) {
-                *c += dt * earned;
-            }
-        }
-        for f in &self.fleets {
-            if let Some(c) = self.credits.get_mut(Self::purse(f.owner)) {
-                *c -= dt * f.ships as f32 * t.upkeep;
+            let out = self.planet_output(&self.planets[i]);
+            for (s, o) in self.planets[i].stock.iter_mut().zip(out) {
+                *s += dt * o;
             }
         }
     }
 
-    /// The shooter's owner pays for the shot (independents: the nearest
-    /// independent fleet's planet).
-    fn pay_for_shot(&mut self, from: Vec2, side: usize) {
-        let owner = if side < 2 {
-            Some(Owner::Side(side))
-        } else {
-            self.fleets
-                .iter()
-                .filter(|f| f.owner.side() == side)
-                .min_by(|a, b| a.pos.distance(from).total_cmp(&b.pos.distance(from)))
-                .map(|f| f.owner)
-        };
-        if let Some(c) = owner.and_then(|o| self.credits.get_mut(Self::purse(o))) {
-            *c -= self.tuning.shot_cost;
+    /// The shooter spends a round.
+    fn spend_ammo(&mut self, shooter: Entity) {
+        let per_shot = self.tuning.ammo_per_shot;
+        if let Some(mut s) = self.world.get_mut::<Stores>(shooter) {
+            s.0[AMMO] = (s.0[AMMO] - per_shot).max(0.0);
         }
     }
 
-    /// Owners out of credits can't fire: their guns stay unloaded.
+    /// Ships out of ammo can't fire: their guns stay unloaded.
     fn hold_fire(&mut self) {
-        let broke: Vec<Entity> = self.fleets.iter().filter(|f| self.credits_of(f.owner) <= 0.0).map(|f| f.division).collect();
-        if broke.is_empty() {
-            return;
-        }
-        for (d, mut w) in self.world.query::<(&InDivision, &mut Weapon)>().iter_mut(&mut self.world) {
-            if broke.contains(&d.0) {
+        let per_shot = self.tuning.ammo_per_shot;
+        for (s, mut w) in self.world.query::<(&Stores, &mut Weapon)>().iter_mut(&mut self.world) {
+            if s.0[AMMO] < per_shot {
                 w.cooldown = w.cooldown.max(2.0 * DT);
             }
         }
     }
 
-    /// The maintenance phase: an owner in debt loses the ships it couldn't
-    /// pay for since the last phase (they desert, from its biggest fleets),
-    /// then damaged ships of fleets out of combat are repaired while
-    /// credits last.
+    /// The owned planet within the capture radius of `pos`, if any.
+    fn friendly_planet(&self, owner: Owner, pos: Vec2) -> Option<usize> {
+        let r = self.capture_radius();
+        (0..self.planets.len()).find(|i| self.planets[*i].owner == owner && self.planets[*i].pos.distance(pos) <= r)
+    }
+
+    /// The maintenance phase, fleet by fleet:
+    /// 1. A fleet at one of its owner's planets draws from the planet's
+    ///    stock; then its supply ships unload into its ships (emptied ones
+    ///    are used up); then its ships' stores are split evenly.
+    /// 2. Every ship eats; with no food, ships may desert.
+    /// 3. Out of combat, parts repair damaged ships; damaged ships with no
+    ///    parts may break up.
+    /// 4. The shortage (ships lacking ammo, food or parts) shakes morale.
+    ///
+    /// Then planets load supply ships for fleets in need.
     fn maintain(&mut self) {
-        let per_ship = self.tuning.upkeep * MAINTENANCE_SECS;
-        for purse in 0..self.credits.len() {
-            let owner = if purse < 2 { Owner::Side(purse) } else { Owner::Independent(purse - 2) };
-            let ships = self.ships_of(owner);
-            if self.credits[purse] >= 0.0 {
+        let t = self.tuning;
+        let mut lost: Vec<(Entity, Vec<Entity>, Vec<Vec2>)> = Vec::new();
+        for fi in 0..self.fleets.len() {
+            let f = &self.fleets[fi];
+            let (owner, division, engaged) = (f.owner, f.division, f.engaged);
+            let mut combat: Vec<(Entity, Stock, f32, f32, Vec2)> = Vec::new();
+            let mut supply: Vec<(Entity, Stock)> = Vec::new();
+            for (k, e) in f.ship_ids.iter().enumerate() {
+                if let Some(c) = self.world.get::<Supply>(*e) {
+                    supply.push((*e, c.0));
+                } else if let (Some(st), Some(sh)) = (self.world.get::<Stores>(*e), self.world.get::<Ship>(*e)) {
+                    combat.push((*e, st.0, sh.hull, sh.max_hull, f.ship_px[k].0));
+                }
+            }
+            let n = combat.len();
+            if n == 0 {
                 continue;
             }
-            let short = -self.credits[purse];
-            self.credits[purse] = 0.0;
-            if per_ship <= 0.0 {
-                continue;
+            let mut pool: Stock = [0.0; 3];
+            for c in &combat {
+                (0..3).for_each(|k| pool[k] += c.1[k]);
             }
-            let mut cut = ((short / per_ship).ceil() as u32).min(ships);
+            let cap: Stock = std::array::from_fn(|k| SHIP_CAP[k] * n as f32);
+            // At home: the planet's stock.
+            if let Some(pi) = self.friendly_planet(owner, f.pos) {
+                let stock = &mut self.planets[pi].stock;
+                for k in 0..3 {
+                    let take = (cap[k] - pool[k]).max(0.0).min(stock[k]);
+                    stock[k] -= take;
+                    pool[k] += take;
+                }
+            }
+            // The supply train.
+            let mut empty: Vec<Entity> = Vec::new();
+            for (e, cargo) in &mut supply {
+                for k in 0..3 {
+                    let take = (cap[k] - pool[k]).max(0.0).min(cargo[k]);
+                    cargo[k] -= take;
+                    pool[k] += take;
+                }
+                if cargo.iter().sum::<f32>() < 0.01 {
+                    empty.push(*e);
+                } else if let Some(mut c) = self.world.get_mut::<Supply>(*e) {
+                    c.0 = *cargo;
+                }
+            }
+            // Eat.
+            let need = n as f32 * t.food_per_phase;
+            let hungry = if need > 0.0 { (1.0 - pool[FOOD] / need).clamp(0.0, 1.0) } else { 0.0 };
+            pool[FOOD] = (pool[FOOD] - need).max(0.0);
+            // Repair out of combat, as far as parts go.
+            let missing: f32 = combat.iter().map(|c| (c.3 - c.2).max(0.0)).sum();
+            let mut fixed = 0.0;
+            if !engaged && missing > 0.0 && t.hull_per_part > 0.0 {
+                fixed = missing.min(pool[PARTS] * t.hull_per_part);
+                pool[PARTS] -= fixed / t.hull_per_part;
+            }
+            let share = if missing > 0.0 { fixed / missing } else { 0.0 };
+            let no_parts = pool[PARTS] < 0.01;
+            let each: Stock = std::array::from_fn(|k| pool[k] / n as f32);
+            let mut gone: Vec<Entity> = Vec::new();
+            let mut booms: Vec<Vec2> = Vec::new();
+            let mut damaged_short = 0;
+            for (e, _, hull, max, pos) in &combat {
+                let hull = (*hull + (*max - *hull).max(0.0) * share).min(*max);
+                if let Some(mut sh) = self.world.get_mut::<Ship>(*e) {
+                    sh.hull = hull;
+                }
+                if let Some(mut st) = self.world.get_mut::<Stores>(*e) {
+                    st.0 = each;
+                }
+                if hungry > 0.0 && self.rng.next_float() < hungry * t.desert_chance {
+                    gone.push(*e);
+                    continue;
+                }
+                if hull < *max - 1e-3 && no_parts {
+                    damaged_short += 1;
+                    if self.rng.next_float() < (1.0 - hull / max) * t.wreck_chance {
+                        gone.push(*e);
+                        booms.push(*pos);
+                    }
+                }
+            }
+            // Shortage: the share of ships lacking each kind, averaged.
+            let no_ammo = if each[AMMO] < t.ammo_per_shot { 1.0 } else { 0.0 };
+            let shortage = (no_ammo + hungry + damaged_short as f32 / n as f32) / 3.0;
+            if shortage > 0.0
+                && let Some(mut d) = self.world.get_mut::<Division>(division)
+            {
+                d.shock += shortage * t.shortage_shock;
+            }
             if let Owner::Side(s) = owner {
-                self.deserted[s] += cut;
+                self.deserted[s] += gone.len() as u32;
             }
-            // One at a time from whichever fleet is biggest.
-            let mut fleets: Vec<(Entity, u32)> = self.fleets.iter().filter(|f| f.owner == owner).map(|f| (f.division, f.ships)).collect();
-            let mut take = vec![0u32; fleets.len()];
-            while cut > 0 {
-                let Some(i) = (0..fleets.len()).filter(|i| fleets[*i].1 > 0).max_by_key(|i| fleets[*i].1) else { break };
-                fleets[i].1 -= 1;
-                take[i] += 1;
-                cut -= 1;
+            gone.extend(empty);
+            if !gone.is_empty() {
+                lost.push((division, gone, booms));
             }
-            for (i, (e, _)) in fleets.iter().enumerate() {
-                if take[i] > 0 {
-                    crate::sim::remove_ships(&mut self.world, *e, take[i] as usize);
+        }
+        for (division, gone, booms) in lost {
+            crate::sim::despawn_ships(&mut self.world, division, &gone);
+            self.booms.extend(booms.into_iter().map(|p| (p, 0.0)));
+        }
+        self.sync();
+        self.load_convoys();
+    }
+
+    /// Each Blue or Red planet with a supply ship's load in stock loads one
+    /// for the nearest (by highway) of its owner's fleets that is away from
+    /// a friendly planet and short of a kind it has, counting what is
+    /// already on its way.
+    fn load_convoys(&mut self) {
+        let t = self.tuning;
+        if t.supply_load <= 0.0 {
+            return;
+        }
+        // What each fleet will hold once the convoys bound for it arrive.
+        let mut incoming: std::collections::HashMap<u32, Stock> = std::collections::HashMap::new();
+        for f in self.fleets.iter().filter(|f| f.convoy.is_some()) {
+            let (_, cargo) = self.fleet_stores(f);
+            let e = incoming.entry(f.convoy.unwrap()).or_insert([0.0; 3]);
+            (0..3).for_each(|k| e[k] += cargo[k]);
+        }
+        for pi in 0..self.planets.len() {
+            let p = self.planets[pi];
+            let Owner::Side(side) = p.owner else { continue };
+            if p.stock.iter().sum::<f32>() < t.supply_load {
+                continue;
+            }
+            let mut best: Option<(f32, u32, Stock)> = None;
+            for f in &self.fleets {
+                if f.owner != p.owner || !f.armed() || f.morale == Morale::Routed || self.friendly_planet(f.owner, f.pos).is_some() {
+                    continue;
+                }
+                let (stores, cargo) = self.fleet_stores(f);
+                let inc = incoming.get(&f.id).copied().unwrap_or([0.0; 3]);
+                let short: Stock = std::array::from_fn(|k| {
+                    let cap = SHIP_CAP[k] * f.ships as f32;
+                    let have = stores[k] + cargo[k] + inc[k];
+                    if have < cap * NEED_SHARE { cap - have } else { 0.0 }
+                });
+                if !(0..3).any(|k| short[k] > 0.0 && p.stock[k] >= 1.0) {
+                    continue;
+                }
+                let dist = self.road_distance(p.pos, f.pos);
+                if best.is_none_or(|b| dist < b.0) {
+                    best = Some((dist, f.id, short));
+                }
+            }
+            let Some((_, target, short)) = best else { continue };
+            // What the fleet lacks first (shared in proportion to its
+            // shortages), then the rest of the stock in proportion.
+            let stock = &mut self.planets[pi].stock;
+            let mut cargo = [0.0; 3];
+            let total_short: f32 = short.iter().sum();
+            let fit = (t.supply_load / total_short).min(1.0);
+            for k in 0..3 {
+                let take = (short[k] * fit).min(stock[k]);
+                cargo[k] += take;
+                stock[k] -= take;
+            }
+            let room = t.supply_load - cargo.iter().sum::<f32>();
+            let total: f32 = stock.iter().sum();
+            if room > 0.0 && total > 0.0 {
+                let frac = (room / total).min(1.0);
+                for k in 0..3 {
+                    let take = stock[k] * frac;
+                    cargo[k] += take;
+                    stock[k] -= take;
+                }
+            }
+            let e = incoming.entry(target).or_insert([0.0; 3]);
+            (0..3).for_each(|k| e[k] += cargo[k]);
+            self.add_convoy(p.owner, p.pos, cargo, Some(target));
+            self.convoys_sent[side] += 1;
+        }
+        self.sync();
+    }
+
+    /// Convoys chase their fleets along the highways and join them in
+    /// range. One whose fleet is gone heads for its owner's nearest planet
+    /// and unloads there.
+    fn run_convoys(&mut self, dt: f32) {
+        self.convoy_timer += dt;
+        if self.convoy_timer < CONVOY_SECS - 1e-4 {
+            return;
+        }
+        self.convoy_timer = 0.0;
+        let reach = self.range() * 2.0;
+        let mut joins: Vec<(Vec<Entity>, Entity)> = Vec::new();
+        let mut unload: Vec<(usize, usize)> = Vec::new();
+        for i in 0..self.fleets.len() {
+            let f = &self.fleets[i];
+            let Some(target) = f.convoy else { continue };
+            let goal = self.fleet(target).filter(|g| g.armed() && g.morale != Morale::Routed && g.owner == f.owner).map(|g| (g.pos, g.division));
+            match goal {
+                Some((at, division)) if at.distance(f.pos) <= reach => joins.push((f.ship_ids.clone(), division)),
+                Some((at, _)) => {
+                    self.route_to(i, at);
+                }
+                None => {
+                    let owner = self.fleets[i].owner;
+                    let pos = self.fleets[i].pos;
+                    let home = (0..self.planets.len())
+                        .filter(|p| self.planets[*p].owner == owner)
+                        .min_by(|a, b| self.road_distance(pos, self.planets[*a].pos).total_cmp(&self.road_distance(pos, self.planets[*b].pos)));
+                    match home {
+                        Some(p) if self.planets[p].pos.distance(pos) <= self.capture_radius() => unload.push((i, p)),
+                        Some(p) => {
+                            let to = self.planets[p].pos;
+                            self.route_to(i, to);
+                        }
+                        None => {}
+                    }
                 }
             }
         }
-        // Repairs, for fleets not fighting.
-        let owners: std::collections::HashMap<Entity, Owner> =
-            self.fleets.iter().filter(|f| !f.engaged).map(|f| (f.division, f.owner)).collect();
-        let cost = self.tuning.repair_cost;
-        let credits = &mut self.credits;
-        for (d, mut ship) in self.world.query::<(&InDivision, &mut Ship)>().iter_mut(&mut self.world) {
-            let Some(owner) = owners.get(&d.0) else { continue };
-            let missing = ship.max_hull - ship.hull;
-            if missing <= 0.0 {
-                continue;
-            }
-            let c = &mut credits[Self::purse(*owner)];
-            let fix = if cost > 0.0 { missing.min(*c / cost) } else { missing };
-            if fix <= 0.0 {
-                continue;
-            }
-            ship.hull += fix;
-            *c -= fix * cost;
+        for (i, p) in unload {
+            let (_, cargo) = self.fleet_stores(&self.fleets[i]);
+            (0..3).for_each(|k| self.planets[p].stock[k] += cargo[k]);
+            let (division, ships) = (self.fleets[i].division, self.fleets[i].ship_ids.clone());
+            crate::sim::despawn_ships(&mut self.world, division, &ships);
+        }
+        for (ships, division) in joins {
+            crate::sim::transfer_ships(&mut self.world, &ships, division);
         }
         self.sync();
     }
 
     /// Reads every fleet back from its division; drops the empty ones.
+    /// A fleet that reaches a waypoint takes the next leg.
     fn sync(&mut self) {
         let unit = self.unit();
-        let mut ships: std::collections::HashMap<Entity, Vec<(Vec2, f32, Entity)>> = std::collections::HashMap::new();
-        for (e, p, h, d) in self.world.query::<(Entity, &Pos, &Heading, &InDivision)>().iter(&self.world) {
-            ships.entry(d.0).or_default().push((p.0 * unit, h.0, e));
+        let mut ships: std::collections::HashMap<Entity, Vec<(Vec2, f32, Entity, bool)>> = std::collections::HashMap::new();
+        for (e, p, h, d, s) in self.world.query::<(Entity, &Pos, &Heading, &InDivision, bevy::prelude::Has<Supply>)>().iter(&self.world) {
+            ships.entry(d.0).or_default().push((p.0 * unit, h.0, e, s));
         }
         let mut gone = Vec::new();
         let mut arrived = Vec::new();
-        for f in &mut self.fleets {
+        let mut legs = Vec::new();
+        for (i, f) in self.fleets.iter_mut().enumerate() {
             let Some(d) = self.world.get::<Division>(f.division) else {
                 gone.push(f.division);
                 continue;
@@ -885,29 +1209,43 @@ impl Dominion {
                 continue;
             }
             list.sort_by_key(|s| s.2);
-            f.pos = list.iter().map(|s| s.0).sum::<Vec2>() / list.len() as f32;
-            f.ships = list.len() as u32;
+            // The fleet is where its combat ships are (a convoy: its ships).
+            let core: Vec<Vec2> = list.iter().filter(|s| !s.3).map(|s| s.0).collect();
+            let core = if core.is_empty() { list.iter().map(|s| s.0).collect() } else { core };
+            f.pos = core.iter().copied().sum::<Vec2>() / core.len() as f32;
+            f.ships = list.iter().filter(|s| !s.3).count() as u32;
+            f.supply = list.len() as u32 - f.ships;
             f.ship_px = list.iter().map(|s| (s.0, s.1)).collect();
             f.ship_ids = list.iter().map(|s| s.2).collect();
+            f.is_supply = list.iter().map(|s| s.3).collect();
             f.facing = d.facing;
             f.formation = d.formation;
             f.morale = d.morale;
             f.engaged = d.since_contact < 1.5;
             if f.morale == Morale::Routed {
                 f.dest = None;
+                f.route.clear();
                 f.home = None;
             }
-            if let Some(dest) = f.dest
-                && (d.anchor * unit).distance(dest) < 1.0
+            if let Some(&next) = f.route.first()
+                && (d.anchor * unit).distance(next) < 1.0
             {
-                f.dest = None;
-                arrived.push(f.division);
+                f.route.remove(0);
+                if f.route.is_empty() {
+                    f.dest = None;
+                    arrived.push(f.division);
+                } else {
+                    legs.push(i);
+                }
             }
         }
         for e in arrived {
             if let Some(mut d) = self.world.get_mut::<Division>(e) {
                 d.order = Order::Hold;
             }
+        }
+        for i in legs {
+            self.next_leg(i);
         }
         self.fleets.retain(|f| !gone.contains(&f.division));
         for e in gone {
@@ -940,15 +1278,9 @@ impl Dominion {
         let _ = unit;
     }
 
-    /// Whether an owner can pay for one more ship now and keep paying its
-    /// upkeep from its planets' income.
-    fn can_build(&self, owner: Owner) -> bool {
-        let t = &self.tuning;
-        self.credits_of(owner) >= t.ship_cost && self.planet_income(owner) >= (self.ships_of(owner) + 1) as f32 * t.upkeep
-    }
-
     fn produce(&mut self, dt: f32) {
         let secs = self.tuning.secs_per_ship.max(0.1);
+        let cost = self.tuning.ship_cost;
         for i in 0..self.planets.len() {
             let (owner, value, pos) = (self.planets[i].owner, self.planets[i].value, self.planets[i].pos);
             let garrison = self.fleets.iter().position(|f| f.home == Some(i) && f.owner == owner);
@@ -960,16 +1292,19 @@ impl Dominion {
             }
             self.planets[i].build += dt * value as f32 / secs * self.planets[i].working();
             while self.planets[i].build >= 1.0 {
-                // Short of credits or of income for its upkeep: the ship waits.
-                if !self.can_build(owner) {
+                // Ships are built of parts; short of them, the ship waits.
+                if self.planets[i].stock[PARTS] < cost {
                     self.planets[i].build = 1.0;
                     break;
                 }
+                self.planets[i].stock[PARTS] -= cost;
                 self.planets[i].build -= 1.0;
-                self.credits[Self::purse(owner)] -= self.tuning.ship_cost;
                 match self.fleets.iter().position(|f| f.home == Some(i) && f.owner == owner) {
                     Some(g) => {
-                        crate::sim::add_ships(&mut self.world, self.fleets[g].division, 1);
+                        let e = self.fleets[g].division;
+                        crate::sim::add_ships(&mut self.world, e, 1);
+                        // Built bare: the planet's stock fills it at the next phase.
+                        self.equip(e, [0.0; 3]);
                         self.fleets[g].ships += 1;
                     }
                     None => {
@@ -985,7 +1320,7 @@ impl Dominion {
         let r = self.capture_radius();
         for i in 0..self.planets.len() {
             let (owner, pos) = (self.planets[i].owner, self.planets[i].pos);
-            let near = |o: Owner| self.fleets.iter().any(|f| f.owner == o && f.morale != Morale::Routed && f.pos.distance(pos) <= r);
+            let near = |o: Owner| self.fleets.iter().any(|f| f.owner == o && f.armed() && f.morale != Morale::Routed && f.pos.distance(pos) <= r);
             if near(owner) {
                 self.planets[i].hold = None;
                 continue;
@@ -1073,8 +1408,6 @@ impl Dominion {
                 f.home = None;
             }
         }
-        let purse = Self::purse(Owner::Independent(i));
-        self.credits[purse] = self.credits[purse].max(INDEPENDENT_CREDITS);
         let ships = ((rebels * value as f32 * REBELS_PER_SIZE).round() as u32).max(1);
         let facing = (Vec2::new(self.cfg.w as f32, self.cfg.h as f32) * 0.5 - pos).to_angle();
         self.spawn(Owner::Independent(i), pos, facing, ships, Some(i));
@@ -1106,48 +1439,48 @@ impl Dominion {
     }
 
     /// A key for everything the background layer depends on.
-    pub fn background_key(&self, regions: bool) -> String {
-        let owners: Vec<Owner> = self.planets.iter().map(|p| p.owner).collect();
-        format!("{:?}|{:?}|{regions}", self.cfg, owners)
+    pub fn background_key(&self) -> String {
+        format!("{:?}", self.cfg)
     }
 }
 
-/// The fleets as weighted influence bases (the grow-the-seeds patches).
+/// A cell of the map's one Voronoi diagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Site {
+    Planet(usize),
+    Fleet(usize),
+}
+
+/// Planets and fleets as the sites of one multiplicatively weighted
+/// Voronoi diagram: a planet weighs size × planet weight, a fleet ships ×
+/// weight per ship, and every point belongs to the site with the lowest
+/// distance ÷ weight.
 pub struct Influence {
-    /// Score (distance ÷ weight) beyond which a fleet doesn't reach.
-    pub reach: f32,
     bases: Vec<Vec2>,
     weights: Vec<f32>,
-    owners: Vec<Owner>,
+    sites: Vec<Site>,
     metric: Metric,
 }
 
 impl Influence {
     pub fn new(d: &Dominion) -> Self {
-        Self {
-            reach: d.tuning.reach_per_weight * d.scale(),
-            bases: d.fleets.iter().map(|f| f.pos).collect(),
-            weights: d.fleets.iter().map(|f| f.weight(&d.tuning)).collect(),
-            owners: d.fleets.iter().map(|f| f.owner).collect(),
-            metric: d.cfg.metric,
+        let mut s = Self { bases: Vec::new(), weights: Vec::new(), sites: Vec::new(), metric: d.cfg.metric };
+        for (i, p) in d.planets.iter().enumerate() {
+            s.bases.push(p.pos);
+            s.weights.push(p.value as f32 * d.tuning.planet_weight);
+            s.sites.push(Site::Planet(i));
         }
+        for (i, f) in d.fleets.iter().enumerate() {
+            s.bases.push(f.pos);
+            s.weights.push(f.weight(&d.tuning));
+            s.sites.push(Site::Fleet(i));
+        }
+        s
     }
 
-    /// The dominating fleet at `p` (if any reaches), whether a hostile
-    /// fleet contests it, and the score.
-    pub fn at(&self, p: Vec2) -> (Option<usize>, bool, f32) {
-        let inf = weighted_scores(&self.bases, &self.weights, p, self.metric);
-        let Some(best) = inf.owner.filter(|_| inf.best <= self.reach) else { return (None, false, inf.best) };
-        let owner = self.owners[best];
-        let rival = self
-            .bases
-            .iter()
-            .zip(&self.weights)
-            .zip(&self.owners)
-            .filter(|((_, w), o)| owner.hostile(**o) && **w > 0.0)
-            .map(|((b, w), _)| distance(*b, p, self.metric) / w)
-            .fold(f32::INFINITY, f32::min);
-        (Some(best), rival <= self.reach && rival <= inf.best * (1.0 + CONTEST_MARGIN), inf.best)
+    /// The cell `p` lies in (none only when no site has weight).
+    pub fn at(&self, p: Vec2) -> Option<Site> {
+        weighted_scores(&self.bases, &self.weights, p, self.metric).owner.map(|i| self.sites[i])
     }
 }
 
@@ -1161,7 +1494,7 @@ pub struct DrawOptions {
     pub marquee: Option<(Vec2, Vec2)>,
     /// Patch sampling step in pixels.
     pub step: u32,
-    /// The selected planet: highlighted, its people drawn in an inset.
+    /// The selected planet (highlighted).
     pub planet: Option<usize>,
 }
 
@@ -1180,40 +1513,71 @@ const INK: Rgb = [10, 10, 14];
 const GOLD: Rgb = [235, 190, 80];
 const HIT: Rgb = [255, 230, 150];
 const SHAKEN: Rgb = [255, 209, 102];
+const PLANET: Rgb = [230, 220, 170];
+const PLANET_DIM: Rgb = [120, 112, 88];
+const HIGHWAY: Rgb = [110, 120, 150];
+pub const RESOURCE_COLORS: [Rgb; 3] = [[235, 80, 60], [90, 200, 100], [175, 180, 190]];
 const UNREST_LOW: Rgb = [240, 210, 90];
 const UNREST_HIGH: Rgb = [235, 60, 50];
 
-/// A planet's rebellion model as an inset: quiet people grey, rebels red,
-/// prisoners dark, cops in the owner's colour.
-fn draw_people(c: &mut Canvas, people: &Rebellion, owner: Owner) {
+/// A planet's people inside its disc: quiet people in the planet's
+/// colour, rebels red, prisoners dark, cops in the owner's colour.
+fn draw_people(c: &mut Canvas, people: &Rebellion, owner: Owner, at: Vec2, r: f32) {
     use super::rebellion::{Cell, SIDE};
-    let (px, margin) = (3i32, 6i32);
-    let size = SIDE as i32 * px;
-    for y in margin - 2..margin + size + 2 {
-        for x in margin - 2..margin + size + 2 {
-            c.set(x, y, INK);
-        }
-    }
+    let cells = people.cells();
     let cop = match owner {
-        Owner::Side(s) => mix(SIDE_COLORS[s], WHITE, 0.3),
+        Owner::Side(s) => mix(SIDE_COLORS[s], WHITE, 0.35),
         o => owner_color(o),
     };
-    for (k, cell) in people.cells().iter().enumerate() {
-        let col = match cell {
-            Cell::Empty => [24, 26, 36],
-            Cell::Quiet => [120, 124, 136],
-            Cell::Active => [235, 60, 50],
-            Cell::Jailed => [60, 50, 50],
-            Cell::Cop => cop,
-        };
-        let (x, y) = ((k % SIDE) as i32 * px + margin, (k / SIDE) as i32 * px + margin);
-        for dy in 0..px - 1 {
-            for dx in 0..px - 1 {
-                c.set(x + dx, y + dy, col);
+    let ri = r.ceil() as i32;
+    for dy in -ri..=ri {
+        for dx in -ri..=ri {
+            let (fx, fy) = (dx as f32 + 0.5, dy as f32 + 0.5);
+            if fx * fx + fy * fy > r * r {
+                continue;
+            }
+            let gx = (((fx / r) * 0.5 + 0.5) * SIDE as f32).clamp(0.0, SIDE as f32 - 1.0) as usize;
+            let gy = (((fy / r) * 0.5 + 0.5) * SIDE as f32).clamp(0.0, SIDE as f32 - 1.0) as usize;
+            let col = match cells[gy * SIDE + gx] {
+                Cell::Empty => PLANET_DIM,
+                Cell::Quiet => PLANET,
+                Cell::Active => [235, 60, 50],
+                Cell::Jailed => [70, 45, 45],
+                Cell::Cop => cop,
+            };
+            c.set(at.x as i32 + dx, at.y as i32 + dy, col);
+        }
+    }
+}
+
+/// One icon per point of a planet's size, in a row above it: ammo a red
+/// triangle, food a green disc, parts a grey square.
+fn draw_icons(c: &mut Canvas, p: &Planet, at: Vec2, r: f32) {
+    let n = p.value as usize;
+    let size = 3.0;
+    for (k, kind) in p.produces.iter().take(n).enumerate() {
+        let x = at.x + (k as f32 - (n as f32 - 1.0) / 2.0) * (2.0 * size + 3.0);
+        let o = Vec2::new(x, at.y - r - size - 4.0);
+        match *kind {
+            AMMO => {
+                let tri = [o + Vec2::new(0.0, -size - 1.0), o + Vec2::new(size + 1.0, size), o + Vec2::new(-size - 1.0, size)];
+                let ink = [o + Vec2::new(0.0, -size - 2.5), o + Vec2::new(size + 2.5, size + 1.0), o + Vec2::new(-size - 2.5, size + 1.0)];
+                c.polygon_fill(&ink, INK, 1.0);
+                c.polygon_fill(&tri, RESOURCE_COLORS[AMMO], 1.0);
+            }
+            FOOD => {
+                c.disc(o, size + 1.0, INK, 1.0);
+                c.disc(o, size, RESOURCE_COLORS[FOOD], 1.0);
+            }
+            _ => {
+                let sq = |h: f32| [o + Vec2::new(-h, -h), o + Vec2::new(h, -h), o + Vec2::new(h, h), o + Vec2::new(-h, h)];
+                c.polygon_fill(&sq(size + 1.0), INK, 1.0);
+                c.polygon_fill(&sq(size - 0.3), RESOURCE_COLORS[PARTS], 1.0);
             }
         }
     }
 }
+
 const ROUTED: Rgb = [93, 100, 120];
 
 pub fn owner_color(o: Owner) -> Rgb {
@@ -1299,9 +1663,8 @@ impl View {
 /// The slow-changing layer: planet regions in their owner's colours,
 /// computed per output pixel so borders stay sharp at any zoom. `step` > 1
 /// samples coarsely (while the camera is moving).
-pub fn render_background(d: &Dominion, view: &View, regions: bool, step: u32) -> Canvas {
+pub fn render_background(d: &Dominion, view: &View, step: u32) -> Canvas {
     let mut c = Canvas::new(view.w, view.h, OUTSIDE);
-    let index = crate::voronoi::metric::SiteIndex::new(&d.sites, d.cfg.metric);
     let world = Vec2::new(d.cfg.w as f32, d.cfg.h as f32);
     let step = step.max(1);
     for y in (0..view.h).step_by(step as usize) {
@@ -1310,24 +1673,9 @@ pub fn render_background(d: &Dominion, view: &View, regions: bool, step: u32) ->
             if p.x < 0.0 || p.y < 0.0 || p.x > world.x || p.y > world.y {
                 continue;
             }
-            let n = index.nearest_two(p);
-            let planet = d.planet_at.get(n.nearest).copied().flatten();
-            let col = match planet {
-                Some(pi) if regions => {
-                    // On a border when the two nearest sites are almost tied
-                    // (about one output pixel either side).
-                    if (n.d2 - n.d1) * view.zoom < 1.2 * step as f32 && d.planet_at.get(n.second).copied().flatten() != Some(pi) {
-                        INK
-                    } else {
-                        let pl = &d.planets[pi];
-                        Canvas::shade_px(owner_color(pl.owner), if matches!(pl.owner, Owner::Side(_)) { 0.45 } else { 0.75 })
-                    }
-                }
-                _ => SPACE,
-            };
             for by in y..(y + step).min(view.h) {
                 for bx in x..(x + step).min(view.w) {
-                    c.set(bx as i32, by as i32, col);
+                    c.set(bx as i32, by as i32, SPACE);
                 }
             }
         }
@@ -1345,41 +1693,43 @@ pub fn tones(d: &Dominion) -> Vec<Rgb> {
         .collect()
 }
 
-/// Patches, planets and ships over a cached background, through `view`.
+/// A planet's radius on screen (big enough to show its people).
+pub fn planet_radius(d: &Dominion, p: &Planet, zoom: f32) -> f32 {
+    ((3.0 + 2.6 * p.value as f32) * d.scale().max(0.8) * zoom).max(4.0)
+}
+
+/// The Voronoi cells, highways, planets and ships over a cached
+/// background, through `view`.
 pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions) -> Canvas {
     let (w, h) = (view.w, view.h);
     let mut c = background.clone();
     let tones = tones(d);
     let z = view.zoom;
-    // Patches, sampled every `step` output pixels.
+    // The one Voronoi diagram, sampled every `step` output pixels; cells
+    // next to a different cell get every pixel computed exactly, so the
+    // borders stay smooth.
     let step = opts.step.max(1);
     let (gw, gh) = (w.div_ceil(step), h.div_ceil(step));
     let inf = Influence::new(d);
     let world = Vec2::new(d.cfg.w as f32, d.cfg.h as f32);
-    let mut cells: Vec<(Option<usize>, bool, bool)> = vec![(None, false, false); (gw * gh) as usize];
+    let sample = |x: f32, y: f32| {
+        let p = view.to_world(Vec2::new(x, y));
+        if p.x < 0.0 || p.y < 0.0 || p.x > world.x || p.y > world.y { None } else { inf.at(p) }
+    };
+    let mut cells: Vec<Option<Site>> = vec![None; (gw * gh) as usize];
     for gy in 0..gh {
         for gx in 0..gw {
-            let p = view.to_world(Vec2::new((gx * step) as f32 + step as f32 * 0.5, (gy * step) as f32 + step as f32 * 0.5));
-            if p.x < 0.0 || p.y < 0.0 || p.x > world.x || p.y > world.y {
-                continue;
-            }
-            let (fleet, contested, score) = inf.at(p);
-            // The last ~1.5 output pixels of a patch's reach.
-            let front = fleet.is_some_and(|f| (inf.reach - score) * d.fleets[f].weight(&d.tuning) * z < 1.5 * step as f32);
-            cells[(gy * gw + gx) as usize] = (fleet, contested, front);
+            cells[(gy * gw + gx) as usize] = sample((gx * step) as f32 + step as f32 * 0.5, (gy * step) as f32 + step as f32 * 0.5);
         }
     }
     let coarse = |x: u32, y: u32| cells[((y / step) * gw + x / step) as usize];
-    // Cells next to a different cell sit on an edge: those get every pixel
-    // computed exactly, so patch outlines and seams stay smooth.
     let edge_cell = |gx: u32, gy: u32| {
         let here = cells[(gy * gw + gx) as usize];
-        here.2
-            || [(gx.wrapping_sub(1), gy), (gx + 1, gy), (gx, gy.wrapping_sub(1)), (gx, gy + 1)]
-                .iter()
-                .any(|&(nx, ny)| nx < gw && ny < gh && cells[(ny * gw + nx) as usize].0 != here.0)
+        [(gx.wrapping_sub(1), gy), (gx + 1, gy), (gx, gy.wrapping_sub(1)), (gx, gy + 1)]
+            .iter()
+            .any(|&(nx, ny)| nx < gw && ny < gh && cells[(ny * gw + nx) as usize] != here)
     };
-    let mut fine: Vec<Option<(Option<usize>, bool, bool)>> = vec![None; (w * h) as usize];
+    let mut fine: Vec<Option<Option<Site>>> = vec![None; (w * h) as usize];
     for gy in 0..gh {
         for gx in 0..gw {
             if !edge_cell(gx, gy) {
@@ -1387,15 +1737,7 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
             }
             for y in gy * step..((gy + 1) * step).min(h) {
                 for x in gx * step..((gx + 1) * step).min(w) {
-                    let p = view.to_world(Vec2::new(x as f32 + 0.5, y as f32 + 0.5));
-                    let v = if p.x < 0.0 || p.y < 0.0 || p.x > world.x || p.y > world.y {
-                        (None, false, false)
-                    } else {
-                        let (fleet, contested, score) = inf.at(p);
-                        let front = fleet.is_some_and(|f| (inf.reach - score) * d.fleets[f].weight(&d.tuning) * z < 1.5);
-                        (fleet, contested, front)
-                    };
-                    fine[(y * w + x) as usize] = Some(v);
+                    fine[(y * w + x) as usize] = Some(sample(x as f32 + 0.5, y as f32 + 0.5));
                 }
             }
         }
@@ -1403,26 +1745,36 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
     let at = |x: u32, y: u32| fine[(y * w + x) as usize].unwrap_or_else(|| coarse(x, y));
     for y in 0..h {
         for x in 0..w {
-            let (fleet, contested, front) = at(x, y);
-            let Some(f) = fleet else { continue };
+            let Some(site) = at(x, y) else { continue };
             let base = c.get(x, y);
-            let mut col = if contested && (x + y) % 8 < 4 { mix(base, CONTESTED, 0.5) } else { mix(base, tones[f], 0.35) };
+            let mut col = match site {
+                Site::Planet(i) if opts.regions => {
+                    let o = d.planets[i].owner;
+                    Canvas::shade_px(owner_color(o), if matches!(o, Owner::Side(_)) { 0.45 } else { 0.75 })
+                }
+                Site::Planet(_) => base,
+                Site::Fleet(f) => mix(base, tones[f], 0.4),
+            };
             if opts.borders {
-                let right = if x + 1 < w { at(x + 1, y).0 } else { fleet };
-                let down = if y + 1 < h { at(x, y + 1).0 } else { fleet };
-                if (right.is_some() && right != fleet) || (down.is_some() && down != fleet) {
+                let right = if x + 1 < w { at(x + 1, y) } else { Some(site) };
+                let down = if y + 1 < h { at(x, y + 1) } else { Some(site) };
+                if (right.is_some() && right != Some(site)) || (down.is_some() && down != Some(site)) {
                     col = INK;
-                } else if front {
-                    col = tones[f];
                 }
             }
             c.set(x as i32, y as i32, col);
         }
     }
-    // Planets (world size, at least a few pixels), with a capture ring.
-    for p in &d.planets {
+    // Highways.
+    for &(a, b) in &d.highways.edges {
+        c.line(view.to_screen(d.highways.nodes[a]), view.to_screen(d.highways.nodes[b]), 1.5, INK, 0.6);
+        c.line(view.to_screen(d.highways.nodes[a]), view.to_screen(d.highways.nodes[b]), 1.0, HIGHWAY, 0.7);
+    }
+    // Planets: their people inside, the capture ring and unrest arc
+    // around, an icon per point of size above.
+    for (i, p) in d.planets.iter().enumerate() {
         let at = view.to_screen(p.pos);
-        let r = ((1.5 + 1.3 * p.value as f32) * d.scale().max(0.8) * z).max(2.5);
+        let r = planet_radius(d, p, z);
         if let Some((by, t)) = p.hold {
             let frac = (t / HOLD_SECS).clamp(0.0, 1.0);
             let n = (64.0 * frac) as usize;
@@ -1431,8 +1783,6 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
                 c.disc(at + Vec2::from_angle(a) * (r + 6.0), 1.8, owner_color(by), 1.0);
             }
         }
-        // Unrest: an arc around Blue's and Red's planets, yellow to red,
-        // full at the revolt share.
         if matches!(p.owner, Owner::Side(_)) && p.unrest > 0.01 {
             let frac = (p.unrest / d.tuning.revolt_share.max(0.01)).clamp(0.0, 1.0);
             let col = mix(UNREST_LOW, UNREST_HIGH, frac);
@@ -1443,21 +1793,30 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
             }
         }
         c.disc(at, r + 1.0, INK, 1.0);
-        c.disc(at, r, [230, 220, 170], 1.0);
+        if matches!(p.owner, Owner::Side(_)) {
+            draw_people(&mut c, &d.people[i], p.owner, at, r);
+        } else {
+            c.disc(at, r, PLANET, 1.0);
+        }
+        draw_icons(&mut c, p, at, r);
     }
     if let Some(p) = opts.planet.and_then(|i| d.planets.get(i)) {
         let at = view.to_screen(p.pos);
-        let r = ((1.5 + 1.3 * p.value as f32) * d.scale().max(0.8) * z).max(2.5) + 9.0;
+        let r = planet_radius(d, p, z) + 9.0;
         c.circle(at, r, GOLD, 1.0);
         c.circle(at, r + 1.0, GOLD, 1.0);
     }
     // Destinations of the wholly selected fleets.
     let whole = d.whole_fleets(&opts.selected);
     for f in whole.iter().filter_map(|id| d.fleet(*id)) {
+        let mut from = view.to_screen(f.pos);
+        for p in &f.route {
+            let to = view.to_screen(*p);
+            c.dashed_line(from, to, 6.0, 5.0, GOLD, 0.9);
+            from = to;
+        }
         if let Some(dest) = f.dest {
-            let (a, b) = (view.to_screen(f.pos), view.to_screen(dest));
-            c.dashed_line(a, b, 6.0, 5.0, GOLD, 0.9);
-            c.circle(b, 5.0, GOLD, 1.0);
+            c.circle(view.to_screen(dest), 5.0, GOLD, 1.0);
         }
     }
     // Shots, then ships (each ECS ship where it is), then explosions.
@@ -1471,7 +1830,14 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
         let ships: Vec<(Vec2, f32)> = f.ship_px.iter().map(|(p, h)| (view.to_screen(*p), *h)).collect();
         let centre = view.to_screen(f.pos);
         if whole.contains(&f.id) {
-            let r = ships.iter().map(|s| s.0.distance(centre)).fold(0.0, f32::max) + 7.0;
+            // Around the combat ships (the supply train trails outside).
+            let r = ships
+                .iter()
+                .zip(&f.is_supply)
+                .filter(|(_, s)| !**s || f.ships == 0)
+                .map(|(s, _)| s.0.distance(centre))
+                .fold(0.0, f32::max)
+                + 7.0;
             c.circle(centre, r, GOLD, 1.0);
             c.circle(centre, r + 1.0, GOLD, 1.0);
         }
@@ -1485,11 +1851,25 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
             if s.x < -10.0 || s.y < -10.0 || s.x > w as f32 + 10.0 || s.y > h as f32 + 10.0 {
                 continue;
             }
+            let selected = f.ship_ids.get(k).is_some_and(|e| opts.selected.contains(e));
+            if f.is_supply.get(k).copied().unwrap_or(false) {
+                // A supply ship: a round hull with a dot of its main cargo.
+                let r = (dart_scale * 7.0).max(2.5);
+                if selected {
+                    c.disc(*s, r + 2.5, GOLD, 1.0);
+                }
+                c.disc(*s, r + 1.2, INK, 1.0);
+                c.disc(*s, r, tone, 1.0);
+                let cargo = f.ship_ids.get(k).and_then(|e| d.world.get::<Supply>(*e)).map_or([0.0; 3], |c| c.0);
+                let main = (0..3).max_by(|a, b| cargo[*a].total_cmp(&cargo[*b])).unwrap();
+                c.disc(*s, r * 0.5, RESOURCE_COLORS[main], 1.0);
+                continue;
+            }
             let col = if Some(k) == flag && f.controllable() { WHITE } else { tone };
             let facing = Vec2::from_angle(*heading);
             let pts = |k: f32| -> Vec<Vec2> { SHIP_DART.iter().map(|p| *s + facing.rotate(*p * dart_scale * k)).collect() };
             // Selected ships get a gold outline.
-            if f.ship_ids.get(k).is_some_and(|e| opts.selected.contains(e)) {
+            if selected {
                 c.polygon_fill(&pts(2.0), GOLD, 1.0);
             }
             c.polygon_fill(&pts(1.45), INK, 1.0);
@@ -1500,10 +1880,6 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
         let k = age / BOOM_SECS;
         c.circle(view.to_screen(*p), (3.0 + 9.0 * k) * (z * d.scale()).clamp(0.6, 2.0), HIT, (1.0 - k) * 0.9);
     }
-    // The selected planet's people, in the top-left corner.
-    if let Some(i) = opts.planet.filter(|i| *i < d.people.len()) {
-        draw_people(&mut c, &d.people[i], d.planets[i].owner);
-    }
     // The selection box being dragged.
     if let Some((a, b)) = opts.marquee {
         let (lo, hi) = (a.min(b), a.max(b));
@@ -1513,6 +1889,14 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
         }
     }
     c
+}
+
+fn stock_text(s: &Stock) -> String {
+    format!("{:.0} ammo, {:.0} food, {:.0} parts", s[AMMO], s[FOOD], s[PARTS])
+}
+
+fn rate_text(s: &Stock) -> String {
+    format!("{:.1}/{:.1}/{:.1}", s[AMMO], s[FOOD], s[PARTS])
 }
 
 /// The status lines for the page.
@@ -1533,17 +1917,13 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
     );
     for (side, name) in SIDE_NAMES.iter().enumerate() {
         let o = Owner::Side(side);
-        let net = d.net_income(o);
-        let broke = if d.credits_of(o) <= 0.0 { " · OUT OF CREDITS, can't fire" } else { "" };
-        let gone = if d.deserted[side] > 0 { format!(" · {} ships deserted", d.deserted[side]) } else { String::new() };
+        let gone = if d.deserted[side] > 0 { format!(" · {} ships lost to shortages", d.deserted[side]) } else { String::new() };
         let gone = if d.revolts[side] > 0 { format!("{gone} · {} planets lost to revolts", d.revolts[side]) } else { gone };
+        let transit = d.fleets.iter().filter(|f| f.owner == o && f.convoy.is_some()).count();
         s.push_str(&format!(
-            "\n{}: {:.0} credits, {:+.1}/s (planets {:+.1}, upkeep −{:.1}){broke}{gone}",
-            name,
-            d.credits_of(o),
-            net,
-            d.planet_income(o),
-            d.ships_of(o) as f32 * d.tuning.upkeep,
+            "\n{name}: planets hold {} · make {}/s · {transit} supply ships under way{gone}",
+            stock_text(&d.stock_of(o)),
+            rate_text(&d.planet_income(o)),
         ));
     }
     if let Some(p) = planet.and_then(|i| d.planets.get(i)) {
@@ -1553,10 +1933,11 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
             Owner::Independent(_) => "Independent".into(),
         };
         s.push_str(&format!(
-            "\nPlanet: {who}, size {}, tax {:.0}% ([ ] change it), earns {:+.2}/s · legitimacy {:.2}",
+            "\nPlanet: {who}, size {}, makes {}/s, holds {} · tax {:.0}% ([ ] change it) · legitimacy {:.2}",
             p.value,
+            rate_text(&d.planet_output(p)),
+            stock_text(&p.stock),
             p.tax * 100.0,
-            d.planet_earning(p),
             p.legitimacy()
         ));
         if p.occupation > 0.0 {
@@ -1590,6 +1971,7 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
             let i = d.fleet_index(*one).unwrap();
             let f = &d.fleets[i];
             let who = match f.owner {
+                Owner::Side(side) if f.convoy.is_some() => format!("{} convoy", SIDE_NAMES[side]),
                 Owner::Side(side) => format!("{} fleet {}", SIDE_NAMES[side], d.fleet_number(i)),
                 Owner::Independent(_) => "Independent garrison".into(),
             };
@@ -1604,6 +1986,16 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
             };
             let fight = if f.engaged { " · ENGAGED" } else { "" };
             s.push_str(&format!("\nSelected: {who}, {} ships, {}, {}, {order}{fight}.", f.ships, f.formation.name(), f.morale.name()));
+            let (stores, cargo) = d.fleet_stores(f);
+            let n = f.ships.max(1) as f32;
+            s.push_str(&format!(
+                " Per ship {:.0} ammo, {:.1} food, {:.1} parts · {} supply ships carrying {}.",
+                stores[AMMO] / n,
+                stores[FOOD] / n,
+                stores[PARTS] / n,
+                f.supply,
+                stock_text(&cargo)
+            ));
             if f.morale == Morale::Routed {
                 s.push_str(" Routed: it no longer takes orders.");
             } else if !f.controllable() {
