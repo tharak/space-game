@@ -437,7 +437,7 @@ pub struct Dominion {
     pub deserted: [u32; 2],
     /// Supply ships loaded, per side.
     pub convoys_sent: [u32; 2],
-    rng: ParkMiller,
+    pub(crate) rng: ParkMiller,
     convoy_timer: f32,
     supply_timer: f32,
     /// Every captain, dead or alive.
@@ -449,6 +449,8 @@ pub struct Dominion {
     pub(crate) mother_people_timer: f32,
     /// Ships destroyed since the last maintenance phase: where, and side.
     pub(crate) recent_kills: Vec<(Vec2, usize)>,
+    /// Escape pods leaving motherships: where, velocity (px/s), age (s).
+    pub pods: Vec<(Vec2, Vec2, f32)>,
     /// Each planet's people (rebellion model), stepped while Blue or Red own it.
     pub people: Vec<Rebellion>,
     pub rebellion: RebellionParams,
@@ -562,6 +564,7 @@ impl Dominion {
             mother_timer: 0.0,
             mother_people_timer: 0.0,
             recent_kills: Vec::new(),
+            pods: Vec::new(),
             people: (0..list_len).map(|i| Rebellion::new(cfg.seed as i64 * 31 + i as i64 + 101)).collect(),
             rebellion: RebellionParams::default(),
             revolts: [0; 2],
@@ -1300,6 +1303,11 @@ impl Dominion {
             b.1 += DT;
         }
         self.shots.retain(|s| s.4 < SHOT_SECS);
+        for p in &mut self.pods {
+            p.0 += p.1 * DT;
+            p.2 += DT;
+        }
+        self.pods.retain(|p| p.2 < super::mothership::POD_SECS);
         self.booms.retain(|b| b.1 < BOOM_SECS);
         let events: Vec<SimEvent> = self.world.resource_mut::<Messages<SimEvent>>().drain().collect();
         for ev in events {
@@ -1555,7 +1563,7 @@ impl Dominion {
                     // A fleet at one of its planets draws that planet's stock:
                     // it needs a convoy only for what that planet lacks.
                     let at_stock = self.friendly_planet(f.owner, f.pos).map(|q| (q, self.planets[q].stock[kind]));
-                    let mother = f.mothership.and_then(|m| self.mothership(m)).filter(|m| m.alive && !m.mutinied);
+                    let mother = f.mothership.and_then(|m| self.mothership(m)).filter(|m| m.alive);
                     if f.owner != p.owner
                         || !(f.armed() || mother.is_some())
                         || f.wing_of.is_some()
@@ -2210,7 +2218,7 @@ fn draw_mothership_panel(c: &mut Canvas, d: &Dominion, m: &super::mothership::Mo
         let wpx = s.chars().count() as i32 * 8;
         draw_text(c, Vec2::new((x0 + 10 + wpx / 2) as f32, (y0 + 14 + row * 18) as f32), s, col);
     };
-    let title = if m.mutinied { format!("{side} MOTHERSHIP - MUTINY") } else { format!("{side} MOTHERSHIP") };
+    let title = format!("{side} MOTHERSHIP");
     text(c, 0, &title, col);
     let (hull, max) = d.world.get::<Ship>(m.ship).map_or((0.0, 1.0), |s| (s.hull, s.max_hull));
     text(c, 1, &format!("HULL {:.0}", hull), WHITE);
@@ -2219,7 +2227,7 @@ fn draw_mothership_panel(c: &mut Canvas, d: &Dominion, m: &super::mothership::Mo
     let (active, jailed) = (m.people.active_share(), m.people.jailed_share());
     text(c, 2, &format!("PEOPLE {pop}"), WHITE);
     text(c, 3, &format!("WORK {:.0}% REBEL {:.0}%", m.working() * 100.0, active * 100.0), WHITE);
-    text(c, 4, &format!("BRIG {:.0}% COPS {}", jailed * 100.0, m.cops), WHITE);
+    text(c, 4, &format!("BRIG {:.0}% COPS {} ESCAPED {}", jailed * 100.0, m.cops, m.escaped), WHITE);
     text(c, 5, &format!("MORALE {:.0}%", m.morale * 100.0), WHITE);
     draw_bar(c, x0 + 110, y0 + 101, 120, m.morale, CALM);
     text(c, 6, &format!("UNREST {:.0}% OF {:.0}%", m.unrest * 100.0, t.revolt_share * 100.0), WHITE);
@@ -2668,6 +2676,13 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
             draw_text(&mut c, Vec2::new(centre.x, top - 12.0), &cap.initial().to_string(), mix(tones[i], WHITE, 0.5));
         }
     }
+    // Escape pods drifting away from a mothership.
+    for (p, _, age) in &d.pods {
+        let a = (1.0 - age / super::mothership::POD_SECS).clamp(0.0, 1.0);
+        let at = view.to_screen(*p);
+        c.disc(at, 2.2, INK, a);
+        c.disc(at, 1.4, [255, 240, 200], a);
+    }
     for (p, age) in &d.booms {
         let k = age / BOOM_SECS;
         c.circle(view.to_screen(*p), (3.0 + 9.0 * k) * (z * d.scale()).clamp(0.6, 2.0), HIT, (1.0 - k) * 0.9);
@@ -2780,14 +2795,15 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
     for m in d.motherships.iter().filter(|m| m.alive) {
         let side = match m.owner {
             Owner::Side(s) => SIDE_NAMES[s],
-            Owner::Independent(_) => "Mutinied",
+            Owner::Independent(_) => "Independent",
         };
         s.push_str(&format!(
-            "\n{side} mothership: {} people ({:.0}% working, {:.0}% rebels, {:.0}% in the brig) · morale {:.0}% · unrest {:.0}% · {} ships aboard · stores {}",
+            "\n{side} mothership: {} people ({:.0}% working, {:.0}% rebels, {:.0}% in the brig, {} escaped in pods) · morale {:.0}% · unrest {:.0}% · {} ships aboard · stores {}",
             m.people.population(),
             m.working() * 100.0,
             m.people.active_share() * 100.0,
             m.people.jailed_share() * 100.0,
+            m.escaped,
             m.morale * 100.0,
             m.unrest * 100.0,
             m.carried,

@@ -621,7 +621,7 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                      crew them), losses and hull damage lower morale; victories raise it. The people at work (not \
                      rebelling, not in the brig) crew it: speed, launching, repairs and building ships aboard (out \
                      of parts) all follow them. Ships aboard keep order (cops). Fed, the people grow; starving or \
-                     hit, they die. Past the revolt share it mutinies. Click it for its view; select ships near it \
+                     hit, they die. Past the revolt share the rebels leave in escape pods. Click it for its view; select ships near it \
                      with it and right-click to take them aboard.",
                 );
                 p.spawn(row()).with_children(|r| proto_buttons(r, 1));

@@ -5,8 +5,9 @@
 //! working (not rebelling, not in the brig) crew it: speed, building ships
 //! aboard, launching and repairs all scale with them. Morale falls with
 //! shortages, crowding (more ships than the people can crew), losses and
-//! hull damage, and rises with victories; past the revolt share the
-//! mothership mutinies and goes independent. It is not a Voronoi site.
+//! hull damage, and rises with victories; past the revolt share the rebels
+//! leave in escape pods, and the population drops. Its ships keep order
+//! (cops) whether aboard or out fighting. It is not a Voronoi site.
 
 use bevy::prelude::Entity;
 
@@ -15,8 +16,8 @@ use super::rebellion::Rebellion;
 use crate::sim::components::{Division, InDivision, MothershipHull, Order, Pos, Ship, Stores, Supply};
 use crate::voronoi::Vec2;
 
-/// Owner ids of mutinied motherships start here (planets use 0..).
-pub const MUTINY_OWNER: usize = 10_000;
+/// Seconds escape pods stay on the map.
+pub const POD_SECS: f32 = 3.0;
 /// Seconds between carrier decisions (launch, target, recall).
 pub const CARRIER_SECS: f32 = 0.5;
 /// Seconds without a threat before the wing comes home.
@@ -47,7 +48,8 @@ pub struct Mothership {
     pub wing_expected: u32,
     /// Seconds without a threat in reach.
     pub calm_for: f32,
-    pub mutinied: bool,
+    /// People who left in escape pods, in all.
+    pub escaped: u32,
     pub alive: bool,
     /// Since the last maintenance phase: ships lost, enemy ships destroyed
     /// near its wing, planets its wing took.
@@ -105,7 +107,7 @@ impl Dominion {
             wing: None,
             wing_expected: 0,
             calm_for: RECALL_SECS,
-            mutinied: false,
+            escaped: 0,
             alive: true,
             lost: 0,
             kills: 0,
@@ -191,13 +193,16 @@ impl Dominion {
                 if !m.alive {
                     continue;
                 }
-                m.cops = ((m.carried as f32 * t.cops_per_ship / 3.0).round() as usize).min(super::dominion::MAX_COPS);
+                let out = m.wing_expected;
+                let m = &mut self.motherships[mi];
+                // Its ships keep order aboard even when they are out fighting.
+                m.cops = (((m.carried + out) as f32 * t.cops_per_ship / 3.0).round() as usize).min(super::dominion::MAX_COPS);
                 let (legit, cops) = (m.morale, m.cops);
                 m.people.step(legit, 0.0, cops, &self.rebellion);
                 let share = m.people.active_share();
                 m.unrest += (share - m.unrest) * UNREST_STEP_SECS / UNREST_SMOOTH_SECS;
-                if !m.mutinied && m.unrest > t.revolt_share {
-                    self.mutiny(mi);
+                if m.unrest > t.revolt_share {
+                    self.escape(mi);
                 }
             }
         }
@@ -214,11 +219,10 @@ impl Dominion {
             .iter()
             .filter(|f| f.armed() && f.owner.hostile(m.owner) && f.morale != crate::sim::components::Morale::Routed)
             .map(|f| (f.pos, Some(f.division)));
-        // Planets are a target unless it mutinied (then it only defends).
         let planets = self
             .planets
             .iter()
-            .filter(|p| !m.mutinied && p.owner != m.owner && p.value > 0)
+            .filter(|p| p.owner != m.owner && p.value > 0)
             .map(|p| (p.pos, None));
         fleets.chain(planets).filter(|(p, _)| p.distance(at) <= reach).min_by(|a, b| a.0.distance(at).total_cmp(&b.0.distance(at)))
     }
@@ -341,24 +345,20 @@ impl Dominion {
         self.sync();
     }
 
-    /// Mothership `mi` mutinies: it and its wing go independent.
-    fn mutiny(&mut self, mi: usize) {
-        let rebel = Owner::Independent(MUTINY_OWNER + self.motherships[mi].id as usize);
+    /// Past the revolt share: the rebels leave mothership `mi` in escape
+    /// pods (the population drops), and the unrest settles.
+    fn escape(&mut self, mi: usize) {
         let m = &mut self.motherships[mi];
-        m.mutinied = true;
-        m.owner = rebel;
-        let ids: Vec<u32> = [Some(m.fleet), m.wing].into_iter().flatten().collect();
-        for id in ids {
-            let Some(fi) = self.fleet_index(id) else { continue };
-            let f = &mut self.fleets[fi];
-            f.owner = rebel;
-            f.route.clear();
-            f.dest = None;
-            let e = f.division;
-            crate::sim::set_side(&mut self.world, e, rebel.side());
-            if let Some(mut d) = self.world.get_mut::<Division>(e) {
-                d.order = Order::Hold;
-            }
+        let n = m.people.remove_active();
+        m.escaped += n as u32;
+        m.unrest = 0.0;
+        let Some(at) = self.fleet(self.motherships[mi].fleet).map(|f| f.pos) else { return };
+        let pods = (n / 10).clamp(1, 30);
+        let speed = 12.0 * self.scale();
+        for k in 0..pods {
+            let a = self.rng.next_float() * std::f32::consts::TAU + k as f32;
+            let v = Vec2::from_angle(a) * speed * (0.6 + self.rng.next_float() * 0.8);
+            self.pods.push((at, v, 0.0));
         }
     }
 
@@ -419,17 +419,15 @@ impl Dominion {
             }
             // Ships built aboard.
             let m = &mut self.motherships[mi];
-            if !m.mutinied {
-                m.build += MAINTENANCE_SECS / t.mothership_build_secs.max(0.1) * working;
-                while m.build >= 1.0 {
-                    if m.stores[PARTS] < t.ship_cost {
-                        m.build = 1.0;
-                        break;
-                    }
-                    m.stores[PARTS] -= t.ship_cost;
-                    m.carried += 1;
-                    m.build -= 1.0;
+            m.build += MAINTENANCE_SECS / t.mothership_build_secs.max(0.1) * working;
+            while m.build >= 1.0 {
+                if m.stores[PARTS] < t.ship_cost {
+                    m.build = 1.0;
+                    break;
                 }
+                m.stores[PARTS] -= t.ship_cost;
+                m.carried += 1;
+                m.build -= 1.0;
             }
             // Morale.
             let shortage = m.stores.iter().filter(|v| **v < 1.0).count() as f32 / 3.0;

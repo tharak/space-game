@@ -63,11 +63,11 @@ The second card on the start page: the same map, supply and planets as prototype
   - Its ships stay inside until a hostile fleet or planet (enemy or independent) comes within 3 gun ranges. Then they launch, one a second times the share of its people at work, into its wing: a normal fleet that fights and captures but takes no orders.
   - After 3 s with no threat, the wing comes back and docks, and the ships' stores return to the mothership.
   - Select your ships near it together with the mothership and right-click to take them aboard.
-- **People:** a rebellion model of its own, starting with 400 people. Legitimacy is its morale, and its ships aboard are the cops.
+- **People:** a rebellion model of its own, starting with 400 people. Legitimacy is its morale, and its ships are the cops, aboard or out in the wing.
   - The people at work (not rebelling, not in the brig) crew it. Speed, launching, repairs and building ships aboard (5 parts each, every 20 s with everyone working) all scale with them.
   - Each ship aboard needs 20 crew.
   - The people eat 0.01 food each per 5 s phase. Fed with stores over half full, they grow 2% a phase, up to 1100. Starving costs 3% a phase, and hull damage kills the same share.
-- **Morale** starts at 100%. It falls with empty stores, crowding (more ships than crew) and losses (ships lost, hull damage), and rises with planets taken, enemy ships destroyed near its wing, and calm times. When the smoothed rebel share passes Revolt, it mutinies: it goes independent with its wing and stops taking orders.
+- **Morale** starts at 100%. It falls with empty stores, crowding (more ships than crew) and losses (ships lost, hull damage), and rises with planets taken, enemy ships destroyed near its wing, and calm times. When the smoothed rebel share passes Revolt, the rebels leave in escape pods (they drift off the hull), so the population drops; the ship stays its side's. Its ships keep order whether aboard or out fighting.
 - **Stores:** up to 200 ammo, 200 food and 100 parts, from a friendly planet it rests at and from supply ships, which planets send to it like to any fleet.
 - **The view:** click the mothership and a panel shows its hull, people (a pie of workers, rebels and the brig, plus the people themselves), morale and unrest, ships aboard and out, crew, stores and building. It sits in the corner away from the mothership.
 - Sliders: Crew per ship, Launch rate, Build aboard, Start people, and the morale costs of shortages and crowding.

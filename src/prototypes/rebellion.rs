@@ -146,6 +146,14 @@ impl Rebellion {
         self.reindex();
     }
 
+    /// Every active rebel leaves (escape pods); returns how many.
+    pub fn remove_active(&mut self) -> usize {
+        let before = self.agents.len();
+        self.agents.retain(|a| !a.active);
+        self.reindex();
+        before - self.agents.len()
+    }
+
     /// Rebuilds who stands where after agents come or go.
     fn reindex(&mut self) {
         for list in &mut self.at {
@@ -504,6 +512,14 @@ mod tests {
         assert_eq!((free, active), (r.free_at.clone(), r.active_at.clone()));
         let total: usize = r.at.iter().map(Vec::len).sum();
         assert_eq!(total, 230);
+        // The rebels leave; nobody active is left and the counts hold.
+        let rebels = r.agents.iter().filter(|a| a.active).count();
+        assert_eq!(r.remove_active(), rebels);
+        assert_eq!(r.population(), 230 - rebels);
+        assert_eq!(r.active_share(), 0.0);
+        let (free, active) = (r.free_at.clone(), r.active_at.clone());
+        r.recount();
+        assert_eq!((free, active), (r.free_at.clone(), r.active_at.clone()));
     }
 
     #[test]

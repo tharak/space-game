@@ -962,22 +962,46 @@ fn shortages_and_crowding_cost_morale_and_low_morale_breeds_rebels() {
     // Legitimacy is morale: at low morale people rebel.
     d.motherships[i].morale = 0.3;
     d.motherships[i].carried = 0;
-    d.step(5.0);
+    // (Before the unrest builds up enough for the rebels to escape.)
+    d.step(2.0);
     assert!(d.motherships[i].people.active_share() > 0.1);
 }
 
 #[test]
-fn a_mothership_mutinies_when_unrest_passes_the_revolt_share() {
+fn past_the_revolt_share_the_rebels_leave_in_escape_pods() {
     let mut d = carrier_world();
     let i = d.motherships.iter().position(|m| m.owner == BLUE).unwrap();
+    let before = d.motherships[i].people.population();
     d.motherships[i].morale = 0.0;
     d.motherships[i].carried = 0;
     d.tuning.morale_recover = 0.0;
-    d.step(20.0);
+    let mut pods = false;
+    for _ in 0..40 {
+        d.step(0.5);
+        pods |= !d.pods.is_empty();
+    }
     let m = &d.motherships[i];
-    assert!(m.mutinied, "unrest {}", m.unrest);
-    assert!(matches!(m.owner, Owner::Independent(_)));
-    assert!(!d.fleet(m.fleet).unwrap().controllable());
+    assert!(m.escaped > 0, "unrest {}", m.unrest);
+    assert!(m.people.population() < before);
+    assert!(pods, "escape pods on the map");
+    // It stays Blue's and takes orders.
+    assert_eq!(m.owner, BLUE);
+    assert!(d.fleet(m.fleet).unwrap().controllable());
+}
+
+#[test]
+fn ships_out_fighting_still_keep_order_aboard() {
+    let mut d = carrier_world();
+    d.tuning.food_per_phase = 0.0;
+    let m = blue_mother(&d);
+    let at = d.fleet(m.fleet).unwrap().pos;
+    d.add_fleet(RED, at + Vec2::new(70.0, 0.0), WEST, 30, None);
+    // Long enough to launch everything.
+    d.step(20.0);
+    let m = blue_mother(&d);
+    let out = m.wing.and_then(|w| d.fleet(w)).map_or(0, |f| f.ships);
+    assert!(out >= 5 && m.carried <= 1, "{out} out, {} aboard", m.carried);
+    assert!(m.cops >= (out as f32 * d.tuning.cops_per_ship / 3.0) as usize, "the wing still counts as cops");
 }
 
 #[test]
