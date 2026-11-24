@@ -1,4 +1,4 @@
-//! Runs prototype01 for a minute and writes frames as PPMs. Each side's
+//! Runs prototype01 for three minutes and writes frames as PPMs. Each side's
 //! fleets head for the nearest independent planet, so there's fighting:
 //! `cargo run --release --example prototype01_dump -- <dir> [planets] [fleets]`.
 
@@ -18,7 +18,12 @@ fn main() {
         let t = std::time::Instant::now();
         let bg = render_background(d, &view, true, 1);
         let t_bg = t.elapsed();
-        let opts = DrawOptions { selected: d.fleets.first().map(|f| f.ship_ids.clone()).unwrap_or_default(), ..Default::default() };
+        // Blue's most restless planet shows its people.
+        let planet = (0..d.planets.len())
+            .filter(|i| d.planets[*i].owner == Owner::Side(0))
+            .max_by(|a, b| d.planets[*a].unrest.total_cmp(&d.planets[*b].unrest));
+        let opts =
+            DrawOptions { selected: d.fleets.first().map(|f| f.ship_ids.clone()).unwrap_or_default(), planet, ..Default::default() };
         let t = std::time::Instant::now();
         let frame = render(d, &bg, &view, &opts);
         println!("{name}: background {:.1} ms, frame {:.1} ms", t_bg.as_secs_f32() * 1e3, t.elapsed().as_secs_f32() * 1e3);
@@ -30,7 +35,7 @@ fn main() {
         }
         let bg = render_background(d, &close, true, 1);
         std::fs::write(format!("{dir}/{name}-zoom.ppm"), render(d, &bg, &close, &opts).to_ppm()).expect("write ppm");
-        println!("{name}: {}", status(d, &[]).replace('\n', " | "));
+        println!("{name}: {}", status(d, &[], planet).replace('\n', " | "));
     };
     // Every commandable fleet goes for the nearest independent planet.
     let orders: Vec<(u32, _)> = d
@@ -48,7 +53,7 @@ fn main() {
     for (id, to) in orders {
         d.order_move(id, to);
     }
-    for t in [0, 20, 40, 60] {
+    for t in [0, 20, 40, 60, 90, 120, 180] {
         d.step(t as f32 - d.time);
         write(&d, &format!("t{t:02}"));
     }

@@ -11,15 +11,23 @@
 //! Influence patches (weight = ships × weight per ship, reach = reach per
 //! weight × weight) show who dominates where.
 //!
-//! Economy: one resource (credits), a stockpile per owner. Planets earn
-//! income and feed their population by size; a ship costs credits to
-//! build, every shot costs credits, and every few seconds a maintenance
-//! phase pays the fleets' upkeep (unpaid ships desert) and repairs damaged
-//! ships out of combat. An owner out of credits can't fire.
+//! Economy: one resource (credits), a stockpile per owner. A planet of
+//! size x produces x × income; its owner takes its tax share. A ship costs
+//! credits to build, every shot costs credits, and every few seconds a
+//! maintenance phase pays the fleets' upkeep (unpaid ships desert) and
+//! repairs damaged ships out of combat. An owner out of credits can't fire.
+//!
+//! Unrest: every Blue or Red planet's people run Epstein's civil-violence
+//! model ([`super::rebellion`]). The owner's ships nearby are its cops,
+//! legitimacy is 1 − tax − occupation (fresh conquests start resented),
+//! and fighting nearby adds hardship. Active rebels strike (income and
+//! building drop by their share); when the smoothed rebel share passes the
+//! revolt share the planet goes independent with a rebel garrison.
 
 use bevy::ecs::message::Messages;
 use bevy::prelude::{Entity, Rect, World};
 
+use super::rebellion::{Rebellion, RebellionParams};
 use crate::sim::battle::{Battle, DT, SimEvent, Tuning as BattleTuning};
 use crate::sim::components::{Division, Heading, InDivision, Morale, Order, Pos, Ship, Weapon};
 pub use crate::sim::formation::Formation;
@@ -58,6 +66,27 @@ pub const START_CREDITS: f32 = 50.0;
 /// Credits each independent planet starts with.
 pub const INDEPENDENT_CREDITS: f32 = 10.0;
 const SIDE_COLORS: [Rgb; 2] = [[70, 130, 220], [215, 80, 70]];
+/// A planet's tax until its owner changes it (legitimacy 0.8, near the
+/// NetLogo model's default of 0.82).
+pub const DEFAULT_TAX: f32 = 0.2;
+pub const MAX_TAX: f32 = 0.9;
+/// Legitimacy lost when a side conquers a planet, fading over `OCCUPATION_SECS`.
+pub const OCCUPATION_PENALTY: f32 = 0.3;
+pub const OCCUPATION_SECS: f32 = 60.0;
+/// War hardship rises to full in this many seconds of fighting nearby and
+/// fades over `WAR_FADE_SECS`.
+pub const WAR_RISE_SECS: f32 = 3.0;
+pub const WAR_FADE_SECS: f32 = 20.0;
+/// Seconds of game time per step of a planet's rebellion model.
+pub const UNREST_STEP_SECS: f32 = 0.5;
+/// Time constant of the smoothed rebel share (single bursts don't topple).
+pub const UNREST_SMOOTH_SECS: f32 = 10.0;
+/// Model steps the home planets' people take before the game starts.
+pub const WARM_UP_STEPS: usize = 40;
+/// Most cops a planet's model gets.
+pub const MAX_COPS: usize = 200;
+/// Rebel ships per point of size for a planet whose people all rebelled.
+pub const REBELS_PER_SIZE: f32 = 10.0;
 
 /// The prototype's sliders.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -73,10 +102,9 @@ pub struct Tuning {
     /// Multiplies the battle's rate of fire, so map fights take seconds,
     /// not minutes; the rules' proportions are unchanged.
     pub combat_speed: f32,
-    /// Income multiplier: a planet of size x earns x × this credits a second.
+    /// Income multiplier: a planet of size x produces x × this credits a
+    /// second, of which its owner takes the planet's tax.
     pub income: f32,
-    /// Credits a second its population needs per point of size.
-    pub population: f32,
     /// Credits to build one ship.
     pub ship_cost: f32,
     /// Credits a second each ship costs (debts are settled at the
@@ -86,6 +114,13 @@ pub struct Tuning {
     pub shot_cost: f32,
     /// Credits per hull point repaired at the maintenance phase.
     pub repair_cost: f32,
+    /// Cops in a planet's rebellion model per ship nearby, divided by the
+    /// planet's size (bigger populations need more ships).
+    pub cops_per_ship: f32,
+    /// Hardship added to everyone while fighting rages nearby.
+    pub war_hardship: f32,
+    /// Smoothed rebel share at which a planet revolts.
+    pub revolt_share: f32,
 }
 
 impl Default for Tuning {
@@ -98,12 +133,14 @@ impl Default for Tuning {
             secs_per_ship: 15.0,
             speed: 30.0,
             combat_speed: 3.0,
-            income: 1.0,
-            population: 0.2,
+            income: 4.0,
             ship_cost: 10.0,
             upkeep: 0.05,
             shot_cost: 0.01,
             repair_cost: 0.2,
+            cops_per_ship: 40.0,
+            war_hardship: 0.3,
+            revolt_share: 0.25,
         }
     }
 }
@@ -147,6 +184,28 @@ pub struct Planet {
     pub build: f32,
     /// An attacker holding the ungarrisoned planet, and for how long.
     pub hold: Option<(Owner, f32)>,
+    /// Share of production its owner takes, 0..=MAX_TAX.
+    pub tax: f32,
+    /// Legitimacy lost to a recent conquest, fading to 0.
+    pub occupation: f32,
+    /// Fighting nearby, 0..1 (adds hardship).
+    pub war: f32,
+    /// Smoothed share of its people actively rebelling.
+    pub unrest: f32,
+    /// Cops its rebellion model was last given.
+    pub cops: usize,
+}
+
+impl Planet {
+    /// 1 − tax − occupation.
+    pub fn legitimacy(&self) -> f32 {
+        (1.0 - self.tax - self.occupation).clamp(0.0, 1.0)
+    }
+
+    /// What the strikes leave of production and building.
+    pub fn working(&self) -> f32 {
+        1.0 - self.unrest.clamp(0.0, 1.0)
+    }
 }
 
 /// A fleet as the map sees it: one ECS division, read back every tick.
@@ -214,6 +273,12 @@ pub struct Dominion {
     pub maintenance_timer: f32,
     /// Ships lost to unpaid upkeep, per side (Blue, Red).
     pub deserted: [u32; 2],
+    /// Each planet's people (rebellion model), stepped while Blue or Red own it.
+    pub people: Vec<Rebellion>,
+    pub rebellion: RebellionParams,
+    /// Planets lost to revolts, per side.
+    pub revolts: [u32; 2],
+    unrest_timer: f32,
     next_id: u32,
     pub time: f32,
     /// Leftover time below one tick.
@@ -268,8 +333,21 @@ impl Dominion {
                 1
             };
             planet_at[site] = Some(list.len());
-            list.push(Planet { site, pos: sites[site], value, owner: Owner::Independent(list.len()), build: 0.0, hold: None });
+            list.push(Planet {
+                site,
+                pos: sites[site],
+                value,
+                owner: Owner::Independent(list.len()),
+                build: 0.0,
+                hold: None,
+                tax: DEFAULT_TAX,
+                occupation: 0.0,
+                war: 0.0,
+                unrest: 0.0,
+                cops: 0,
+            });
         }
+        let list_len = list.len();
         let battle = battle_tuning(&tuning);
         let unit = UNIT * map_scale(cfg);
         let bounds = Rect::new(0.0, 0.0, cfg.w as f32 / unit, cfg.h as f32 / unit);
@@ -290,6 +368,10 @@ impl Dominion {
             credits: Vec::new(),
             maintenance_timer: 0.0,
             deserted: [0; 2],
+            people: (0..list_len).map(|i| Rebellion::new(cfg.seed as i64 * 31 + i as i64 + 101)).collect(),
+            rebellion: RebellionParams::default(),
+            revolts: [0; 2],
+            unrest_timer: 0.0,
             next_id: 1,
             time: 0.0,
             pending: 0.0,
@@ -328,7 +410,32 @@ impl Dominion {
             d.spawn(owner, pos, facing, size, Some(i));
         }
         d.sync();
+        // The home planets' people settle under their garrisons before the
+        // game starts (a fresh model opens with a burst of rebels).
+        for i in 0..d.planets.len() {
+            if matches!(d.planets[i].owner, Owner::Side(_)) {
+                let (legit, cops) = (d.planets[i].legitimacy(), d.cops_for(i));
+                for _ in 0..WARM_UP_STEPS {
+                    d.people[i].step(legit, 0.0, cops, &d.rebellion);
+                }
+                d.planets[i].cops = cops;
+            }
+        }
         d
+    }
+
+    /// Cops for planet `i`'s model: its owner's ships within the police
+    /// radius × cops per ship ÷ size.
+    pub fn cops_for(&self, i: usize) -> usize {
+        let p = &self.planets[i];
+        let police = self.police_radius();
+        let ships: u32 = self
+            .fleets
+            .iter()
+            .filter(|f| f.owner == p.owner && f.morale != Morale::Routed && f.pos.distance(p.pos) <= police)
+            .map(|f| f.ships)
+            .sum();
+        ((ships as f32 * self.tuning.cops_per_ship / p.value.max(1) as f32).round() as usize).min(MAX_COPS)
     }
 
     /// Removes every fleet and its ships (for tests and set-pieces).
@@ -398,6 +505,11 @@ impl Dominion {
         25.0 * self.scale()
     }
 
+    /// Radius around a planet within which its owner's ships police it.
+    pub fn police_radius(&self) -> f32 {
+        2.0 * self.capture_radius()
+    }
+
     /// Index of an owner's stockpile in `credits`.
     pub fn purse(owner: Owner) -> usize {
         match owner {
@@ -410,10 +522,29 @@ impl Dominion {
         self.credits.get(Self::purse(owner)).copied().unwrap_or(0.0)
     }
 
-    /// Credits a second an owner's planets earn after feeding their people.
+    /// Credits a second a planet earns its owner: its tax share of what it
+    /// produces, less what strikes cost.
+    pub fn planet_earning(&self, p: &Planet) -> f32 {
+        p.value as f32 * self.tuning.income * p.tax * p.working()
+    }
+
+    /// Credits a second an owner's planets earn.
     pub fn planet_income(&self, owner: Owner) -> f32 {
-        let t = &self.tuning;
-        self.planets.iter().filter(|p| p.owner == owner).map(|p| p.value as f32 * (t.income - t.population)).sum()
+        self.planets.iter().filter(|p| p.owner == owner).map(|p| self.planet_earning(p)).sum()
+    }
+
+    /// Sets a planet's tax (clamped to 0..=MAX_TAX).
+    pub fn set_tax(&mut self, i: usize, tax: f32) {
+        if let Some(p) = self.planets.get_mut(i) {
+            p.tax = tax.clamp(0.0, MAX_TAX);
+        }
+    }
+
+    /// The planet within `r` pixels of `p`, nearest first.
+    pub fn planet_near(&self, p: Vec2, r: f32) -> Option<usize> {
+        (0..self.planets.len())
+            .filter(|i| self.planets[*i].pos.distance(p) <= r)
+            .min_by(|a, b| self.planets[*a].pos.distance(p).total_cmp(&self.planets[*b].pos.distance(p)))
     }
 
     pub fn ships_of(&self, owner: Owner) -> u32 {
@@ -621,6 +752,7 @@ impl Dominion {
         }
         self.sync();
         self.capture(DT);
+        self.unrest(DT);
         self.maintenance_timer += DT;
         if self.maintenance_timer >= MAINTENANCE_SECS - 1e-4 {
             self.maintenance_timer = 0.0;
@@ -628,13 +760,14 @@ impl Dominion {
         }
     }
 
-    /// Every tick planets earn income and feed their population, and
+    /// Every tick planets earn their owners' share, and
     /// fleets pay their upkeep.
     fn earn(&mut self, dt: f32) {
         let t = self.tuning;
-        for p in &self.planets {
-            if let Some(c) = self.credits.get_mut(Self::purse(p.owner)) {
-                *c += dt * p.value as f32 * (t.income - t.population);
+        for i in 0..self.planets.len() {
+            let earned = self.planet_earning(&self.planets[i]);
+            if let Some(c) = self.credits.get_mut(Self::purse(self.planets[i].owner)) {
+                *c += dt * earned;
             }
         }
         for f in &self.fleets {
@@ -825,7 +958,7 @@ impl Dominion {
                 self.planets[i].build = 0.0;
                 continue;
             }
-            self.planets[i].build += dt * value as f32 / secs;
+            self.planets[i].build += dt * value as f32 / secs * self.planets[i].working();
             while self.planets[i].build >= 1.0 {
                 // Short of credits or of income for its upkeep: the ship waits.
                 if !self.can_build(owner) {
@@ -873,6 +1006,9 @@ impl Dominion {
                 p.owner = by;
                 p.build = 0.0;
                 p.hold = None;
+                // A fresh conquest is resented.
+                p.occupation = OCCUPATION_PENALTY;
+                p.unrest = 0.0;
                 for f in &mut self.fleets {
                     if f.home == Some(i) {
                         f.home = None;
@@ -882,6 +1018,67 @@ impl Dominion {
                 self.planets[i].hold = Some((by, held));
             }
         }
+    }
+
+    /// War and occupation evolve; every half second the people of Blue's
+    /// and Red's planets take a step of the rebellion model; a planet whose
+    /// smoothed rebel share passes the revolt share goes independent.
+    fn unrest(&mut self, dt: f32) {
+        let r = self.capture_radius();
+        for p in &mut self.planets {
+            let fighting = self.fleets.iter().any(|f| f.engaged && f.pos.distance(p.pos) <= r);
+            p.war = if fighting { p.war + dt / WAR_RISE_SECS } else { p.war - dt / WAR_FADE_SECS }.clamp(0.0, 1.0);
+            p.occupation = (p.occupation - dt * OCCUPATION_PENALTY / OCCUPATION_SECS).max(0.0);
+        }
+        self.unrest_timer += dt;
+        if self.unrest_timer < UNREST_STEP_SECS - 1e-4 {
+            return;
+        }
+        self.unrest_timer = 0.0;
+        let t = self.tuning;
+        let blend = UNREST_STEP_SECS / UNREST_SMOOTH_SECS;
+        for i in 0..self.planets.len() {
+            let p = self.planets[i];
+            let Owner::Side(side) = p.owner else { continue };
+            let cops = self.cops_for(i);
+            let people = &mut self.people[i];
+            people.step(p.legitimacy(), p.war * t.war_hardship, cops, &self.rebellion);
+            let share = people.active_share();
+            let rebels = share + people.jailed_share();
+            let pl = &mut self.planets[i];
+            pl.cops = cops;
+            pl.unrest += (share - pl.unrest) * blend;
+            if pl.unrest > t.revolt_share {
+                self.revolt(i, side, rebels);
+            }
+        }
+    }
+
+    /// The planet goes independent; its rebels (active and jailed) arm a
+    /// garrison that fights whatever of the old owner's is there.
+    fn revolt(&mut self, i: usize, side: usize, rebels: f32) {
+        self.revolts[side] += 1;
+        let (pos, value) = (self.planets[i].pos, self.planets[i].value);
+        let p = &mut self.planets[i];
+        p.owner = Owner::Independent(i);
+        p.build = 0.0;
+        p.hold = None;
+        p.tax = DEFAULT_TAX;
+        p.occupation = 0.0;
+        p.unrest = 0.0;
+        p.cops = 0;
+        self.people[i].reset();
+        for f in &mut self.fleets {
+            if f.home == Some(i) {
+                f.home = None;
+            }
+        }
+        let purse = Self::purse(Owner::Independent(i));
+        self.credits[purse] = self.credits[purse].max(INDEPENDENT_CREDITS);
+        let ships = ((rebels * value as f32 * REBELS_PER_SIZE).round() as u32).max(1);
+        let facing = (Vec2::new(self.cfg.w as f32, self.cfg.h as f32) * 0.5 - pos).to_angle();
+        self.spawn(Owner::Independent(i), pos, facing, ships, Some(i));
+        self.sync();
     }
 
     /// Planets, fleets and ships per side, and how many planets are independent.
@@ -964,11 +1161,13 @@ pub struct DrawOptions {
     pub marquee: Option<(Vec2, Vec2)>,
     /// Patch sampling step in pixels.
     pub step: u32,
+    /// The selected planet: highlighted, its people drawn in an inset.
+    pub planet: Option<usize>,
 }
 
 impl Default for DrawOptions {
     fn default() -> Self {
-        Self { regions: true, borders: true, selected: Vec::new(), marquee: None, step: 3 }
+        Self { regions: true, borders: true, selected: Vec::new(), marquee: None, step: 3, planet: None }
     }
 }
 
@@ -981,6 +1180,40 @@ const INK: Rgb = [10, 10, 14];
 const GOLD: Rgb = [235, 190, 80];
 const HIT: Rgb = [255, 230, 150];
 const SHAKEN: Rgb = [255, 209, 102];
+const UNREST_LOW: Rgb = [240, 210, 90];
+const UNREST_HIGH: Rgb = [235, 60, 50];
+
+/// A planet's rebellion model as an inset: quiet people grey, rebels red,
+/// prisoners dark, cops in the owner's colour.
+fn draw_people(c: &mut Canvas, people: &Rebellion, owner: Owner) {
+    use super::rebellion::{Cell, SIDE};
+    let (px, margin) = (3i32, 6i32);
+    let size = SIDE as i32 * px;
+    for y in margin - 2..margin + size + 2 {
+        for x in margin - 2..margin + size + 2 {
+            c.set(x, y, INK);
+        }
+    }
+    let cop = match owner {
+        Owner::Side(s) => mix(SIDE_COLORS[s], WHITE, 0.3),
+        o => owner_color(o),
+    };
+    for (k, cell) in people.cells().iter().enumerate() {
+        let col = match cell {
+            Cell::Empty => [24, 26, 36],
+            Cell::Quiet => [120, 124, 136],
+            Cell::Active => [235, 60, 50],
+            Cell::Jailed => [60, 50, 50],
+            Cell::Cop => cop,
+        };
+        let (x, y) = ((k % SIDE) as i32 * px + margin, (k / SIDE) as i32 * px + margin);
+        for dy in 0..px - 1 {
+            for dx in 0..px - 1 {
+                c.set(x + dx, y + dy, col);
+            }
+        }
+    }
+}
 const ROUTED: Rgb = [93, 100, 120];
 
 pub fn owner_color(o: Owner) -> Rgb {
@@ -1198,8 +1431,25 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
                 c.disc(at + Vec2::from_angle(a) * (r + 6.0), 1.8, owner_color(by), 1.0);
             }
         }
+        // Unrest: an arc around Blue's and Red's planets, yellow to red,
+        // full at the revolt share.
+        if matches!(p.owner, Owner::Side(_)) && p.unrest > 0.01 {
+            let frac = (p.unrest / d.tuning.revolt_share.max(0.01)).clamp(0.0, 1.0);
+            let col = mix(UNREST_LOW, UNREST_HIGH, frac);
+            let n = (64.0 * frac).ceil() as usize;
+            for k in 0..n {
+                let a = -std::f32::consts::FRAC_PI_2 - k as f32 / 64.0 * std::f32::consts::TAU;
+                c.disc(at + Vec2::from_angle(a) * (r + 3.5), 1.3, col, 0.95);
+            }
+        }
         c.disc(at, r + 1.0, INK, 1.0);
         c.disc(at, r, [230, 220, 170], 1.0);
+    }
+    if let Some(p) = opts.planet.and_then(|i| d.planets.get(i)) {
+        let at = view.to_screen(p.pos);
+        let r = ((1.5 + 1.3 * p.value as f32) * d.scale().max(0.8) * z).max(2.5) + 9.0;
+        c.circle(at, r, GOLD, 1.0);
+        c.circle(at, r + 1.0, GOLD, 1.0);
     }
     // Destinations of the wholly selected fleets.
     let whole = d.whole_fleets(&opts.selected);
@@ -1250,6 +1500,10 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
         let k = age / BOOM_SECS;
         c.circle(view.to_screen(*p), (3.0 + 9.0 * k) * (z * d.scale()).clamp(0.6, 2.0), HIT, (1.0 - k) * 0.9);
     }
+    // The selected planet's people, in the top-left corner.
+    if let Some(i) = opts.planet.filter(|i| *i < d.people.len()) {
+        draw_people(&mut c, &d.people[i], d.planets[i].owner);
+    }
     // The selection box being dragged.
     if let Some((a, b)) = opts.marquee {
         let (lo, hi) = (a.min(b), a.max(b));
@@ -1262,7 +1516,7 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
 }
 
 /// The status lines for the page.
-pub fn status(d: &Dominion, selected: &[Entity]) -> String {
+pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> String {
     let (planets, fleets, ships, free) = d.tally();
     let secs = d.time as u32;
     let mut s = format!(
@@ -1282,6 +1536,7 @@ pub fn status(d: &Dominion, selected: &[Entity]) -> String {
         let net = d.net_income(o);
         let broke = if d.credits_of(o) <= 0.0 { " · OUT OF CREDITS, can't fire" } else { "" };
         let gone = if d.deserted[side] > 0 { format!(" · {} ships deserted", d.deserted[side]) } else { String::new() };
+        let gone = if d.revolts[side] > 0 { format!("{gone} · {} planets lost to revolts", d.revolts[side]) } else { gone };
         s.push_str(&format!(
             "\n{}: {:.0} credits, {:+.1}/s (planets {:+.1}, upkeep −{:.1}){broke}{gone}",
             name,
@@ -1290,6 +1545,37 @@ pub fn status(d: &Dominion, selected: &[Entity]) -> String {
             d.planet_income(o),
             d.ships_of(o) as f32 * d.tuning.upkeep,
         ));
+    }
+    if let Some(p) = planet.and_then(|i| d.planets.get(i)) {
+        let i = planet.unwrap();
+        let who = match p.owner {
+            Owner::Side(s) => SIDE_NAMES[s].to_string(),
+            Owner::Independent(_) => "Independent".into(),
+        };
+        s.push_str(&format!(
+            "\nPlanet: {who}, size {}, tax {:.0}% ([ ] change it), earns {:+.2}/s · legitimacy {:.2}",
+            p.value,
+            p.tax * 100.0,
+            d.planet_earning(p),
+            p.legitimacy()
+        ));
+        if p.occupation > 0.0 {
+            s.push_str(&format!(" (occupied −{:.2})", p.occupation));
+        }
+        if matches!(p.owner, Owner::Side(_)) {
+            let people = &d.people[i];
+            s.push_str(&format!(
+                " · rebels {:.0}% now, unrest {:.0}% (revolt at {:.0}%) · jailed {:.0}% · {} cops{}",
+                people.active_share() * 100.0,
+                p.unrest * 100.0,
+                d.tuning.revolt_share * 100.0,
+                people.jailed_share() * 100.0,
+                p.cops,
+                if p.war > 0.05 { " · war hardship" } else { "" }
+            ));
+        } else {
+            s.push_str(" · its own people: no unrest.");
+        }
     }
     let whole = d.whole_fleets(selected);
     let mut from: Vec<u32> = selected.iter().filter_map(|e| d.fleet_of_ship(*e)).map(|f| f.id).collect();

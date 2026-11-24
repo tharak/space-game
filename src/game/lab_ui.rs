@@ -58,6 +58,8 @@ struct Proto {
     fleets: usize,
     /// Selected ships.
     selected: Vec<Entity>,
+    /// The planet clicked last (its people and tax).
+    selected_planet: Option<usize>,
     /// Left button held on the map: where the press started and where the
     /// cursor is now (picture pixels), and whether it became a box drag.
     drag: Option<(MapVec, MapVec, bool)>,
@@ -162,7 +164,9 @@ pub enum SliderParam {
     FleetSpeed,
     CombatSpeed,
     Income,
-    Population,
+    CopsPerShip,
+    WarHardship,
+    RevoltShare,
     ShipCost,
     Upkeep,
     ShotCost,
@@ -184,8 +188,10 @@ impl SliderParam {
             SliderParam::Production => (0.5, 30.0, 0.5),
             SliderParam::FleetSpeed => (5.0, 150.0, 1.0),
             SliderParam::CombatSpeed => (0.25, 20.0, 0.25),
-            SliderParam::Income => (0.0, 5.0, 0.05),
-            SliderParam::Population => (0.0, 2.0, 0.05),
+            SliderParam::Income => (0.0, 10.0, 0.1),
+            SliderParam::CopsPerShip => (0.0, 150.0, 1.0),
+            SliderParam::WarHardship => (0.0, 1.0, 0.05),
+            SliderParam::RevoltShare => (0.05, 1.0, 0.01),
             SliderParam::ShipCost => (1.0, 50.0, 1.0),
             SliderParam::Upkeep => (0.0, 0.5, 0.01),
             SliderParam::ShotCost => (0.0, 0.1, 0.005),
@@ -210,7 +216,9 @@ impl SliderParam {
             SliderParam::FleetSpeed => proto.d.tuning.speed,
             SliderParam::CombatSpeed => proto.d.tuning.combat_speed,
             SliderParam::Income => proto.d.tuning.income,
-            SliderParam::Population => proto.d.tuning.population,
+            SliderParam::CopsPerShip => proto.d.tuning.cops_per_ship,
+            SliderParam::WarHardship => proto.d.tuning.war_hardship,
+            SliderParam::RevoltShare => proto.d.tuning.revolt_share,
             SliderParam::ShipCost => proto.d.tuning.ship_cost,
             SliderParam::Upkeep => proto.d.tuning.upkeep,
             SliderParam::ShotCost => proto.d.tuning.shot_cost,
@@ -232,8 +240,10 @@ impl SliderParam {
             SliderParam::Production => format!("{v:.1} s a ship (÷ planet value)"),
             SliderParam::FleetSpeed => format!("{v:.0} px/s (at 720 wide)"),
             SliderParam::CombatSpeed => format!("{v:.2}× the battle's rate of fire"),
-            SliderParam::Income => format!("{v:.2}× planet size credits/s"),
-            SliderParam::Population => format!("{v:.2} credits/s per planet size"),
+            SliderParam::Income => format!("{v:.1}× planet size credits/s produced (owner takes the tax)"),
+            SliderParam::CopsPerShip => format!("{v:.0} cops a ship ÷ planet size"),
+            SliderParam::WarHardship => format!("+{v:.2} hardship while fighting nearby"),
+            SliderParam::RevoltShare => format!("revolt at {:.0}% rebels (smoothed)", v * 100.0),
             SliderParam::ShipCost => format!("{v:.0} credits a ship"),
             SliderParam::Upkeep => format!("{v:.2} credits/s a ship"),
             SliderParam::ShotCost => format!("{v:.3} credits a shot"),
@@ -373,7 +383,9 @@ fn set_slider(param: SliderParam, v: f32, cfg: &mut VoronoiConfig, labs: &mut La
         SliderParam::FleetSpeed => proto.d.tuning.speed = v,
         SliderParam::CombatSpeed => proto.d.tuning.combat_speed = v,
         SliderParam::Income => proto.d.tuning.income = v,
-        SliderParam::Population => proto.d.tuning.population = v,
+        SliderParam::CopsPerShip => proto.d.tuning.cops_per_ship = v,
+        SliderParam::WarHardship => proto.d.tuning.war_hardship = v,
+        SliderParam::RevoltShare => proto.d.tuning.revolt_share = v,
         SliderParam::ShipCost => proto.d.tuning.ship_cost = v,
         SliderParam::Upkeep => proto.d.tuning.upkeep = v,
         SliderParam::ShotCost => proto.d.tuning.shot_cost = v,
@@ -420,6 +432,7 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
         planets,
         fleets,
         selected: Vec::new(),
+        selected_planet: None,
         drag: None,
         regions: true,
         borders: true,
@@ -468,7 +481,10 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                      front/flank/rear hit chances, reload, hull, closing ranks and morale, so formation and facing \
                      matter and a beaten fleet turns shaken (gold), routs (grey) and flees off the map. Keys 1–6 set the selected fleets' \
                      formation. A planet changes hands once its garrison is gone and an enemy fleet holds it for 3 s \
-                     (ring). Patches show each fleet's influence (ships × weight per ship, reach × weight).",
+                     (ring). Patches show each fleet's influence (ships × weight per ship, reach × weight). \
+                     Each owned planet's people run Epstein's rebellion model: legitimacy is 1 − tax − occupation \
+                     (fresh conquests are resented), ships nearby are the cops, fighting adds hardship. Rebels strike \
+                     (red arc) and, past the revolt share, the planet goes independent with a rebel garrison.",
                 );
                 p.spawn(row()).with_children(|r| {
                     button_for(r, "Pause", LabAction::ProtoPause, BtnKind::Primary);
@@ -504,7 +520,9 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                 slider(p, "Fleet speed", SliderParam::FleetSpeed);
                 slider(p, "Combat speed", SliderParam::CombatSpeed);
                 slider(p, "Income", SliderParam::Income);
-                slider(p, "Population", SliderParam::Population);
+                slider(p, "Cops per ship", SliderParam::CopsPerShip);
+                slider(p, "War hardship", SliderParam::WarHardship);
+                slider(p, "Revolt", SliderParam::RevoltShare);
                 slider(p, "Ship cost", SliderParam::ShipCost);
                 slider(p, "Upkeep", SliderParam::Upkeep);
                 slider(p, "Shot cost", SliderParam::ShotCost);
@@ -515,7 +533,8 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                 p.spawn(text(
                     "Left-drag a box around ships (or click a fleet) to select · Shift adds · right-click the map to send them there: \
                      ships from several fleets merge into one fleet, part of a fleet splits off · \
-                     1 Line · 2 Wedge · 3 Crescent · 4 Echelon L · 5 Echelon R · 6 Column · wheel over the map: zoom · middle-drag: pan.",
+                     1 Line · 2 Wedge · 3 Crescent · 4 Echelon L · 5 Echelon R · 6 Column · wheel over the map: zoom · middle-drag: pan · \
+                     click a planet to see its people, [ and ] lower or raise its tax.",
                     12.5,
                     DIM,
                 ));
@@ -980,6 +999,21 @@ pub fn proto_pointer(
     }
     if keys.just_pressed(KeyCode::Escape) {
         proto.selected.clear();
+        proto.selected_planet = None;
+    }
+    // [ and ] lower or raise the selected planet's tax by 5 %.
+    if let Some(i) = proto.selected_planet {
+        let step = if keys.just_pressed(KeyCode::BracketLeft) {
+            -0.05
+        } else if keys.just_pressed(KeyCode::BracketRight) {
+            0.05
+        } else {
+            0.0
+        };
+        if step != 0.0 {
+            let tax = proto.d.planets[i].tax;
+            proto.d.set_tax(i, ((tax + step) * 20.0).round() / 20.0);
+        }
     }
     let Ok(cursor) = image.single() else { return };
     let Some(n) = cursor.normalized else { return };
@@ -1023,6 +1057,10 @@ pub fn proto_pointer(
             proto.drag = None;
             if !shift {
                 proto.selected.clear();
+            }
+            if !boxed {
+                // A click on a planet shows its people (elsewhere: deselects it).
+                proto.selected_planet = proto.d.planet_near(proto.camera.to_world(from), 8.0 / proto.camera.zoom);
             }
             if boxed {
                 // Ships of controllable fleets inside the box.
@@ -1119,7 +1157,7 @@ pub fn render_labs(
         // Half-resolution regions while zooming or panning, sharp once still.
         let bg_step = if proto.camera_still < 0.25 { 2 } else { 1 };
         let marquee = proto.drag.filter(|d| d.2).map(|d| (d.0, d.1));
-        let opts = DrawOptions { regions: proto.regions, borders: proto.borders, selected: proto.selected.clone(), marquee, step: 3 };
+        let opts = DrawOptions { regions: proto.regions, borders: proto.borders, selected: proto.selected.clone(), marquee, step: 3, planet: proto.selected_planet };
         let key = format!(
             "{}|{:?}|{:?}|{bg_step}|{:?}|{:?}",
             proto.d.time,
@@ -1222,7 +1260,7 @@ pub fn update_lab_ui(
     for (which, mut t) in &mut texts {
         let s = match which {
             LabText::Seed => c.seed.to_string(),
-            LabText::Proto => dominion::status(&labs.proto.d, &labs.proto.selected),
+            LabText::Proto => dominion::status(&labs.proto.d, &labs.proto.selected, labs.proto.selected_planet),
             LabText::Status(l) => status(&c, *l, st),
         };
         if t.0 != s {

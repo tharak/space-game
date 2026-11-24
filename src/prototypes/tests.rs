@@ -59,7 +59,8 @@ fn the_world_starts_with_home_planets_fleets_and_garrisons() {
 fn planets_build_ships_into_their_garrison() {
     let mut d = world();
     d.tuning.secs_per_ship = 6.0;
-    // Build mechanics only: no costs.
+    // Build mechanics only: no costs, no strikes.
+    d.rebellion.threshold = 2.0;
     d.tuning.upkeep = 0.0;
     d.tuning.ship_cost = 0.0;
     let home = d.planets.iter().position(|p| p.owner == BLUE).unwrap();
@@ -241,8 +242,17 @@ fn a_fleet_sent_at_a_planet_takes_it() {
     d.planets[i].value = 1;
     let blue = d.add_fleet(BLUE, p.pos + Vec2::new(-80.0, 0.0), 0.0, 80, None);
     assert!(d.order_move(blue, p.pos));
-    d.step(90.0);
+    let mut t = 0.0;
+    while d.planets[i].owner != BLUE && t < 90.0 {
+        d.step(0.5);
+        t += 0.5;
+    }
     assert_eq!(d.planets[i].owner, BLUE);
+    // A fresh conquest is resented for a minute.
+    assert!(d.planets[i].occupation > 0.25);
+    d.step(OCCUPATION_SECS + 1.0);
+    assert_eq!(d.planets[i].occupation, 0.0);
+    assert_eq!(d.planets[i].owner, BLUE, "80 ships keep the peace");
 }
 
 /// Blue's home planet of size 2 and nothing else on the map.
@@ -254,6 +264,8 @@ fn economy() -> (Dominion, usize) {
         p.value = if i == home { 2 } else { 0 };
     }
     d.tuning.secs_per_ship = 0.5;
+    // Content people: nobody ever rebels.
+    d.rebellion.threshold = 2.0;
     (d, home)
 }
 
@@ -264,7 +276,6 @@ fn ships_cost_credits_and_wait_when_short() {
     d.tuning.ship_cost = 100.0;
     d.credits[0] = 250.0;
     d.tuning.income = 0.0;
-    d.tuning.population = 0.0;
     d.step(10.0);
     // Two ships bought, then the planet waits for credits.
     assert_eq!(d.ships_of(BLUE), 2);
@@ -272,13 +283,46 @@ fn ships_cost_credits_and_wait_when_short() {
 }
 
 #[test]
-fn planets_earn_by_size_minus_population() {
-    let (mut d, _) = economy();
+fn planets_earn_their_tax_share_of_production() {
+    let (mut d, home) = economy();
     d.tuning.ship_cost = 1e6;
     d.credits[0] = 0.0;
     d.step(10.0);
-    // Size 2 × (1 − 0.2) a second for 10 s.
+    // Size 2 × income 4 × tax 0.2 a second for 10 s.
     assert!((d.credits_of(BLUE) - 16.0).abs() < 0.1, "{}", d.credits_of(BLUE));
+    // Strikes take their share.
+    d.planets[home].unrest = 0.5;
+    assert!((d.planet_income(BLUE) - 0.8).abs() < 1e-4);
+    d.set_tax(home, 2.0);
+    assert_eq!(d.planets[home].tax, MAX_TAX);
+}
+
+#[test]
+fn an_unguarded_overtaxed_planet_revolts() {
+    let (mut d, home) = economy();
+    d.rebellion = Default::default();
+    d.tuning.ship_cost = 1e6;
+    d.set_tax(home, 0.6);
+    d.step(60.0);
+    let p = d.planets[home];
+    assert_eq!(p.owner, Owner::Independent(home));
+    assert_eq!(d.revolts[0], 1);
+    let rebels = d.fleets.iter().find(|f| f.home == Some(home)).expect("a rebel garrison");
+    assert_eq!(rebels.owner, Owner::Independent(home));
+    assert!(rebels.ships >= 1);
+}
+
+#[test]
+fn a_garrisoned_planet_at_a_fair_tax_stays_calm() {
+    let (mut d, home) = economy();
+    d.rebellion = Default::default();
+    d.tuning.ship_cost = 1e6;
+    let at = d.planets[home].pos;
+    d.add_fleet(BLUE, at, 0.0, 10, Some(home));
+    d.step(120.0);
+    assert_eq!(d.planets[home].owner, BLUE);
+    assert!(d.planets[home].unrest < 0.05, "{}", d.planets[home].unrest);
+    assert_eq!(d.revolts[0], 0);
 }
 
 #[test]
