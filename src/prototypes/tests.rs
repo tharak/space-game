@@ -80,7 +80,7 @@ fn the_world_starts_with_home_planets_fleets_and_garrisons() {
     }
     // Start fleets carry a supply ship each, out on the highways.
     for f in d.fleets.iter().filter(|f| f.home.is_none()) {
-        assert_eq!((f.ships, f.supply), (START_SHIPS, 1));
+        assert_eq!((f.ships, f.supply), (START_SHIPS, 3));
         let s = d.highways.snap(f.pos).unwrap();
         assert!(s.point.distance(f.pos) < 3.0, "{:?} is off the highways", f.pos);
     }
@@ -398,6 +398,8 @@ fn an_unguarded_overtaxed_planet_revolts() {
     let (mut d, home) = economy();
     d.rebellion = Default::default();
     d.tuning.ship_cost = 1e6;
+    // Not a home planet any more (those stay loyal).
+    d.planets[home].home_of = None;
     d.set_tax(home, 0.6);
     d.step(60.0);
     let p = d.planets[home];
@@ -406,6 +408,38 @@ fn an_unguarded_overtaxed_planet_revolts() {
     let rebels = d.fleets.iter().find(|f| f.home == Some(home)).expect("a rebel garrison");
     assert_eq!(rebels.owner, Owner::Independent(home));
     assert!(rebels.ships >= 1);
+}
+
+#[test]
+fn a_home_planet_never_rebels_against_its_own_side() {
+    let (mut d, home) = economy();
+    d.rebellion = Default::default();
+    d.tuning.ship_cost = 1e6;
+    d.set_tax(home, MAX_TAX);
+    d.step(60.0);
+    assert_eq!(d.planets[home].owner, BLUE);
+    assert!(d.planets[home].loyal());
+    assert_eq!(d.revolts[0], 0);
+    assert_eq!(d.ships_needed(home), Some(0));
+    // Held by the enemy, it is just another planet.
+    d.planets[home].owner = RED;
+    assert!(!d.planets[home].loyal() && d.planets[home].restless());
+}
+
+#[test]
+fn the_ships_a_planet_needs_grow_with_tax_and_occupation() {
+    let (mut d, home) = economy();
+    d.planets[home].home_of = None;
+    d.set_tax(home, 0.1);
+    assert_eq!(d.ships_needed(home), Some(0));
+    d.set_tax(home, 0.2);
+    let fair = d.ships_needed(home).unwrap();
+    assert!(fair >= 1);
+    d.planets[home].occupation = OCCUPATION_PENALTY;
+    let occupied = d.ships_needed(home).unwrap_or(u32::MAX);
+    assert!(occupied > fair, "{occupied} vs {fair}");
+    d.set_tax(home, MAX_TAX);
+    assert!(d.ships_needed(home).is_none_or(|n| n >= occupied));
 }
 
 #[test]
@@ -478,39 +512,71 @@ fn parts_repair_ships_and_without_them_damaged_ships_break_up() {
 }
 
 #[test]
-fn a_fleet_in_need_gets_a_convoy_that_joins_and_is_used_up() {
+fn a_fleet_in_need_gets_one_convoy_per_kind_that_joins_and_is_used_up() {
     let (mut d, home) = economy();
     d.tuning.ship_cost = 1e6;
-    // Enough for one supply ship, and no more coming.
+    // Enough for one supply ship of each kind, and no more coming.
     d.tuning.income = 0.0;
     d.planets[home].stock = [10.0; 3];
     let start = d.planets[home].pos;
     let far = d.highways.neighbors[home][0];
     let at = d.planets[home].pos + (d.planets[far].pos - start) * 0.6;
     let id = d.add_fleet(BLUE, at, 0.0, 6, None);
-    set_stores(&mut d, id, [1.0, 1.0, 0.5]);
+    set_stores(&mut d, id, [1.0, 1.0, 0.0]);
     d.step(MAINTENANCE_SECS + 0.05);
-    assert_eq!(d.convoys_sent[0], 1);
-    assert!(d.fleets.iter().any(|f| f.convoy == Some(id)));
-    assert!((d.planets[home].stock.iter().sum::<f32>() - 10.0).abs() < 0.01, "20 units loaded");
-    // It travels the highway and joins.
-    let mut joined = false;
+    assert_eq!(d.convoys_sent[0], 3);
+    let convoys: Vec<&Fleet> = d.fleets.iter().filter(|f| f.convoy == Some(id)).collect();
+    assert_eq!(convoys.len(), 3);
+    for c in &convoys {
+        let (_, cargo) = d.fleet_stores(c);
+        assert_eq!(cargo.iter().filter(|v| **v > 0.0).count(), 1, "one kind a ship: {cargo:?}");
+    }
+    assert!(d.planets[home].stock.iter().sum::<f32>() < 0.01, "all loaded");
+    // They travel the highway and join (and may unload at once).
+    let mut seen = 0;
     for _ in 0..120 {
-        d.step(0.5);
-        if d.fleet(id).unwrap().supply > 0 {
-            joined = true;
+        d.step(0.05);
+        seen = seen.max(d.fleet(id).unwrap().supply);
+        if !d.fleets.iter().any(|f| f.convoy == Some(id)) {
             break;
         }
     }
-    assert!(joined, "the convoy never joined");
-    // It trails behind, and its cargo is used up at the next phase.
+    assert!(seen >= 1, "no convoy ever joined");
+    assert!(!d.fleets.iter().any(|f| f.convoy == Some(id)), "convoys still under way");
+    // Their cargo is used up by the next phase.
     d.step(MAINTENANCE_SECS + 0.05);
     let f = d.fleet(id).unwrap();
     let (stores, _) = d.fleet_stores(f);
-    assert!(stores[AMMO] > 6.0 && stores[FOOD] > 6.0 * 0.5, "{stores:?}");
-    // 6 ships hold 60 ammo, 18 food, 12 parts: 20 units all fit.
-    assert_eq!(f.supply, 0, "the empty supply ship is used up");
-    assert_eq!(d.convoys_sent[0], 1);
+    assert!(stores[AMMO] > 10.0 && stores[FOOD] > 6.0 && stores[PARTS] > 9.0, "{stores:?}");
+    assert_eq!(f.supply, 0, "the empty supply ships are used up");
+}
+
+#[test]
+fn a_convoy_waits_at_enemy_lines() {
+    let (mut d, home) = economy();
+    d.tuning.food_per_phase = 0.0;
+    let far = d.highways.neighbors[home][0];
+    let (a, b) = (d.planets[home].pos, d.planets[far].pos);
+    let target = d.add_fleet(BLUE, b, 0.0, 6, None);
+    // A big Red fleet sits on the road: its cell covers the middle.
+    let mid = a + (b - a) * 0.5;
+    let red = d.add_fleet(RED, mid + (b - a).perp().normalize() * 40.0, 0.0, 60, None);
+    let convoy = d.add_convoy(BLUE, a, [10.0, 0.0, 0.0], Some(target));
+    d.step(8.0);
+    let c = d.fleet(convoy).expect("still under way");
+    assert!(c.waiting, "it should wait at the border");
+    let inf = Influence::new(&d);
+    assert!(!matches!(inf.at(c.pos), Some(Site::Fleet(i)) if d.fleets[i].owner == RED));
+    // The Red fleet leaves: the convoy goes on and joins.
+    d.clear_fleet(red);
+    for _ in 0..60 {
+        d.step(0.5);
+        if d.fleet(convoy).is_none() {
+            break;
+        }
+    }
+    assert!(d.fleet(convoy).is_none(), "the convoy never arrived");
+    assert_eq!(d.fleet(target).unwrap().supply, 1);
 }
 
 #[test]
@@ -521,7 +587,7 @@ fn supply_ships_trail_their_fleet_and_can_be_shot() {
     let f = d.fleet(a).unwrap();
     let k = f.is_supply.iter().position(|s| *s).unwrap();
     let behind = (f.ship_px[k].0 - f.pos).dot(Vec2::from_angle(f.facing));
-    assert!(behind < -d.range(), "{behind}");
+    assert!(behind < 0.0 && behind > -d.range(), "close behind: {behind}");
     assert!(d.world.get::<Supply>(f.ship_ids[k]).is_some());
     // A lone supply ship next to an enemy fleet gets shot down.
     let lone = d.add_convoy(BLUE, d.fleet(b).unwrap().pos + Vec2::new(-30.0, 0.0), [5.0; 3], None);
@@ -544,18 +610,30 @@ fn one_whole_fleet_selected_just_moves() {
 }
 
 #[test]
-fn selected_fleets_merge_into_the_biggest() {
-    let (mut d, a, _) = duel((BLUE, Vec2::new(100.0, 100.0), 0.0, 12), (RED, Vec2::new(650.0, 350.0), WEST, 10));
-    let b = d.add_fleet(BLUE, Vec2::new(100.0, 250.0), 0.0, 5, None);
+fn fleets_ordered_together_travel_apart_and_merge_where_they_arrive() {
+    let mut d = world();
+    d.clear_fleets();
+    d.tuning.food_per_phase = 0.0;
+    d.tuning.secs_per_ship = 1e6;
+    let home = d.planets.iter().position(|p| p.owner == BLUE).unwrap();
+    let ns = d.highways.neighbors[home].clone();
+    let (p1, p2) = (d.planets[ns[0]].pos, d.planets[ns[1]].pos);
+    let a = d.add_fleet(BLUE, p1, 0.0, 12, None);
+    let b = d.add_fleet(BLUE, p2, 0.0, 5, None);
     let mut sel = ids(&d, a);
     sel.extend(ids(&d, b));
-    let to = Vec2::new(250.0, 180.0);
+    let to = d.planets[home].pos;
     assert_eq!(d.form_fleet(&sel, to), Some(a));
-    assert!(d.fleet(b).is_none(), "the smaller fleet is absorbed");
-    assert_eq!(ships(&d, a), 17);
-    assert_eq!(d.fleet(a).unwrap().dest, Some(d.highways.snap(to).unwrap().point));
-    d.step(10.0);
-    assert_eq!(ships(&d, a), 17);
+    // Under way: still two fleets, each on its own route.
+    d.step(1.0);
+    assert!(d.fleet(a).is_some() && d.fleet(b).is_some());
+    assert_eq!(d.fleet(b).unwrap().rendezvous, Some(a));
+    d.step(60.0);
+    assert!(d.fleet(b).is_none(), "the smaller fleet merged in");
+    let f = d.fleet(a).unwrap();
+    assert_eq!(f.ships, 17);
+    assert!(f.pos.distance(to) < 30.0);
+    assert_eq!(f.rendezvous, None);
 }
 
 #[test]

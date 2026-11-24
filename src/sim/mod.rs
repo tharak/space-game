@@ -127,8 +127,9 @@ fn spawn_ships(world: &mut World, division: Entity, points: &[Vec2]) {
     }
 }
 
-/// How far behind a division's rear rank its supply ships trail, in gun ranges.
-pub const SUPPLY_TRAIL: f32 = 1.5;
+/// How far behind a division's rear rank its supply ships trail, in ship
+/// spacings: as close as they can without getting in the way.
+pub const SUPPLY_TRAIL: f32 = 2.0;
 
 /// A supply ship carrying `cargo` joins `division` at `at`; returns it.
 pub fn add_supply(world: &mut World, division: Entity, at: Vec2, cargo: [f32; 3]) -> Option<Entity> {
@@ -278,7 +279,7 @@ pub fn set_formation(world: &mut World, division: Entity, formation: Formation) 
     }
     // Supply ships trail on a line behind the rear rank, out of the fight.
     // (A convoy of supply ships alone keeps them at its anchor.)
-    let gap = if ships.is_empty() { 0.0 } else { world.resource::<Tuning>().range * SUPPLY_TRAIL };
+    let gap = if ships.is_empty() { 0.0 } else { spacing * SUPPLY_TRAIL };
     let n = supply.len() as f32;
     for (k, (e, _)) in supply.iter().enumerate() {
         let y = (k as f32 - (n - 1.0) / 2.0) * spacing * 1.5;

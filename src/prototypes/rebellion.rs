@@ -321,6 +321,31 @@ impl Rebellion {
     }
 }
 
+/// The fewest cops that keep people with this legitimacy and hardship
+/// bonus calm, from the precomputed [`super::calm::CALM_COPS`] table,
+/// interpolated. Never fewer for lower legitimacy or more hardship (the
+/// table is noisy, and very unhappy people sit calm only because they are
+/// in jail). `None`: not even the most cops a planet can get.
+pub fn calm_cops(legitimacy: f32, bonus: f32) -> Option<f32> {
+    use super::calm::CALM_COPS;
+    let at = |l: usize, b: usize| -> f32 {
+        let mut most = 0u8;
+        for row in CALM_COPS.iter().skip(l) {
+            for &v in row.iter().take(b + 1) {
+                most = most.max(v);
+            }
+        }
+        if most == 255 { f32::INFINITY } else { most as f32 }
+    };
+    let l = (legitimacy.clamp(0.0, 1.0) / 0.05).min(20.0);
+    let b = (bonus.clamp(0.0, 1.0) / 0.1).min(10.0);
+    let (l0, b0) = (l.floor() as usize, b.floor() as usize);
+    let (l1, b1) = ((l0 + 1).min(20), (b0 + 1).min(10));
+    let (fl, fb) = (l - l0 as f32, b - b0 as f32);
+    let v = (at(l0, b0) * (1.0 - fb) + at(l0, b1) * fb) * (1.0 - fl) + (at(l1, b0) * (1.0 - fb) + at(l1, b1) * fb) * fl;
+    v.is_finite().then_some(v)
+}
+
 fn rank(c: Cell) -> u8 {
     match c {
         Cell::Empty => 0,
@@ -401,6 +426,19 @@ mod tests {
         r.recount();
         assert_eq!(free, r.free_at);
         assert_eq!(active, r.active_at);
+    }
+
+    #[test]
+    fn the_calm_table_never_asks_less_of_unhappier_people() {
+        assert_eq!(calm_cops(1.0, 0.0), Some(0.0));
+        assert_eq!(calm_cops(0.9, 0.0), Some(0.0));
+        let mut last = 0.0;
+        for k in (0..=20).rev() {
+            let v = calm_cops(k as f32 * 0.05, 0.3).unwrap_or(f32::INFINITY);
+            assert!(v >= last, "{k}: {v} < {last}");
+            last = v;
+        }
+        assert!(calm_cops(0.8, 0.0).unwrap() < calm_cops(0.8, 0.5).unwrap());
     }
 
     #[test]
