@@ -202,7 +202,7 @@ fn fleets_move_at_the_set_speed_along_a_highway_and_stop_there() {
     assert!(d.order_move(a, to));
     d.step(2.0);
     let gone = d.fleet(a).unwrap().pos.distance(from);
-    assert!(gone > 20.0 && gone < 2.0 * d.tuning.speed + 5.0, "{gone}");
+    assert!(gone > 0.6 * d.tuning.speed && gone < 2.0 * d.tuning.speed + 5.0, "{gone}");
     d.step(from.distance(to) / d.tuning.speed + 10.0);
     let f = d.fleet(a).unwrap();
     assert!(f.dest.is_none());
@@ -604,7 +604,7 @@ fn a_fleet_in_need_gets_one_convoy_per_kind_that_joins_and_is_used_up() {
     assert!(d.planets[home].stock.iter().sum::<f32>() < 0.01, "all loaded");
     // They travel the highway and join (and may unload at once).
     let mut seen = 0;
-    for _ in 0..120 {
+    for _ in 0..600 {
         d.step(0.05);
         seen = seen.max(d.fleet(id).unwrap().supply);
         if !d.fleets.iter().any(|f| f.joining == Some(id)) {

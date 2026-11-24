@@ -179,7 +179,7 @@ impl Default for Tuning {
             weight_per_ship: 0.1,
             planet_weight: 0.5,
             secs_per_ship: 15.0,
-            speed: 30.0,
+            speed: 15.0,
             combat_speed: 3.0,
             income: 4.0,
             ship_cost: 5.0,
