@@ -1,8 +1,9 @@
 //! Runs prototype01 for three minutes and writes frames as PPMs. Each side's
 //! fleets head for the nearest independent planet, so there's fighting:
-//! `cargo run --release --example prototype01_dump -- <dir> [planets] [fleets]`.
+//! `cargo run --release --example prototype01_dump -- <dir> [planets] [fleets] [motherships]`
+//! (`motherships` runs prototype02, with Blue's mothership's view open).
 
-use space_game::prototypes::dominion::{DrawOptions, Dominion, Owner, Tuning, VIEW_H, VIEW_W, View, render, render_background, status};
+use space_game::prototypes::dominion::{DrawOptions, Dominion, Mode, Owner, Tuning, VIEW_H, VIEW_W, View, render, render_background, status};
 use space_game::voronoi::sites::VoronoiConfig;
 
 fn main() {
@@ -12,7 +13,8 @@ fn main() {
     let fleets = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
     std::fs::create_dir_all(&dir).expect("create output dir");
     let cfg = VoronoiConfig { w: 1080, h: 600, ..Default::default() };
-    let mut d = Dominion::new(&cfg, planets, fleets, Tuning::default());
+    let mode = if args.get(4).is_some_and(|a| a == "motherships") { Mode::Motherships } else { Mode::Captains };
+    let mut d = Dominion::with_mode(&cfg, planets, fleets, Tuning::default(), mode);
     let write = |d: &Dominion, name: &str| {
         let view = View::fit(&d.cfg, VIEW_W, VIEW_H);
         let t = std::time::Instant::now();
@@ -22,8 +24,11 @@ fn main() {
         let planet = (0..d.planets.len())
             .filter(|i| d.planets[*i].owner == Owner::Side(0))
             .max_by(|a, b| d.planets[*a].unrest.total_cmp(&d.planets[*b].unrest));
-        let opts =
-            DrawOptions { selected: d.fleets.first().map(|f| f.ship_ids.clone()).unwrap_or_default(), planet, ..Default::default() };
+        let selected = match d.motherships.iter().find(|m| m.alive && m.owner == Owner::Side(0)) {
+            Some(m) => vec![m.ship],
+            None => d.fleets.first().map(|f| f.ship_ids.clone()).unwrap_or_default(),
+        };
+        let opts = DrawOptions { selected, planet, ..Default::default() };
         let t = std::time::Instant::now();
         let frame = render(d, &bg, &view, &opts);
         println!("{name}: background {:.1} ms, frame {:.1} ms", t_bg.as_secs_f32() * 1e3, t.elapsed().as_secs_f32() * 1e3);

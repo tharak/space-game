@@ -151,6 +151,18 @@ pub fn add_ship(world: &mut World, division: Entity, at: Vec2) -> Option<Entity>
     Some(e)
 }
 
+/// Moves a division and its ships to another side (a mutiny).
+pub fn set_side(world: &mut World, division: Entity, side: usize) {
+    if let Some(mut d) = world.get_mut::<Division>(division) {
+        d.side = side;
+    }
+    let ships: Vec<Entity> =
+        world.query::<(Entity, &InDivision)>().iter(world).filter(|(_, d)| d.0 == division).map(|(e, _)| e).collect();
+    for e in ships {
+        world.entity_mut(e).insert(Side(side));
+    }
+}
+
 /// Despawns these ships of a division (not counted as losses) and re-forms it.
 pub fn despawn_ships(world: &mut World, division: Entity, ships: &[Entity]) {
     let mut n = 0u32;

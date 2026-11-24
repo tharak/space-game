@@ -284,7 +284,7 @@ pub fn hit_chance(tuning: &Tuning, arc: usize, dist: f32) -> f32 {
 #[allow(clippy::too_many_arguments)]
 pub fn fire(
     mut commands: Commands,
-    mut shooters: Query<(&Pos, &Heading, &Side, &InDivision, &mut Weapon), Without<Supply>>,
+    mut shooters: Query<(&Pos, &Heading, &Side, &InDivision, &mut Weapon), (Without<Supply>, Without<MothershipHull>)>,
     mut hulls: Query<(&mut Ship, Has<FleetFlagship>)>,
     mut divs: Query<&mut Division>,
     hash: Res<SpatialHash>,

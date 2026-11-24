@@ -13,7 +13,7 @@ use bevy::ui::RelativeCursorPosition;
 use super::flow::{AppRequest, Phase};
 use super::theme::*;
 use super::ui::{BtnKind, BtnLabel, Enabled, Selected, button_for, card_title, choice_row, panel, row, text};
-use crate::prototypes::dominion::{self, DrawOptions, Dominion, Formation, MAX_FLEETS_PER_SIDE, MAX_SHIPS, MIN_SHIPS, Tuning, VIEW_H, VIEW_W, View};
+use crate::prototypes::dominion::{self, DrawOptions, Dominion, Formation, MAX_FLEETS_PER_SIDE, MAX_SHIPS, MIN_SHIPS, Mode, Tuning, VIEW_H, VIEW_W, View};
 use crate::voronoi::Vec2 as MapVec;
 use crate::voronoi::labs::{FACTIONS, LabId, LabState, render, site_at, status, zoom_inset};
 use crate::voronoi::metric::Metric;
@@ -50,6 +50,8 @@ struct LabView {
 /// prototype01's state, selection and image.
 struct Proto {
     d: Dominion,
+    /// prototype01 (captains) or prototype02 (motherships).
+    mode: Mode,
     /// The prototype's own map size (bigger than the labs').
     size: (u32, u32),
     /// How many of the sites get a planet.
@@ -85,7 +87,7 @@ struct Proto {
 impl Proto {
     /// A fresh world (after a size, count or config change) and a fitted camera.
     fn rebuild(&mut self, cfg: &VoronoiConfig) {
-        self.d = Dominion::new(&proto_cfg(cfg, self.size), self.planets, self.fleets, self.d.tuning);
+        self.d = Dominion::with_mode(&proto_cfg(cfg, self.size), self.planets, self.fleets, self.d.tuning, self.mode);
         self.selected.clear();
         self.camera = View::fit(&self.d.cfg, VIEW_W, VIEW_H);
     }
@@ -95,7 +97,8 @@ impl Proto {
 #[derive(Resource)]
 pub struct Labs {
     pub state: LabState,
-    proto: Proto,
+    /// prototype01 and prototype02.
+    protos: Vec<Proto>,
     views: Vec<LabView>,
     hover: Option<(LabId, MapVec)>,
     drag: Option<(LabId, Drag)>,
@@ -125,13 +128,14 @@ pub enum LabAction {
     /// −/+ on a slider: one step down or up.
     Nudge(SliderParam, i8),
     // prototype01
-    ProtoPause,
-    ProtoSpeed(u32),
+    // Each takes the prototype (0 = prototype01, 1 = prototype02).
+    ProtoPause(usize),
+    ProtoSpeed(usize, u32),
     /// Zoom the prototype map by a factor (around its centre); 0 = fit.
-    ProtoZoom(i8),
-    ProtoReset,
-    ProtoRegions,
-    ProtoBorders,
+    ProtoZoom(usize, i8),
+    ProtoReset(usize),
+    ProtoRegions(usize),
+    ProtoBorders(usize),
     // Per lab
     Play(LabId),
     Reset(LabId),
@@ -174,6 +178,13 @@ pub enum SliderParam {
     FlagshipShips,
     Command,
     CaptainDeath,
+    // prototype02
+    CrewPerShip,
+    LaunchRate,
+    StartPopulation,
+    MoraleShortage,
+    MoraleCrowding,
+    MothershipBuild,
     GrowRadius,
     Crack,
     Weight(usize),
@@ -202,13 +213,20 @@ impl SliderParam {
             SliderParam::FlagshipShips => (1.0, 10.0, 0.5),
             SliderParam::Command => (1.0, 40.0, 1.0),
             SliderParam::CaptainDeath => (0.0, 1.0, 0.05),
+            SliderParam::CrewPerShip => (1.0, 60.0, 1.0),
+            SliderParam::LaunchRate => (0.1, 5.0, 0.1),
+            SliderParam::StartPopulation => (50.0, 1100.0, 10.0),
+            SliderParam::MoraleShortage => (0.0, 0.3, 0.01),
+            SliderParam::MoraleCrowding => (0.0, 0.3, 0.01),
+            SliderParam::MothershipBuild => (2.0, 120.0, 1.0),
             SliderParam::GrowRadius => (0.0, LabState::grow_max(cfg), 1.0),
             SliderParam::Crack => (0.5, 10.0, 0.1),
             SliderParam::Weight(_) => (0.2, 4.0, 0.1),
         }
     }
 
-    fn get(self, cfg: &VoronoiConfig, st: &LabState, proto: &Proto) -> f32 {
+    fn get(self, cfg: &VoronoiConfig, st: &LabState, protos: &[Proto]) -> f32 {
+        let (proto, carrier) = (&protos[0], &protos[1]);
         match self {
             SliderParam::Sites => cfg.sites as f32,
             SliderParam::Planets => proto.planets.min(cfg.sites) as f32,
@@ -232,6 +250,12 @@ impl SliderParam {
             SliderParam::FlagshipShips => proto.d.tuning.flagship_ships,
             SliderParam::Command => proto.d.tuning.command,
             SliderParam::CaptainDeath => proto.d.tuning.captain_death,
+            SliderParam::CrewPerShip => carrier.d.tuning.crew_per_ship,
+            SliderParam::LaunchRate => carrier.d.tuning.launch_rate,
+            SliderParam::StartPopulation => carrier.d.tuning.start_population,
+            SliderParam::MoraleShortage => carrier.d.tuning.morale_shortage,
+            SliderParam::MoraleCrowding => carrier.d.tuning.morale_crowding,
+            SliderParam::MothershipBuild => carrier.d.tuning.mothership_build_secs,
             SliderParam::GrowRadius => st.grow_radius,
             SliderParam::Crack => st.crack,
             SliderParam::Weight(i) => st.weights[i],
@@ -260,6 +284,12 @@ impl SliderParam {
             SliderParam::FlagshipShips => format!("a flagship counts as {v:.1} ships"),
             SliderParam::Command => format!("{v:.0} escorts a captain commands"),
             SliderParam::CaptainDeath => format!("{:.0}% chance to die with the flagship", v * 100.0),
+            SliderParam::CrewPerShip => format!("{v:.0} people to crew a ship aboard"),
+            SliderParam::LaunchRate => format!("{v:.1} ships launched a second (all working)"),
+            SliderParam::StartPopulation => format!("{v:.0} people at the start (Reset)"),
+            SliderParam::MoraleShortage => format!("−{:.0}% morale per empty store (÷3) a phase", v * 100.0),
+            SliderParam::MoraleCrowding => format!("−{:.0}% morale per 100% crowding a phase", v * 100.0),
+            SliderParam::MothershipBuild => format!("{v:.0} s to build a ship aboard (all working)"),
             SliderParam::GrowRadius => format!("{v:.0} px"),
             SliderParam::Crack => format!("{v:.1}"),
             SliderParam::Weight(_) => format!("{v:.1}×"),
@@ -281,7 +311,7 @@ pub struct ActiveSlider(Option<SliderParam>);
 #[derive(Component, Clone, Copy, PartialEq)]
 pub enum LabText {
     Seed,
-    Proto,
+    Proto(usize),
     Status(LabId),
 }
 
@@ -300,7 +330,7 @@ fn proto_cfg(cfg: &VoronoiConfig, size: (u32, u32)) -> VoronoiConfig {
 #[derive(Component)]
 pub struct LabImage(LabId);
 #[derive(Component)]
-pub struct PrototypeImage;
+pub struct PrototypeImage(usize);
 
 const MAP_W: f32 = 720.0;
 const MAP_H: f32 = 400.0;
@@ -315,6 +345,20 @@ fn blank_image(cfg: &VoronoiConfig) -> Image {
     );
     img.sampler = ImageSampler::nearest();
     img
+}
+
+/// A prototype's Pause, speed, view and zoom buttons.
+fn proto_buttons(r: &mut ChildSpawnerCommands, i: usize) {
+    button_for(r, "Pause", LabAction::ProtoPause(i), BtnKind::Primary);
+    for m in [1, 2, 4] {
+        button_for(r, &format!("{m}×"), LabAction::ProtoSpeed(i, m), BtnKind::Choice);
+    }
+    toggle(r, "Planet cells", LabAction::ProtoRegions(i));
+    toggle(r, "Patch edges", LabAction::ProtoBorders(i));
+    button_for(r, "Reset", LabAction::ProtoReset(i), BtnKind::Normal);
+    button_for(r, "Zoom −", LabAction::ProtoZoom(i, -1), BtnKind::Normal);
+    button_for(r, "Zoom +", LabAction::ProtoZoom(i, 1), BtnKind::Normal);
+    button_for(r, "Fit", LabAction::ProtoZoom(i, 0), BtnKind::Normal);
 }
 
 fn toggle(parent: &mut ChildSpawnerCommands, label: &str, action: LabAction) {
@@ -362,7 +406,8 @@ fn slider_sized(parent: &mut ChildSpawnerCommands, title: &str, param: SliderPar
 fn set_slider(param: SliderParam, v: f32, cfg: &mut VoronoiConfig, labs: &mut Labs) {
     let (lo, hi, _) = param.range(cfg);
     let v = v.clamp(lo, hi);
-    let proto = &mut labs.proto;
+    let (first, rest) = labs.protos.split_at_mut(1);
+    let (proto, carrier) = (&mut first[0], &mut rest[0]);
     match param {
         SliderParam::Sites => {
             let n = v.round() as usize;
@@ -405,6 +450,12 @@ fn set_slider(param: SliderParam, v: f32, cfg: &mut VoronoiConfig, labs: &mut La
         SliderParam::FlagshipShips => proto.d.tuning.flagship_ships = v,
         SliderParam::Command => proto.d.tuning.command = v,
         SliderParam::CaptainDeath => proto.d.tuning.captain_death = v,
+        SliderParam::CrewPerShip => carrier.d.tuning.crew_per_ship = v,
+        SliderParam::LaunchRate => carrier.d.tuning.launch_rate = v,
+        SliderParam::StartPopulation => carrier.d.tuning.start_population = v,
+        SliderParam::MoraleShortage => carrier.d.tuning.morale_shortage = v,
+        SliderParam::MoraleCrowding => carrier.d.tuning.morale_crowding = v,
+        SliderParam::MothershipBuild => carrier.d.tuning.mothership_build_secs = v,
         SliderParam::GrowRadius => {
             labs.state.grow_radius = v;
             if labs.playing == Some(LabId::Grow) {
@@ -439,10 +490,12 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
     // A fixed-resolution picture, smoothed when the page shows it smaller.
     let mut picture = blank_image(&VoronoiConfig { w: VIEW_W, h: VIEW_H, ..pcfg });
     picture.sampler = ImageSampler::linear();
-    let proto_image = images.add(picture);
+    let proto_image = images.add(picture.clone());
+    let carrier_image = images.add(picture);
     let (planets, fleets) = (20, 3);
-    let proto = Proto {
-        d: Dominion::new(&pcfg, planets, fleets, Tuning::default()),
+    let make = |mode: Mode, image: Handle<Image>| Proto {
+        d: Dominion::with_mode(&pcfg, planets, fleets, Tuning::default(), mode),
+        mode,
         size,
         planets,
         fleets,
@@ -453,7 +506,7 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
         borders: true,
         paused: false,
         speed: 1,
-        view: LabView { image: proto_image.clone(), key: String::new(), base: None, shown: String::new() },
+        view: LabView { image, key: String::new(), base: None, shown: String::new() },
         background: None,
         background_key: String::new(),
         since_render: 0.0,
@@ -462,9 +515,10 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
         camera_still: 0.0,
         last_camera: View::fit(&pcfg, VIEW_W, VIEW_H),
     };
+    let protos = vec![make(Mode::Captains, proto_image.clone()), make(Mode::Motherships, carrier_image.clone())];
     commands.insert_resource(Labs {
         state: LabState::new(&cfg.0),
-        proto,
+        protos,
         views,
         hover: None,
         drag: None,
@@ -511,20 +565,11 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                      Under each planet: ships there / ships needed to keep its people calm.",
                 );
                 p.spawn(row()).with_children(|r| {
-                    button_for(r, "Pause", LabAction::ProtoPause, BtnKind::Primary);
-                    for m in [1, 2, 4] {
-                        button_for(r, &format!("{m}×"), LabAction::ProtoSpeed(m), BtnKind::Choice);
-                    }
-                    toggle(r, "Planet cells", LabAction::ProtoRegions);
-                    toggle(r, "Patch edges", LabAction::ProtoBorders);
-                    button_for(r, "Reset", LabAction::ProtoReset, BtnKind::Normal);
-                    button_for(r, "Zoom −", LabAction::ProtoZoom(-1), BtnKind::Normal);
-                    button_for(r, "Zoom +", LabAction::ProtoZoom(1), BtnKind::Normal);
-                    button_for(r, "Fit", LabAction::ProtoZoom(0), BtnKind::Normal);
+                    proto_buttons(r, 0);
                 });
-                p.spawn((LabText::Proto, text("", 13.0, GREEN)));
+                p.spawn((LabText::Proto(0), text("", 13.0, GREEN)));
                 p.spawn((
-                    PrototypeImage,
+                    PrototypeImage(0),
                     ImageNode::new(proto_image),
                     RelativeCursorPosition::default(),
                     Node {
@@ -565,6 +610,39 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                     12.5,
                     DIM,
                 ));
+            });
+            c.spawn(panel()).with_children(|p| {
+                card_title(
+                    p,
+                    "prototype02 — Motherships",
+                    "One mothership a side, a carrier: its ships ride inside and launch only when a hostile fleet or \
+                     planet comes within reach, then dock again when it's calm. It is no Voronoi site. Its people run \
+                     the rebellion model with legitimacy = morale. Shortages, crowding (more ships than people to \
+                     crew them), losses and hull damage lower morale; victories raise it. The people at work (not \
+                     rebelling, not in the brig) crew it: speed, launching, repairs and building ships aboard (out \
+                     of parts) all follow them. Ships aboard keep order (cops). Fed, the people grow; starving or \
+                     hit, they die. Past the revolt share it mutinies. Click it for its view; select ships near it \
+                     with it and right-click to take them aboard.",
+                );
+                p.spawn(row()).with_children(|r| proto_buttons(r, 1));
+                p.spawn((LabText::Proto(1), text("", 13.0, GREEN)));
+                p.spawn((
+                    PrototypeImage(1),
+                    ImageNode::new(carrier_image),
+                    RelativeCursorPosition::default(),
+                    Node {
+                        width: Val::Percent(100.0),
+                        aspect_ratio: Some(VIEW_W as f32 / VIEW_H as f32),
+                        flex_shrink: 0.0,
+                        ..default()
+                    },
+                ));
+                slider(p, "Crew per ship", SliderParam::CrewPerShip);
+                slider(p, "Launch rate", SliderParam::LaunchRate);
+                slider(p, "Build aboard", SliderParam::MothershipBuild);
+                slider(p, "Start people", SliderParam::StartPopulation);
+                slider(p, "Morale: shortage", SliderParam::MoraleShortage);
+                slider(p, "Morale: crowding", SliderParam::MoraleCrowding);
             });
         });
     });
@@ -785,426 +863,449 @@ pub fn handle_lab_buttons(
                 requests.write(AppRequest::BoardPage);
             }
             LabAction::ProtoSize(w, h) => {
-                if labs.proto.size != (w, h) {
-                    labs.proto.size = (w, h);
-                    labs.proto.rebuild(&cfg.0);
-                }
-            }
-            LabAction::Game => {
-                labs.playing = None;
-                requests.write(AppRequest::Menu);
-            }
-            LabAction::SeedDelta(d) => cfg.0.seed = cfg.0.seed.saturating_add_signed(d).max(1),
-            LabAction::NewSeed => cfg.0.seed = super::random_seed() % 2_000_000_000 + 1,
-            LabAction::Metric(m) => cfg.0.metric = m,
-            LabAction::Relax(n) => cfg.0.relax = n,
-            LabAction::Nudge(param, dir) => {
-                let (lo, _, step) = param.range(&cfg.0);
-                let v = snap(param.get(&cfg.0, &labs.state, &labs.proto) + step * dir as f32, lo, step);
-                set_slider(param, v, &mut cfg.0, labs);
-            }
-            LabAction::ProtoPause => labs.proto.paused = !labs.proto.paused,
-            LabAction::ProtoSpeed(m) => {
-                labs.proto.speed = m;
-                labs.proto.paused = false;
-            }
-            LabAction::ProtoReset => labs.proto.rebuild(&cfg.0),
-            LabAction::ProtoZoom(dir) => {
-                let proto = &mut labs.proto;
-                let centre = Vec2::new(VIEW_W as f32, VIEW_H as f32) * 0.5;
-                match dir {
-                    0 => proto.camera = View::fit(&proto.d.cfg, VIEW_W, VIEW_H),
-                    d => proto.camera.zoom_at(centre, if d > 0 { 1.5 } else { 1.0 / 1.5 }, &proto.d.cfg),
-                }
-            }
-            LabAction::ProtoRegions => labs.proto.regions = !labs.proto.regions,
-            LabAction::ProtoBorders => labs.proto.borders = !labs.proto.borders,
-            LabAction::Play(lab) => {
-                if labs.playing == Some(lab) {
-                    labs.playing = None;
-                } else {
-                    if lab == LabId::Grow && st.grow_radius >= LabState::grow_max(&cfg.0) {
-                        st.grow_radius = 0.0;
-                    }
-                    if lab == LabId::Lloyd && st.lloyd_settled() {
-                        st.lloyd = None;
-                        st.lloyd_round = 0;
-                        st.lloyd_moved = f32::INFINITY;
-                    }
-                    labs.playing = Some(lab);
-                }
-            }
-            LabAction::Reset(lab) => {
-                let fresh = LabState::new(&cfg.0);
-                match lab {
-                    LabId::Delaunay => {
-                        st.edited = None;
-                        st.selected = None;
-                    }
-                    LabId::Lloyd => {
-                        st.lloyd = None;
-                        st.lloyd_round = 0;
-                        st.lloyd_moved = f32::INFINITY;
-                        if labs.playing == Some(lab) {
-                            labs.playing = None;
+                  for proto in &mut labs.protos {
+                        if proto.size != (w, h) {
+                            proto.size = (w, h);
+                            proto.rebuild(&cfg.0);
                         }
                     }
-                    LabId::Influence => {
-                        st.bases = fresh.bases;
-                        st.weights = fresh.weights;
-                        st.alive = fresh.alive;
-                        st.use_weights = true;
-                    }
-                    _ => {}
                 }
-            }
-            LabAction::GrowFronts => st.grow_fronts = !st.grow_fronts,
-            LabAction::DistanceLines => st.distance_lines = !st.distance_lines,
-            LabAction::OwnerBorders => st.owner_borders = !st.owner_borders,
-            LabAction::Cells => st.show_cells = !st.show_cells,
-            LabAction::Triangles => st.show_triangles = !st.show_triangles,
-            LabAction::Circles => st.show_circles = !st.show_circles,
-            LabAction::LloydStep => {
-                st.lloyd_step(&cfg.0);
-                if labs.playing == Some(LabId::Lloyd) {
+                LabAction::Game => {
                     labs.playing = None;
+                    requests.write(AppRequest::Menu);
                 }
-            }
-            LabAction::Centroids => st.show_centroids = !st.show_centroids,
-            LabAction::BiomeBorders => st.biome_borders = !st.biome_borders,
-            LabAction::BiomeSites => st.biome_sites = !st.biome_sites,
-            LabAction::Destroy(i) => st.alive[i] = !st.alive[i],
-            LabAction::UseWeights => st.use_weights = !st.use_weights,
-            LabAction::Mode(m) => st.noise_mode = m,
-            LabAction::Preset(p) => st.preset = p,
-            LabAction::NewWorld => st.world = st.world.wrapping_add(1),
-        }
-    }
-    // A new config invalidates edits made on the old sites.
-    if cfg.0 != labs.last_cfg {
-        let c = cfg.0;
-        labs.state.reseed(&c);
-        labs.proto.planets = labs.proto.planets.min(c.sites);
-        labs.proto.rebuild(&c);
-        labs.last_cfg = c;
-    }
-}
-
-pub fn drag_sliders(
-    mouse: Res<ButtonInput<MouseButton>>,
-    tracks: Query<(&SliderTrack, &Interaction, &RelativeCursorPosition)>,
-    mut active: ResMut<ActiveSlider>,
-    mut cfg: ResMut<LabsConfig>,
-    mut labs: ResMut<Labs>,
-) {
-    if !mouse.pressed(MouseButton::Left) {
-        active.0 = None;
-        return;
-    }
-    for (track, interaction, cursor) in &tracks {
-        if active.0.is_none() && *interaction == Interaction::Pressed {
-            active.0 = Some(track.0);
-        }
-        if active.0 != Some(track.0) {
-            continue;
-        }
-        let Some(n) = cursor.normalized else { continue };
-        let (lo, hi, step) = track.0.range(&cfg.0);
-        let t = (n.x + 0.5).clamp(0.0, 1.0);
-        let v = snap(lo + (hi - lo) * t, lo, step);
-        if (v - track.0.get(&cfg.0, &labs.state, &labs.proto)).abs() > step * 0.25 {
-            set_slider(track.0, v, &mut cfg.0, &mut labs);
-        }
-    }
-}
-
-/// Clicks and drags on the lab images.
-pub fn lab_pointer(
-    mouse: Res<ButtonInput<MouseButton>>,
-    images: Query<(&LabImage, &RelativeCursorPosition)>,
-    phase: Res<Phase>,
-    cfg: Res<LabsConfig>,
-    mut labs: ResMut<Labs>,
-) {
-    if !on_labs(&phase) {
-        labs.drag = None;
-        labs.hover = None;
-        return;
-    }
-    let cfg = cfg.0;
-    let to_map = |n: Vec2| MapVec::new((n.x + 0.5) * cfg.w as f32, (n.y + 0.5) * cfg.h as f32);
-    let clamp = |p: MapVec| p.clamp(MapVec::ZERO, MapVec::new(cfg.w as f32 - 0.5, cfg.h as f32 - 0.5));
-
-    // Hover zoom on the painted island.
-    let hover = images
-        .iter()
-        .find(|(img, c)| img.0 == LabId::Island && c.cursor_over())
-        .and_then(|(_, c)| c.normalized.map(|n| (LabId::Island, to_map(n))));
-    if labs.hover != hover {
-        labs.hover = hover;
-    }
-
-    if mouse.just_pressed(MouseButton::Left) {
-        let Some((lab, p)) = images.iter().find(|(_, c)| c.cursor_over()).and_then(|(img, c)| c.normalized.map(|n| (img.0, to_map(n))))
-        else {
-            return;
-        };
-        let st = &mut labs.state;
-        let drag = match lab {
-            LabId::Nearest => {
-                st.probe = clamp(p);
-                Some(Drag::Probe)
-            }
-            LabId::Delaunay => {
-                let mut sites = st.sites(&cfg, lab);
-                match site_at(&sites, p, 9.0) {
-                    Some(i) => {
-                        st.selected = Some(i);
-                        Some(Drag::Site(i))
-                    }
-                    None => {
-                        sites.push(clamp(p));
-                        st.selected = Some(sites.len() - 1);
-                        st.edited = Some(sites);
-                        None
+                LabAction::SeedDelta(d) => cfg.0.seed = cfg.0.seed.saturating_add_signed(d).max(1),
+                LabAction::NewSeed => cfg.0.seed = super::random_seed() % 2_000_000_000 + 1,
+                LabAction::Metric(m) => cfg.0.metric = m,
+                LabAction::Relax(n) => cfg.0.relax = n,
+                LabAction::Nudge(param, dir) => {
+                    let (lo, _, step) = param.range(&cfg.0);
+                    let v = snap(param.get(&cfg.0, &labs.state, &labs.protos) + step * dir as f32, lo, step);
+                    set_slider(param, v, &mut cfg.0, labs);
+                }
+                LabAction::ProtoPause(i) => labs.protos[i].paused = !labs.protos[i].paused,
+                LabAction::ProtoSpeed(i, m) => {
+                    labs.protos[i].speed = m;
+                    labs.protos[i].paused = false;
+                }
+                LabAction::ProtoReset(i) => labs.protos[i].rebuild(&cfg.0),
+                LabAction::ProtoZoom(i, dir) => {
+                    let proto = &mut labs.protos[i];
+                    let centre = Vec2::new(VIEW_W as f32, VIEW_H as f32) * 0.5;
+                    match dir {
+                        0 => proto.camera = View::fit(&proto.d.cfg, VIEW_W, VIEW_H),
+                        d => proto.camera.zoom_at(centre, if d > 0 { 1.5 } else { 1.0 / 1.5 }, &proto.d.cfg),
                     }
                 }
-            }
-            LabId::Influence => site_at(&st.bases, p, 12.0).map(Drag::Base),
-            _ => None,
-        };
-        labs.drag = drag.map(|d| (lab, d));
-    } else if mouse.pressed(MouseButton::Left)
-        && let Some((lab, drag)) = labs.drag
-    {
-        // Keep following the pointer even when it leaves the image.
-        let Some(p) = images.iter().find(|(img, _)| img.0 == lab).and_then(|(_, c)| c.normalized).map(to_map) else { return };
-        let p = clamp(p);
-        let st = &mut labs.state;
-        match drag {
-            Drag::Probe => st.probe = p,
-            Drag::Site(i) => {
-                let mut sites = st.sites(&cfg, LabId::Delaunay);
-                if i < sites.len() && sites[i] != p {
-                    sites[i] = p;
-                    st.edited = Some(sites);
+                LabAction::ProtoRegions(i) => labs.protos[i].regions = !labs.protos[i].regions,
+                LabAction::ProtoBorders(i) => labs.protos[i].borders = !labs.protos[i].borders,
+                LabAction::Play(lab) => {
+                    if labs.playing == Some(lab) {
+                        labs.playing = None;
+                    } else {
+                        if lab == LabId::Grow && st.grow_radius >= LabState::grow_max(&cfg.0) {
+                            st.grow_radius = 0.0;
+                        }
+                        if lab == LabId::Lloyd && st.lloyd_settled() {
+                            st.lloyd = None;
+                            st.lloyd_round = 0;
+                            st.lloyd_moved = f32::INFINITY;
+                        }
+                        labs.playing = Some(lab);
+                    }
                 }
+                LabAction::Reset(lab) => {
+                    let fresh = LabState::new(&cfg.0);
+                    match lab {
+                        LabId::Delaunay => {
+                            st.edited = None;
+                            st.selected = None;
+                        }
+                        LabId::Lloyd => {
+                            st.lloyd = None;
+                            st.lloyd_round = 0;
+                            st.lloyd_moved = f32::INFINITY;
+                            if labs.playing == Some(lab) {
+                                labs.playing = None;
+                            }
+                        }
+                        LabId::Influence => {
+                            st.bases = fresh.bases;
+                            st.weights = fresh.weights;
+                            st.alive = fresh.alive;
+                            st.use_weights = true;
+                        }
+                        _ => {}
+                    }
+                }
+                LabAction::GrowFronts => st.grow_fronts = !st.grow_fronts,
+                LabAction::DistanceLines => st.distance_lines = !st.distance_lines,
+                LabAction::OwnerBorders => st.owner_borders = !st.owner_borders,
+                LabAction::Cells => st.show_cells = !st.show_cells,
+                LabAction::Triangles => st.show_triangles = !st.show_triangles,
+                LabAction::Circles => st.show_circles = !st.show_circles,
+                LabAction::LloydStep => {
+                    st.lloyd_step(&cfg.0);
+                    if labs.playing == Some(LabId::Lloyd) {
+                        labs.playing = None;
+                    }
+                }
+                LabAction::Centroids => st.show_centroids = !st.show_centroids,
+                LabAction::BiomeBorders => st.biome_borders = !st.biome_borders,
+                LabAction::BiomeSites => st.biome_sites = !st.biome_sites,
+                LabAction::Destroy(i) => st.alive[i] = !st.alive[i],
+                LabAction::UseWeights => st.use_weights = !st.use_weights,
+                LabAction::Mode(m) => st.noise_mode = m,
+                LabAction::Preset(p) => st.preset = p,
+                LabAction::NewWorld => st.world = st.world.wrapping_add(1),
             }
-            Drag::Base(i) => st.bases[i] = p,
         }
-    } else if !mouse.pressed(MouseButton::Left) {
-        labs.drag = None;
+        // A new config invalidates edits made on the old sites.
+        if cfg.0 != labs.last_cfg {
+            let c = cfg.0;
+            labs.state.reseed(&c);
+            for proto in &mut labs.protos {
+                proto.planets = proto.planets.min(c.sites);
+                proto.rebuild(&c);
+            }
+            labs.last_cfg = c;
+        }
     }
-}
 
-/// prototype01, RTS style: left-drag a box to select fleets (or click one,
-/// Shift adds), right-click to send the selection there, middle-drag pans.
-#[allow(clippy::too_many_arguments)]
-pub fn proto_pointer(
-    mouse: Res<ButtonInput<MouseButton>>,
-    keys: Res<ButtonInput<KeyCode>>,
-    mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
-    image: Query<&RelativeCursorPosition, With<PrototypeImage>>,
-    phase: Res<Phase>,
-    mut labs: ResMut<Labs>,
-) {
-    let proto = &mut labs.proto;
-    if !on_start(&phase) {
-        proto.drag = None;
-        proto.pan_from = None;
-        return;
-    }
-    // Fleets that are gone drop out of the selection.
-    let d = &proto.d;
-    proto.selected.retain(|e| d.fleet_of_ship(*e).is_some());
-    // Keys 1–6 set the wholly selected fleets' formation.
-    const KEYS: [KeyCode; 6] = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4, KeyCode::Digit5, KeyCode::Digit6];
-    if let Some(k) = KEYS.iter().position(|k| keys.just_pressed(*k)) {
-        for id in proto.d.whole_fleets(&proto.selected) {
-            proto.d.set_formation(id, Formation::PLAYER[k]);
-        }
-    }
-    if keys.just_pressed(KeyCode::Escape) {
-        proto.selected.clear();
-        proto.selected_planet = None;
-    }
-    // [ and ] lower or raise the selected planet's tax by 5 %.
-    if let Some(i) = proto.selected_planet {
-        let step = if keys.just_pressed(KeyCode::BracketLeft) {
-            -0.05
-        } else if keys.just_pressed(KeyCode::BracketRight) {
-            0.05
-        } else {
-            0.0
-        };
-        if step != 0.0 {
-            let tax = proto.d.planets[i].tax;
-            proto.d.set_tax(i, ((tax + step) * 20.0).round() / 20.0);
-        }
-    }
-    let Ok(cursor) = image.single() else { return };
-    let Some(n) = cursor.normalized else { return };
-    // Cursor in picture pixels, then in the world.
-    let screen = Vec2::new((n.x + 0.5) * VIEW_W as f32, (n.y + 0.5) * VIEW_H as f32);
-    let cfg = proto.d.cfg;
-    let p = proto.camera.to_world(screen).clamp(MapVec::ZERO, MapVec::new(cfg.w as f32 - 0.5, cfg.h as f32 - 0.5));
-    let over = cursor.cursor_over();
-    // Wheel over the map zooms around the cursor (the page scroll skips it).
-    let notches: f32 = wheel
-        .read()
-        .map(|ev| match ev.unit {
-            bevy::input::mouse::MouseScrollUnit::Line => ev.y,
-            bevy::input::mouse::MouseScrollUnit::Pixel => ev.y / 40.0,
-        })
-        .sum();
-    if over && notches != 0.0 {
-        proto.camera.zoom_at(screen, 1.2f32.powf(notches), &cfg);
-    }
-    // Middle drag pans.
-    if over && mouse.just_pressed(MouseButton::Middle) {
-        proto.pan_from = Some(screen);
-    }
-    if let Some(from) = proto.pan_from {
-        if mouse.pressed(MouseButton::Middle) {
-            proto.camera.pan(screen - from, &cfg);
-            proto.pan_from = Some(screen);
-        } else {
-            proto.pan_from = None;
-        }
-    }
-    let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-    // Left: press, then a click selects one fleet or a drag selects a box.
-    if mouse.just_pressed(MouseButton::Left) && over {
-        proto.drag = Some((screen, screen, false));
-    }
-    if let Some((from, _, boxed)) = proto.drag {
-        let boxed = boxed || from.distance(screen) > 6.0;
-        proto.drag = Some((from, screen, boxed));
+    pub fn drag_sliders(
+        mouse: Res<ButtonInput<MouseButton>>,
+        tracks: Query<(&SliderTrack, &Interaction, &RelativeCursorPosition)>,
+        mut active: ResMut<ActiveSlider>,
+        mut cfg: ResMut<LabsConfig>,
+        mut labs: ResMut<Labs>,
+    ) {
         if !mouse.pressed(MouseButton::Left) {
-            proto.drag = None;
-            if !shift {
-                proto.selected.clear();
+            active.0 = None;
+            return;
+        }
+        for (track, interaction, cursor) in &tracks {
+            if active.0.is_none() && *interaction == Interaction::Pressed {
+                active.0 = Some(track.0);
             }
-            if !boxed {
-                // A click on a planet shows its people (elsewhere: deselects it).
-                proto.selected_planet = proto.d.planet_near(proto.camera.to_world(from), 8.0 / proto.camera.zoom);
+            if active.0 != Some(track.0) {
+                continue;
             }
-            if boxed {
-                // Ships of controllable fleets inside the box.
-                let ships = proto.d.ships_in_box(proto.camera.to_world(from), proto.camera.to_world(screen));
-                for e in ships {
-                    if !proto.selected.contains(&e) {
-                        proto.selected.push(e);
+            let Some(n) = cursor.normalized else { continue };
+            let (lo, hi, step) = track.0.range(&cfg.0);
+            let t = (n.x + 0.5).clamp(0.0, 1.0);
+            let v = snap(lo + (hi - lo) * t, lo, step);
+            if (v - track.0.get(&cfg.0, &labs.state, &labs.protos)).abs() > step * 0.25 {
+                set_slider(track.0, v, &mut cfg.0, &mut labs);
+            }
+        }
+    }
+
+    /// Clicks and drags on the lab images.
+    pub fn lab_pointer(
+        mouse: Res<ButtonInput<MouseButton>>,
+        images: Query<(&LabImage, &RelativeCursorPosition)>,
+        phase: Res<Phase>,
+        cfg: Res<LabsConfig>,
+        mut labs: ResMut<Labs>,
+    ) {
+        if !on_labs(&phase) {
+            labs.drag = None;
+            labs.hover = None;
+            return;
+        }
+        let cfg = cfg.0;
+        let to_map = |n: Vec2| MapVec::new((n.x + 0.5) * cfg.w as f32, (n.y + 0.5) * cfg.h as f32);
+        let clamp = |p: MapVec| p.clamp(MapVec::ZERO, MapVec::new(cfg.w as f32 - 0.5, cfg.h as f32 - 0.5));
+
+        // Hover zoom on the painted island.
+        let hover = images
+            .iter()
+            .find(|(img, c)| img.0 == LabId::Island && c.cursor_over())
+            .and_then(|(_, c)| c.normalized.map(|n| (LabId::Island, to_map(n))));
+        if labs.hover != hover {
+            labs.hover = hover;
+        }
+
+        if mouse.just_pressed(MouseButton::Left) {
+            let Some((lab, p)) = images.iter().find(|(_, c)| c.cursor_over()).and_then(|(img, c)| c.normalized.map(|n| (img.0, to_map(n))))
+            else {
+                return;
+            };
+            let st = &mut labs.state;
+            let drag = match lab {
+                LabId::Nearest => {
+                    st.probe = clamp(p);
+                    Some(Drag::Probe)
+                }
+                LabId::Delaunay => {
+                    let mut sites = st.sites(&cfg, lab);
+                    match site_at(&sites, p, 9.0) {
+                        Some(i) => {
+                            st.selected = Some(i);
+                            Some(Drag::Site(i))
+                        }
+                        None => {
+                            sites.push(clamp(p));
+                            st.selected = Some(sites.len() - 1);
+                            st.edited = Some(sites);
+                            None
+                        }
                     }
                 }
-            } else if let Some(f) = proto.d.fleet_at(proto.camera.to_world(from), 10.0 / proto.camera.zoom).and_then(|id| proto.d.fleet(id))
-            {
-                // A click takes the whole fleet (about 10 picture pixels).
-                // Shift-click on a fully selected fleet takes it out.
-                let ids = f.ship_ids.clone();
-                if shift && ids.iter().all(|e| proto.selected.contains(e)) {
-                    proto.selected.retain(|e| !ids.contains(e));
-                } else {
-                    for e in ids {
+                LabId::Influence => site_at(&st.bases, p, 12.0).map(Drag::Base),
+                _ => None,
+            };
+            labs.drag = drag.map(|d| (lab, d));
+        } else if mouse.pressed(MouseButton::Left)
+            && let Some((lab, drag)) = labs.drag
+        {
+            // Keep following the pointer even when it leaves the image.
+            let Some(p) = images.iter().find(|(img, _)| img.0 == lab).and_then(|(_, c)| c.normalized).map(to_map) else { return };
+            let p = clamp(p);
+            let st = &mut labs.state;
+            match drag {
+                Drag::Probe => st.probe = p,
+                Drag::Site(i) => {
+                    let mut sites = st.sites(&cfg, LabId::Delaunay);
+                    if i < sites.len() && sites[i] != p {
+                        sites[i] = p;
+                        st.edited = Some(sites);
+                    }
+                }
+                Drag::Base(i) => st.bases[i] = p,
+            }
+        } else if !mouse.pressed(MouseButton::Left) {
+            labs.drag = None;
+        }
+    }
+
+    /// prototype01, RTS style: left-drag a box to select fleets (or click one,
+    /// Shift adds), right-click to send the selection there, middle-drag pans.
+    #[allow(clippy::too_many_arguments)]
+    pub fn proto_pointer(
+        mouse: Res<ButtonInput<MouseButton>>,
+        keys: Res<ButtonInput<KeyCode>>,
+        mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
+        images: Query<(&RelativeCursorPosition, &PrototypeImage)>,
+        phase: Res<Phase>,
+        mut labs: ResMut<Labs>,
+    ) {
+        let notches: f32 = wheel
+            .read()
+            .map(|ev| match ev.unit {
+                bevy::input::mouse::MouseScrollUnit::Line => ev.y,
+                bevy::input::mouse::MouseScrollUnit::Pixel => ev.y / 40.0,
+            })
+            .sum();
+        let started = on_start(&phase);
+        for (i, proto) in labs.protos.iter_mut().enumerate() {
+            let cursor = images.iter().find(|(_, img)| img.0 == i).map(|(c, _)| c);
+            pointer_one(proto, cursor, &mouse, &keys, notches, started);
+        }
+    }
+
+    /// One prototype map's mouse and keys.
+    fn pointer_one(
+        proto: &mut Proto,
+        cursor: Option<&RelativeCursorPosition>,
+        mouse: &ButtonInput<MouseButton>,
+        keys: &ButtonInput<KeyCode>,
+        notches: f32,
+        started: bool,
+    ) {
+        if !started {
+            proto.drag = None;
+            proto.pan_from = None;
+            return;
+        }
+        // Fleets that are gone drop out of the selection.
+        let d = &proto.d;
+        proto.selected.retain(|e| d.fleet_of_ship(*e).is_some());
+        // Keys 1–6 set the wholly selected fleets' formation.
+        const KEYS: [KeyCode; 6] = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4, KeyCode::Digit5, KeyCode::Digit6];
+        if let Some(k) = KEYS.iter().position(|k| keys.just_pressed(*k)) {
+            for id in proto.d.whole_fleets(&proto.selected) {
+                proto.d.set_formation(id, Formation::PLAYER[k]);
+            }
+        }
+        if keys.just_pressed(KeyCode::Escape) {
+            proto.selected.clear();
+            proto.selected_planet = None;
+        }
+        // [ and ] lower or raise the selected planet's tax by 5 %.
+        if let Some(i) = proto.selected_planet {
+            let step = if keys.just_pressed(KeyCode::BracketLeft) {
+                -0.05
+            } else if keys.just_pressed(KeyCode::BracketRight) {
+                0.05
+            } else {
+                0.0
+            };
+            if step != 0.0 {
+                let tax = proto.d.planets[i].tax;
+                proto.d.set_tax(i, ((tax + step) * 20.0).round() / 20.0);
+            }
+        }
+        let Some(cursor) = cursor else { return };
+        let Some(n) = cursor.normalized else { return };
+        // Cursor in picture pixels, then in the world.
+        let screen = Vec2::new((n.x + 0.5) * VIEW_W as f32, (n.y + 0.5) * VIEW_H as f32);
+        let cfg = proto.d.cfg;
+        let p = proto.camera.to_world(screen).clamp(MapVec::ZERO, MapVec::new(cfg.w as f32 - 0.5, cfg.h as f32 - 0.5));
+        let over = cursor.cursor_over();
+        // Wheel over the map zooms around the cursor (the page scroll skips it).
+        if over && notches != 0.0 {
+            proto.camera.zoom_at(screen, 1.2f32.powf(notches), &cfg);
+        }
+        // Middle drag pans.
+        if over && mouse.just_pressed(MouseButton::Middle) {
+            proto.pan_from = Some(screen);
+        }
+        if let Some(from) = proto.pan_from {
+            if mouse.pressed(MouseButton::Middle) {
+                proto.camera.pan(screen - from, &cfg);
+                proto.pan_from = Some(screen);
+            } else {
+                proto.pan_from = None;
+            }
+        }
+        let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+        // Left: press, then a click selects one fleet or a drag selects a box.
+        if mouse.just_pressed(MouseButton::Left) && over {
+            proto.drag = Some((screen, screen, false));
+        }
+        if let Some((from, _, boxed)) = proto.drag {
+            let boxed = boxed || from.distance(screen) > 6.0;
+            proto.drag = Some((from, screen, boxed));
+            if !mouse.pressed(MouseButton::Left) {
+                proto.drag = None;
+                if !shift {
+                    proto.selected.clear();
+                }
+                if !boxed {
+                    // A click on a planet shows its people (elsewhere: deselects it).
+                    proto.selected_planet = proto.d.planet_near(proto.camera.to_world(from), 8.0 / proto.camera.zoom);
+                }
+                if boxed {
+                    // Ships of controllable fleets inside the box.
+                    let ships = proto.d.ships_in_box(proto.camera.to_world(from), proto.camera.to_world(screen));
+                    for e in ships {
                         if !proto.selected.contains(&e) {
                             proto.selected.push(e);
                         }
                     }
+                } else if let Some(f) = proto.d.fleet_at(proto.camera.to_world(from), 10.0 / proto.camera.zoom).and_then(|id| proto.d.fleet(id))
+                {
+                    // A click takes the whole fleet (about 10 picture pixels).
+                    // Shift-click on a fully selected fleet takes it out.
+                    let ids = f.ship_ids.clone();
+                    if shift && ids.iter().all(|e| proto.selected.contains(e)) {
+                        proto.selected.retain(|e| !ids.contains(e));
+                    } else {
+                        for e in ids {
+                            if !proto.selected.contains(&e) {
+                                proto.selected.push(e);
+                            }
+                        }
+                    }
                 }
             }
         }
+        // Right click: the selected ships become one fleet and go there
+        // (several fleets merge, part of a fleet splits off).
+        if mouse.just_pressed(MouseButton::Right) && over {
+            let ships = proto.selected.clone();
+            proto.d.form_fleet(&ships, p);
+        }
     }
-    // Right click: the selected ships become one fleet and go there
-    // (several fleets merge, part of a fleet splits off).
-    if mouse.just_pressed(MouseButton::Right) && over {
-        let ships = proto.selected.clone();
-        proto.d.form_fleet(&ships, p);
-    }
-}
 
-/// Runs prototype01 in real time while the start page is open.
-pub fn step_proto(time: Res<Time>, phase: Res<Phase>, mut labs: ResMut<Labs>) {
-    let proto = &mut labs.proto;
-    if !on_start(&phase) || proto.paused {
-        return;
-    }
-    let dt = time.delta_secs().min(0.1) * proto.speed as f32;
-    proto.d.step(dt);
-}
-
-/// Play: grow the seeds, or run Lloyd rounds until nothing moves.
-pub fn animate_labs(time: Res<Time>, phase: Res<Phase>, cfg: Res<LabsConfig>, mut labs: ResMut<Labs>) {
-    if !on_labs(&phase) {
-        labs.playing = None;
-    }
-    let dt = time.delta_secs();
-    match labs.playing {
-        Some(LabId::Grow) => {
-            let max = LabState::grow_max(&cfg.0);
-            labs.state.grow_radius = (labs.state.grow_radius + 90.0 * dt).min(max);
-            if labs.state.grow_radius >= max {
-                labs.playing = None;
+    /// Runs prototype01 in real time while the start page is open.
+    pub fn step_proto(time: Res<Time>, phase: Res<Phase>, mut labs: ResMut<Labs>) {
+        if !on_start(&phase) {
+            return;
+        }
+        for proto in &mut labs.protos {
+            if !proto.paused {
+                let dt = time.delta_secs().min(0.1) * proto.speed as f32;
+                proto.d.step(dt);
             }
         }
-        Some(LabId::Lloyd) => {
-            labs.timer += dt;
-            if labs.timer >= 0.35 {
-                labs.timer = 0.0;
-                labs.state.lloyd_step(&cfg.0);
-                if labs.state.lloyd_settled() {
+    }
+
+    /// Play: grow the seeds, or run Lloyd rounds until nothing moves.
+    pub fn animate_labs(time: Res<Time>, phase: Res<Phase>, cfg: Res<LabsConfig>, mut labs: ResMut<Labs>) {
+        if !on_labs(&phase) {
+            labs.playing = None;
+        }
+        let dt = time.delta_secs();
+        match labs.playing {
+            Some(LabId::Grow) => {
+                let max = LabState::grow_max(&cfg.0);
+                labs.state.grow_radius = (labs.state.grow_radius + 90.0 * dt).min(max);
+                if labs.state.grow_radius >= max {
                     labs.playing = None;
                 }
             }
+            Some(LabId::Lloyd) => {
+                labs.timer += dt;
+                if labs.timer >= 0.35 {
+                    labs.timer = 0.0;
+                    labs.state.lloyd_step(&cfg.0);
+                    if labs.state.lloyd_settled() {
+                        labs.playing = None;
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
-}
 
-/// Re-renders the lab images whose inputs changed: the lab being dragged,
-/// animated or hovered first, then at most a couple of others per frame.
-pub fn render_labs(
-    time: Res<Time>,
-    phase: Res<Phase>,
-    cfg: Res<LabsConfig>,
-    slider: Res<ActiveSlider>,
-    mut labs: ResMut<Labs>,
-    mut images: ResMut<Assets<Image>>,
-) {
-    let labs = &mut *labs;
-    // prototype01, on the start page only, at most ~25 frames a second.
-    if on_start(&phase) {
-        let proto = &mut labs.proto;
-        proto.since_render += time.delta_secs();
-        if proto.camera != proto.last_camera {
-            proto.last_camera = proto.camera;
-            proto.camera_still = 0.0;
-        } else {
-            proto.camera_still += time.delta_secs();
-        }
-        // Half-resolution regions while zooming or panning, sharp once still.
-        let bg_step = if proto.camera_still < 0.25 { 2 } else { 1 };
-        let marquee = proto.drag.filter(|d| d.2).map(|d| (d.0, d.1));
-        let opts = DrawOptions { regions: proto.regions, borders: proto.borders, selected: proto.selected.clone(), marquee, step: 3, planet: proto.selected_planet };
-        let key = format!(
-            "{}|{:?}|{:?}|{bg_step}|{:?}|{:?}",
-            proto.d.time,
-            opts,
-            proto.camera,
-            proto.d.tuning,
-            proto.d.fleets.iter().map(|f| (f.id, f.pos, f.facing, f.ships, f.formation, f.dest)).collect::<Vec<_>>()
-        );
-        if key != proto.view.key && proto.since_render >= 0.04 {
-            let bg_key = format!("{}|{:?}|{bg_step}", proto.d.background_key(), proto.camera);
-            if bg_key != proto.background_key || proto.background.is_none() {
-                proto.background = Some(dominion::render_background(&proto.d, &proto.camera, bg_step));
-                proto.background_key = bg_key;
+    /// Re-renders the lab images whose inputs changed: the lab being dragged,
+    /// animated or hovered first, then at most a couple of others per frame.
+    pub fn render_labs(
+        time: Res<Time>,
+        phase: Res<Phase>,
+        cfg: Res<LabsConfig>,
+        slider: Res<ActiveSlider>,
+        mut labs: ResMut<Labs>,
+        mut images: ResMut<Assets<Image>>,
+    ) {
+        let labs = &mut *labs;
+        // prototype01, on the start page only, at most ~25 frames a second.
+        if on_start(&phase) {
+          for proto in &mut labs.protos {
+            proto.since_render += time.delta_secs();
+            if proto.camera != proto.last_camera {
+                proto.last_camera = proto.camera;
+                proto.camera_still = 0.0;
+            } else {
+                proto.camera_still += time.delta_secs();
             }
-            let rgba = dominion::render(&proto.d, proto.background.as_ref().unwrap(), &proto.camera, &opts).to_rgba();
-            if let Some(mut img) = images.get_mut(&proto.view.image) {
-                img.data = Some(rgba);
+            // Half-resolution regions while zooming or panning, sharp once still.
+            let bg_step = if proto.camera_still < 0.25 { 2 } else { 1 };
+            let marquee = proto.drag.filter(|d| d.2).map(|d| (d.0, d.1));
+            let opts = DrawOptions { regions: proto.regions, borders: proto.borders, selected: proto.selected.clone(), marquee, step: 3, planet: proto.selected_planet };
+            let key = format!(
+                "{}|{:?}|{:?}|{bg_step}|{:?}|{:?}",
+                proto.d.time,
+                opts,
+                proto.camera,
+                proto.d.tuning,
+                proto.d.fleets.iter().map(|f| (f.id, f.pos, f.facing, f.ships, f.formation, f.dest)).collect::<Vec<_>>()
+            );
+            if key != proto.view.key && proto.since_render >= 0.04 {
+                let bg_key = format!("{}|{:?}|{bg_step}", proto.d.background_key(), proto.camera);
+                if bg_key != proto.background_key || proto.background.is_none() {
+                    proto.background = Some(dominion::render_background(&proto.d, &proto.camera, bg_step));
+                    proto.background_key = bg_key;
+                }
+                let rgba = dominion::render(&proto.d, proto.background.as_ref().unwrap(), &proto.camera, &opts).to_rgba();
+                if let Some(mut img) = images.get_mut(&proto.view.image) {
+                    img.data = Some(rgba);
+                }
+                proto.view.key = key;
+                proto.since_render = 0.0;
             }
-            proto.view.key = key;
-            proto.since_render = 0.0;
         }
         return;
     }
@@ -1287,7 +1388,10 @@ pub fn update_lab_ui(
     for (which, mut t) in &mut texts {
         let s = match which {
             LabText::Seed => c.seed.to_string(),
-            LabText::Proto => dominion::status(&labs.proto.d, &labs.proto.selected, labs.proto.selected_planet),
+            LabText::Proto(i) => {
+                let p = &labs.protos[*i];
+                dominion::status(&p.d, &p.selected, p.selected_planet)
+            }
             LabText::Status(l) => status(&c, *l, st),
         };
         if t.0 != s {
@@ -1296,16 +1400,16 @@ pub fn update_lab_ui(
     }
     for (f, mut n) in &mut fills {
         let (lo, hi, _) = f.0.range(&c);
-        let pct = ((f.0.get(&c, st, &labs.proto) - lo) / (hi - lo)).clamp(0.0, 1.0) * 100.0;
+        let pct = ((f.0.get(&c, st, &labs.protos) - lo) / (hi - lo)).clamp(0.0, 1.0) * 100.0;
         if n.width != Val::Percent(pct) {
             n.width = Val::Percent(pct);
         }
     }
     for (v, mut t) in &mut values {
-        let s = if v.0 == SliderParam::FleetShips && labs.proto.d.whole_fleets(&labs.proto.selected).is_empty() {
+        let s = if v.0 == SliderParam::FleetShips && labs.protos[0].d.whole_fleets(&labs.protos[0].selected).is_empty() {
             "select a fleet".to_string()
         } else {
-            v.0.label(v.0.get(&c, st, &labs.proto))
+            v.0.label(v.0.get(&c, st, &labs.protos))
         };
         if t.0 != s {
             t.0 = s;
@@ -1322,18 +1426,18 @@ pub fn lab_button_state(
 ) {
     let st = &labs.state;
     let c = cfg.0;
-    let proto = &labs.proto;
-    let size = proto.size;
+    let protos = &labs.protos;
+    let size = protos[0].size;
     for (action, mut sel, mut enabled, labels) in &mut buttons {
         if !enabled.0 {
             enabled.0 = true;
         }
         let on = match *action {
-            LabAction::ProtoPause => proto.paused,
-            LabAction::ProtoSpeed(m) => !proto.paused && proto.speed == m,
+            LabAction::ProtoPause(i) => protos[i].paused,
+            LabAction::ProtoSpeed(i, m) => !protos[i].paused && protos[i].speed == m,
             LabAction::ProtoSize(w, h) => size == (w, h),
-            LabAction::ProtoRegions => proto.regions,
-            LabAction::ProtoBorders => proto.borders,
+            LabAction::ProtoRegions(i) => protos[i].regions,
+            LabAction::ProtoBorders(i) => protos[i].borders,
             LabAction::Metric(m) => c.metric == m,
             LabAction::Relax(n) => c.relax == n,
             LabAction::GrowFronts => st.grow_fronts,
@@ -1355,7 +1459,7 @@ pub fn lab_button_state(
         }
         let label = match *action {
             LabAction::Play(l) => Some(if labs.playing == Some(l) { "⏸ Pause".to_string() } else { "▶ Play".to_string() }),
-            LabAction::ProtoPause => Some(if proto.paused { "▶ Resume".to_string() } else { "Pause".to_string() }),
+            LabAction::ProtoPause(i) => Some(if protos[i].paused { "▶ Resume".to_string() } else { "Pause".to_string() }),
             LabAction::Destroy(i) => Some(if st.alive[i] { format!("Destroy {}", FACTIONS[i].0) } else { format!("Rebuild {}", FACTIONS[i].0) }),
             _ => None,
         };

@@ -5,6 +5,7 @@ pub mod calm;
 pub mod captains;
 pub mod dominion;
 pub mod highways;
+pub mod mothership;
 pub mod rebellion;
 
 #[cfg(test)]

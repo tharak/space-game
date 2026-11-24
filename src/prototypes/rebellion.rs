@@ -77,10 +77,15 @@ pub struct Rebellion {
 impl Rebellion {
     /// 70 % of the patches get an agent; no cops yet.
     pub fn new(seed: i64) -> Self {
+        Self::with_population(seed, (AGENT_DENSITY * PATCHES as f32).round() as usize)
+    }
+
+    /// `n` agents (at most the patches) on random patches; no cops yet.
+    pub fn with_population(seed: i64, n: usize) -> Self {
         let mut rng = ParkMiller::new(seed);
         let mut patches: Vec<u16> = (0..PATCHES as u16).collect();
         shuffle(&mut patches, &mut rng);
-        let n = (AGENT_DENSITY * PATCHES as f32).round() as usize;
+        let n = n.min(PATCHES);
         let mut at = vec![Vec::new(); PATCHES];
         let mut free_at = vec![0; PATCHES];
         let agents = patches[..n]
@@ -110,6 +115,44 @@ impl Rebellion {
         for a in &mut self.agents {
             a.active = false;
             a.jail = 0;
+        }
+        self.recount();
+    }
+
+    pub fn population(&self) -> usize {
+        self.agents.len()
+    }
+
+    /// `k` newcomers (quiet, free) on empty patches, while any are left.
+    pub fn add_people(&mut self, k: usize) {
+        for _ in 0..k {
+            let empty: Vec<usize> = (0..PATCHES).filter(|p| self.empty(*p)).collect();
+            if empty.is_empty() {
+                break;
+            }
+            let p = empty[((self.rng.next_float() * empty.len() as f32) as usize).min(empty.len() - 1)];
+            let (hardship, risk_aversion) = (self.rng.next_float(), self.rng.next_float());
+            self.agents.push(Agent { patch: p as u16, hardship, risk_aversion, active: false, jail: 0 });
+        }
+        self.reindex();
+    }
+
+    /// `k` random people gone (deaths).
+    pub fn remove_people(&mut self, k: usize) {
+        for _ in 0..k.min(self.agents.len()) {
+            let i = ((self.rng.next_float() * self.agents.len() as f32) as usize).min(self.agents.len() - 1);
+            self.agents.swap_remove(i);
+        }
+        self.reindex();
+    }
+
+    /// Rebuilds who stands where after agents come or go.
+    fn reindex(&mut self) {
+        for list in &mut self.at {
+            list.clear();
+        }
+        for (i, a) in self.agents.iter().enumerate() {
+            self.at[a.patch as usize].push(i as u16);
         }
         self.recount();
     }
@@ -439,6 +482,28 @@ mod tests {
             last = v;
         }
         assert!(calm_cops(0.8, 0.0).unwrap() < calm_cops(0.8, 0.5).unwrap());
+    }
+
+    #[test]
+    fn people_come_and_go_and_the_counts_keep_up() {
+        let mut r = Rebellion::with_population(3, 300);
+        assert_eq!(r.population(), 300);
+        let p = RebellionParams::default();
+        for _ in 0..10 {
+            r.step(0.4, 0.0, 20, &p);
+        }
+        r.add_people(50);
+        assert_eq!(r.population(), 350);
+        r.remove_people(120);
+        assert_eq!(r.population(), 230);
+        for _ in 0..10 {
+            r.step(0.4, 0.0, 20, &p);
+        }
+        let (free, active) = (r.free_at.clone(), r.active_at.clone());
+        r.recount();
+        assert_eq!((free, active), (r.free_at.clone(), r.active_at.clone()));
+        let total: usize = r.at.iter().map(Vec::len).sum();
+        assert_eq!(total, 230);
     }
 
     #[test]

@@ -54,6 +54,11 @@ pub struct Supply(pub [f32; 3]);
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Flagship(pub u32);
 
+/// A mothership's hull (prototype02): carries its ships inside, never
+/// fires itself.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MothershipHull(pub u32);
+
 /// What a combat ship carries for itself (prototype01): ammo, food, parts.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Stores(pub [f32; 3]);

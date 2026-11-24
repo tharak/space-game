@@ -55,6 +55,24 @@ The start page's prototype, in real time (Pause, 1×, 2×, 4×). Code: `src/prot
 
 - **View:** the map renders at a fixed 1440×800 through a camera, so it stays sharp at any map size. The wheel over the map zooms toward the cursor (up to 8×), middle-drag pans, and the Zoom −, Zoom + and Fit buttons do the same.
 
+## prototype02 — Motherships
+
+The second card on the start page: the same map, supply and planets as prototype01, but each side has one mothership and no captains. Code: `src/prototypes/mothership.rs` (`Mode::Motherships`).
+
+- **Carrier:** the mothership is a big round hull with its ships aboard written on it. It isn't a Voronoi site, never fires, and moves along the highways like any fleet.
+  - Its ships stay inside until a hostile fleet or planet (enemy or independent) comes within 3 gun ranges. Then they launch, one a second times the share of its people at work, into its wing: a normal fleet that fights and captures but takes no orders.
+  - After 3 s with no threat, the wing comes back and docks, and the ships' stores return to the mothership.
+  - Select your ships near it together with the mothership and right-click to take them aboard.
+- **People:** a rebellion model of its own, starting with 400 people. Legitimacy is its morale, and its ships aboard are the cops.
+  - The people at work (not rebelling, not in the brig) crew it. Speed, launching, repairs and building ships aboard (5 parts each, every 20 s with everyone working) all scale with them.
+  - Each ship aboard needs 20 crew.
+  - The people eat 0.01 food each per 5 s phase. Fed with stores over half full, they grow 2% a phase, up to 1100. Starving costs 3% a phase, and hull damage kills the same share.
+- **Morale** starts at 100%. It falls with empty stores, crowding (more ships than crew) and losses (ships lost, hull damage), and rises with planets taken, enemy ships destroyed near its wing, and calm times. When the smoothed rebel share passes Revolt, it mutinies: it goes independent with its wing and stops taking orders.
+- **Stores:** up to 200 ammo, 200 food and 100 parts, from a friendly planet it rests at and from supply ships, which planets send to it like to any fleet.
+- **The view:** click the mothership and a panel shows its hull, people (a pie of workers, rebels and the brig, plus the people themselves), morale and unrest, ships aboard and out, crew, stores and building. It sits in the corner away from the mothership.
+- Sliders: Crew per ship, Launch rate, Build aboard, Start people, and the morale costs of shortages and crowding.
+- `cargo run --release --example prototype01_dump -- <dir> 20 3 motherships` writes frames with Blue's view open.
+
 Tests: `cargo test prototypes`. `cargo run --release --example prototype01_dump -- <dir>` plays three minutes and writes frames, a 4× close-up of each, and render timings.
 
 ## Hex board — BattleStars v0.2.1

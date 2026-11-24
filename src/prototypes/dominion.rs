@@ -39,8 +39,9 @@ use bevy::prelude::{Entity, Rect, World};
 use super::rebellion::{Rebellion, RebellionParams};
 use crate::sim::battle::{Battle, DT, SimEvent, Tuning as BattleTuning};
 use super::captains::{Captain, Skill, draw_name, draw_skills};
+use super::mothership::Mothership;
 use super::highways::Highways;
-use crate::sim::components::{Division, Flagship, Heading, InDivision, Morale, Order, Pos, Ship, Stores, Supply, Weapon};
+use crate::sim::components::{Division, Flagship, Heading, InDivision, Morale, MothershipHull, Order, Pos, Ship, Stores, Supply, Weapon};
 pub use crate::sim::formation::Formation;
 use crate::sim::formation::SHIP_DART;
 use crate::voronoi::Vec2;
@@ -162,6 +163,34 @@ pub struct Tuning {
     pub captain_death: f32,
     /// Seconds until a surviving captain has a new flagship at home.
     pub captain_return: f32,
+    // prototype02: motherships.
+    pub mothership_hull: f32,
+    /// Speed of a fully crewed mothership (× fleet speed).
+    pub mothership_pace: f32,
+    /// People needed to crew each ship aboard.
+    pub crew_per_ship: f32,
+    /// Food each person eats per maintenance phase.
+    pub food_per_person: f32,
+    pub start_population: f32,
+    pub max_population: f32,
+    /// Seconds to build a ship aboard with everyone working.
+    pub mothership_build_secs: f32,
+    /// Ships launched a second with everyone working.
+    pub launch_rate: f32,
+    /// A hostile within this many gun ranges makes it launch.
+    pub deploy_ranges: f32,
+    /// What a mothership's stores hold.
+    pub mothership_cap: Stock,
+    /// Morale per maintenance phase: lost for each empty kind (÷3), for
+    /// crowding, per ship lost, per share of hull lost; gained per planet
+    /// taken, per enemy ship destroyed, and while all is well.
+    pub morale_shortage: f32,
+    pub morale_crowding: f32,
+    pub morale_loss: f32,
+    pub morale_damage: f32,
+    pub morale_capture: f32,
+    pub morale_kill: f32,
+    pub morale_recover: f32,
     /// Cops in a planet's rebellion model per ship nearby, divided by the
     /// planet's size (bigger populations need more ships).
     pub cops_per_ship: f32,
@@ -196,11 +225,38 @@ impl Default for Tuning {
             flag_shock: 0.4,
             captain_death: 0.5,
             captain_return: 60.0,
+            mothership_hull: 100.0,
+            mothership_pace: 0.6,
+            crew_per_ship: 20.0,
+            food_per_person: 0.01,
+            start_population: 400.0,
+            max_population: 1100.0,
+            mothership_build_secs: 20.0,
+            launch_rate: 1.0,
+            deploy_ranges: 3.0,
+            mothership_cap: [200.0, 200.0, 100.0],
+            morale_shortage: 0.05,
+            morale_crowding: 0.05,
+            morale_loss: 0.02,
+            morale_damage: 0.5,
+            morale_capture: 0.1,
+            morale_kill: 0.01,
+            morale_recover: 0.01,
             cops_per_ship: 40.0,
             war_hardship: 0.3,
             revolt_share: 0.25,
         }
     }
+}
+
+/// Which game the map runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// prototype01: captains on flagships lead fleets.
+    #[default]
+    Captains,
+    /// prototype02: one mothership a side carries its ships.
+    Motherships,
 }
 
 /// How much bigger than the reference this map is.
@@ -300,8 +356,12 @@ pub struct Fleet {
     /// On its way to join this fleet (by id): a supply convoy, or a new
     /// ship reinforcing it.
     pub joining: Option<u32>,
-    /// The captain whose flagship leads it (by id). Only these move.
+    /// The captain whose flagship leads it (by id).
     pub captain: Option<u32>,
+    /// This fleet is a mothership's hull (by mothership id).
+    pub mothership: Option<u32>,
+    /// A mothership's launched ships (run by the mothership, not the player).
+    pub wing_of: Option<u32>,
     /// Supply ships only: held up at the edge of the other side's cells.
     pub waiting: bool,
     /// Combat ships.
@@ -337,9 +397,9 @@ impl Fleet {
         self.ships > 0
     }
 
-    /// Blue and Red fleets, unless routed (with a captain or not).
+    /// Blue and Red fleets, unless routed or a mothership's wing.
     pub fn controllable(&self) -> bool {
-        self.selectable()
+        self.selectable() && self.wing_of.is_none()
     }
 
     /// Blue and Red ships the player can pick (garrisons included).
@@ -382,6 +442,13 @@ pub struct Dominion {
     supply_timer: f32,
     /// Every captain, dead or alive.
     pub captains: Vec<Captain>,
+    pub mode: Mode,
+    /// prototype02's motherships, destroyed ones included.
+    pub motherships: Vec<Mothership>,
+    pub(crate) mother_timer: f32,
+    pub(crate) mother_people_timer: f32,
+    /// Ships destroyed since the last maintenance phase: where, and side.
+    pub(crate) recent_kills: Vec<(Vec2, usize)>,
     /// Each planet's people (rebellion model), stepped while Blue or Red own it.
     pub people: Vec<Rebellion>,
     pub rebellion: RebellionParams,
@@ -421,6 +488,12 @@ impl Dominion {
     /// its highways, each with a full supply ship; every planet starts with
     /// a garrison of its size.
     pub fn new(cfg: &VoronoiConfig, planets: usize, fleets: usize, tuning: Tuning) -> Self {
+        Self::with_mode(cfg, planets, fleets, tuning, Mode::Captains)
+    }
+
+    /// The map in either game: with captains (`fleets` lone flagships a
+    /// side at home), or with one mothership a side at home.
+    pub fn with_mode(cfg: &VoronoiConfig, planets: usize, fleets: usize, tuning: Tuning, mode: Mode) -> Self {
         let sites = cfg.relaxed_sites();
         let regions = voronoi_grid(&sites, cfg.w, cfg.h, cfg.metric);
         let edge = regions.edge_owners();
@@ -484,6 +557,11 @@ impl Dominion {
             convoy_timer: 0.0,
             supply_timer: 0.0,
             captains: Vec::new(),
+            mode,
+            motherships: Vec::new(),
+            mother_timer: 0.0,
+            mother_people_timer: 0.0,
+            recent_kills: Vec::new(),
             people: (0..list_len).map(|i| Rebellion::new(cfg.seed as i64 * 31 + i as i64 + 101)).collect(),
             rebellion: RebellionParams::default(),
             revolts: [0; 2],
@@ -511,6 +589,11 @@ impl Dominion {
             p.produces = [AMMO, FOOD, PARTS];
             p.stock = [HOME_STOCK; 3];
             let at = p.pos;
+            if mode == Mode::Motherships {
+                let carried = d.tuning.start_population as u32 / d.tuning.crew_per_ship.max(1.0) as u32 / 2;
+                d.add_mothership(Owner::Side(side), at, carried);
+                continue;
+            }
             let n = fleets.clamp(1, MAX_FLEETS_PER_SIDE);
             // Lone flagships at the home planet, a little way out along its
             // highways (round the roads again if there are more of them).
@@ -628,7 +711,7 @@ impl Dominion {
     }
 
     /// A new division of `ships` for `owner` at `pos` (pixels).
-    fn spawn(&mut self, owner: Owner, pos: Vec2, facing: f32, ships: u32, home: Option<usize>) -> u32 {
+    pub(crate) fn spawn(&mut self, owner: Owner, pos: Vec2, facing: f32, ships: u32, home: Option<usize>) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
         let unit = self.unit();
@@ -645,6 +728,8 @@ impl Dominion {
             route: Vec::new(),
             joining: None,
             captain: None,
+            mothership: None,
+            wing_of: None,
             waiting: false,
             ships,
             supply: 0,
@@ -903,9 +988,37 @@ impl Dominion {
                 _ => loose.push(mine),
             }
         }
+        // A selected mothership moves; its own selected ships near it are
+        // taken aboard first.
+        let reach = self.police_radius();
+        let mothers: Vec<(u32, u32)> = loose
+            .iter()
+            .filter_map(|mine| mine.first().and_then(|e| self.fleet_of_ship(*e)))
+            .filter_map(|f| f.mothership.map(|m| (f.id, m)))
+            .collect();
+        if !mothers.is_empty() {
+            let mut rest = Vec::new();
+            for mine in std::mem::take(&mut loose) {
+                let Some(f) = mine.first().and_then(|e| self.fleet_of_ship(*e)) else { continue };
+                if f.mothership.is_some() {
+                    continue;
+                }
+                let at = f.pos;
+                let near = mothers
+                    .iter()
+                    .filter_map(|(fid, m)| self.fleet(*fid).map(|g| (*m, g.pos.distance(at))))
+                    .filter(|(_, dist)| *dist <= reach)
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                match near {
+                    Some((m, _)) => self.board(m, &mine),
+                    None => rest.push(mine),
+                }
+            }
+            loose = rest;
+            captains.extend(mothers.iter().map(|(fid, _)| *fid));
+        }
         // Ships without a captain: into the nearest moving captain within
         // reach, or on their own.
-        let reach = self.police_radius();
         let mut movers = captains.clone();
         for mine in loose {
             let Some(f) = mine.first().and_then(|e| self.fleet_of_ship(*e)) else { continue };
@@ -1195,12 +1308,18 @@ impl Dominion {
                     self.spend_ammo(shooter);
                     self.shots.push((from * unit, to * unit, side, hit, 0.0));
                 }
-                SimEvent::Destroyed { pos, .. } => self.booms.push((pos * unit, 0.0)),
+                SimEvent::Destroyed { pos, side, .. } => {
+                    self.booms.push((pos * unit, 0.0));
+                    if !self.motherships.is_empty() {
+                        self.recent_kills.push((pos * unit, side));
+                    }
+                }
                 _ => {}
             }
         }
         self.sync();
         self.return_captains(DT);
+        self.run_motherships(DT);
         self.capture(DT);
         self.unrest(DT);
         self.run_convoys(DT);
@@ -1262,7 +1381,7 @@ impl Dominion {
     }
 
     /// The owned planet within the capture radius of `pos`, if any.
-    fn friendly_planet(&self, owner: Owner, pos: Vec2) -> Option<usize> {
+    pub(crate) fn friendly_planet(&self, owner: Owner, pos: Vec2) -> Option<usize> {
         let r = self.capture_radius();
         (0..self.planets.len()).find(|i| self.planets[*i].owner == owner && self.planets[*i].pos.distance(pos) <= r)
     }
@@ -1402,6 +1521,7 @@ impl Dominion {
             self.booms.extend(booms.into_iter().map(|p| (p, 0.0)));
         }
         self.sync();
+        self.maintain_motherships();
         self.load_convoys();
     }
 
@@ -1435,16 +1555,22 @@ impl Dominion {
                     // A fleet at one of its planets draws that planet's stock:
                     // it needs a convoy only for what that planet lacks.
                     let at_stock = self.friendly_planet(f.owner, f.pos).map(|q| (q, self.planets[q].stock[kind]));
+                    let mother = f.mothership.and_then(|m| self.mothership(m)).filter(|m| m.alive && !m.mutinied);
                     if f.owner != p.owner
-                        || !f.armed()
+                        || !(f.armed() || mother.is_some())
+                        || f.wing_of.is_some()
                         || f.morale == Morale::Routed
                         || at_stock.is_some_and(|(q, held)| q == pi || held >= 1.0)
                     {
                         continue;
                     }
-                    let (stores, cargo) = self.fleet_stores(f);
+                    // A mothership's need is its own stores against its capacity.
+                    let (stores, cargo) = match mother {
+                        Some(m) => (m.stores, self.fleet_stores(f).1),
+                        None => self.fleet_stores(f),
+                    };
                     let inc = incoming.get(&f.id).map_or(0.0, |s| s[kind]);
-                    let cap = SHIP_CAP[kind] * f.strength(&t);
+                    let cap = if mother.is_some() { t.mothership_cap[kind] } else { SHIP_CAP[kind] * f.strength(&t) };
                     let have = stores[kind] + cargo[kind] + inc;
                     if have >= cap * NEED_SHARE {
                         continue;
@@ -1484,7 +1610,10 @@ impl Dominion {
         for i in 0..self.fleets.len() {
             let f = &self.fleets[i];
             let Some(target) = f.joining else { continue };
-            let goal = self.fleet(target).filter(|g| g.armed() && g.morale != Morale::Routed && g.owner == f.owner).map(|g| (g.pos, g.division));
+            let goal = self
+                .fleet(target)
+                .filter(|g| (g.armed() || g.mothership.is_some()) && g.morale != Morale::Routed && g.owner == f.owner)
+                .map(|g| (g.pos, g.division));
             match goal {
                 Some((at, division)) if at.distance(f.pos) <= reach => joins.push((f.ship_ids.clone(), division)),
                 Some((at, _)) => {
@@ -1539,14 +1668,14 @@ impl Dominion {
     /// Fleets of supply ships alone stop at the edge of the other side's
     /// cells and go on once the way is clear.
     fn hold_convoys(&mut self) {
-        if !self.fleets.iter().any(|f| !f.armed() && !f.route.is_empty()) {
+        if !self.fleets.iter().any(|f| !f.armed() && f.mothership.is_none() && !f.route.is_empty()) {
             return;
         }
         let inf = Influence::new(self);
         let unit = self.unit();
         for i in 0..self.fleets.len() {
             let f = &self.fleets[i];
-            if f.armed() || f.route.is_empty() {
+            if f.armed() || f.mothership.is_some() || f.route.is_empty() {
                 continue;
             }
             let Some(anchor) = self.world.get::<Division>(f.division).map(|d| d.anchor * unit) else { continue };
@@ -1607,11 +1736,19 @@ impl Dominion {
 
     /// Reads every fleet back from its division; drops the empty ones.
     /// A fleet that reaches a waypoint takes the next leg.
-    fn sync(&mut self) {
+    pub(crate) fn sync(&mut self) {
         let unit = self.unit();
         let mut ships: std::collections::HashMap<Entity, Vec<(Vec2, f32, Entity, bool)>> = std::collections::HashMap::new();
-        for (e, p, h, d, s) in self.world.query::<(Entity, &Pos, &Heading, &InDivision, bevy::prelude::Has<Supply>)>().iter(&self.world) {
+        let mut hulls: Vec<Entity> = Vec::new();
+        for (e, p, h, d, s, m) in self
+            .world
+            .query::<(Entity, &Pos, &Heading, &InDivision, bevy::prelude::Has<Supply>, bevy::prelude::Has<MothershipHull>)>()
+            .iter(&self.world)
+        {
             ships.entry(d.0).or_default().push((p.0 * unit, h.0, e, s));
+            if m {
+                hulls.push(e);
+            }
         }
         let mut gone = Vec::new();
         let mut arrived = Vec::new();
@@ -1631,8 +1768,10 @@ impl Dominion {
             let core: Vec<Vec2> = list.iter().filter(|s| !s.3).map(|s| s.0).collect();
             let core = if core.is_empty() { list.iter().map(|s| s.0).collect() } else { core };
             f.pos = core.iter().copied().sum::<Vec2>() / core.len() as f32;
-            f.ships = list.iter().filter(|s| !s.3).count() as u32;
-            f.supply = list.len() as u32 - f.ships;
+            // A mothership's hull is not a combat ship.
+            let hull = list.iter().filter(|s| hulls.contains(&s.2)).count() as u32;
+            f.ships = list.iter().filter(|s| !s.3).count() as u32 - hull;
+            f.supply = list.len() as u32 - f.ships - hull;
             f.ship_px = list.iter().map(|s| (s.0, s.1)).collect();
             f.ship_ids = list.iter().map(|s| s.2).collect();
             f.is_supply = list.iter().map(|s| s.3).collect();
@@ -1799,6 +1938,7 @@ impl Dominion {
                 // A fresh conquest is resented.
                 p.occupation = OCCUPATION_PENALTY * k;
                 p.unrest = 0.0;
+                self.credit_capture(by, pos);
                 for f in &mut self.fleets {
                     if f.home == Some(i) {
                         f.home = None;
@@ -2038,6 +2178,83 @@ fn draw_icons(c: &mut Canvas, p: &Planet, at: Vec2, r: f32) {
     }
 }
 
+/// A bar `w` wide at (x, y) filled to `frac`.
+fn draw_bar(c: &mut Canvas, x: i32, y: i32, w: i32, frac: f32, col: Rgb) {
+    let fill = (w as f32 * frac.clamp(0.0, 1.0)).round() as i32;
+    for dy in 0..6 {
+        for dx in 0..w {
+            c.set(x + dx, y + dy, if dx < fill { col } else { [40, 44, 58] });
+        }
+    }
+}
+
+/// The mothership view: hull, people (a pie of workers, rebels and the
+/// brig, and the people themselves), morale and unrest, ships, stores and
+/// building.
+fn draw_mothership_panel(c: &mut Canvas, d: &Dominion, m: &super::mothership::Mothership, x0: i32) {
+    use super::rebellion::{Cell, SIDE};
+    let t = &d.tuning;
+    let (y0, w, h) = (8i32, 330i32, 262i32);
+    for y in y0..y0 + h {
+        for x in x0..x0 + w {
+            let base = c.get(x.max(0) as u32, y.max(0) as u32);
+            c.set(x, y, mix(base, INK, 0.85));
+        }
+    }
+    let side = match m.owner {
+        Owner::Side(s) => SIDE_NAMES[s].to_uppercase(),
+        Owner::Independent(_) => "REBEL".into(),
+    };
+    let col = owner_color(m.owner);
+    let text = |c: &mut Canvas, row: i32, s: &str, col: Rgb| {
+        let wpx = s.chars().count() as i32 * 8;
+        draw_text(c, Vec2::new((x0 + 10 + wpx / 2) as f32, (y0 + 14 + row * 18) as f32), s, col);
+    };
+    let title = if m.mutinied { format!("{side} MOTHERSHIP - MUTINY") } else { format!("{side} MOTHERSHIP") };
+    text(c, 0, &title, col);
+    let (hull, max) = d.world.get::<Ship>(m.ship).map_or((0.0, 1.0), |s| (s.hull, s.max_hull));
+    text(c, 1, &format!("HULL {:.0}", hull), WHITE);
+    draw_bar(c, x0 + 110, y0 + 29, 120, hull / max, [200, 200, 210]);
+    let pop = m.people.population();
+    let (active, jailed) = (m.people.active_share(), m.people.jailed_share());
+    text(c, 2, &format!("PEOPLE {pop}"), WHITE);
+    text(c, 3, &format!("WORK {:.0}% REBEL {:.0}%", m.working() * 100.0, active * 100.0), WHITE);
+    text(c, 4, &format!("BRIG {:.0}% COPS {}", jailed * 100.0, m.cops), WHITE);
+    text(c, 5, &format!("MORALE {:.0}%", m.morale * 100.0), WHITE);
+    draw_bar(c, x0 + 110, y0 + 101, 120, m.morale, CALM);
+    text(c, 6, &format!("UNREST {:.0}% OF {:.0}%", m.unrest * 100.0, t.revolt_share * 100.0), WHITE);
+    draw_bar(c, x0 + 200, y0 + 119, 30, m.unrest / t.revolt_share.max(0.01), UNREST_HIGH);
+    let out = m.wing.and_then(|w| d.fleet(w)).map_or(0, |f| f.ships);
+    text(c, 7, &format!("SHIPS {} OUT {}", m.carried, out), WHITE);
+    let crew = m.crew_needed(t.crew_per_ship);
+    text(c, 8, &format!("CREW {:.0} OF {pop}", crew), if crew > pop as f32 { UNREST_HIGH } else { WHITE });
+    for (k, name) in ["AMMO", "FOOD", "PARTS"].iter().enumerate() {
+        text(c, 9 + k as i32, &format!("{name} {:.0}", m.stores[k]), WHITE);
+        draw_bar(c, x0 + 110, y0 + 173 + k as i32 * 18, 120, m.stores[k] / t.mothership_cap[k].max(1.0), RESOURCE_COLORS[k]);
+    }
+    text(c, 12, &format!("BUILD {:.0}%", (m.build * 100.0).min(100.0)), WHITE);
+    draw_bar(c, x0 + 110, y0 + 227, 120, m.build, GOLD);
+    // The people: a pie, and each of them (2 px a patch).
+    let at = Vec2::new((x0 + w - 44) as f32, (y0 + 52) as f32);
+    c.disc(at, 31.0, INK, 1.0);
+    draw_pie(c, at, 30.0, &[(active, REBEL), (jailed, JAILED)], PLANET);
+    let (gx, gy) = (x0 + w - 84, y0 + 98);
+    for (k, cell) in m.people.cells().iter().enumerate() {
+        let colr = match cell {
+            Cell::Empty => [24, 26, 36],
+            Cell::Quiet => PLANET,
+            Cell::Active => REBEL,
+            Cell::Jailed => JAILED,
+            Cell::Cop => col,
+        };
+        let (x, y) = (gx + (k % SIDE) as i32 * 2, gy + (k / SIDE) as i32 * 2);
+        c.set(x, y, colr);
+        c.set(x + 1, y, colr);
+        c.set(x, y + 1, colr);
+        c.set(x + 1, y + 1, colr);
+    }
+}
+
 /// A 3×5 pixel glyph: digits, capitals, '!', '/' and space.
 fn glyph(ch: char) -> Option<[u8; 5]> {
     Some(match ch.to_ascii_uppercase() {
@@ -2079,6 +2296,8 @@ fn glyph(ch: char) -> Option<[u8; 5]> {
         '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
         '!' => [0b010, 0b010, 0b010, 0b000, 0b010],
         ' ' => [0b000, 0b000, 0b000, 0b000, 0b000],
+        '%' => [0b101, 0b001, 0b010, 0b100, 0b101],
+        '-' => [0b000, 0b000, 0b111, 0b000, 0b000],
         '/' => [0b001, 0b001, 0b010, 0b100, 0b100],
         _ => return None,
     })
@@ -2416,6 +2635,18 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
                 draw_icon(&mut c, supply_kind(&cargo), *s, (r * 0.6).max(2.0));
                 continue;
             }
+            // A mothership: a big round hull with its ships aboard on it.
+            if let Some(m) = f.ship_ids.get(k).and_then(|e| d.mothership_of_ship(*e)) {
+                let r = (dart_scale * 22.0).max(9.0);
+                if selected {
+                    c.disc(*s, r + 3.5, GOLD, 1.0);
+                }
+                c.disc(*s, r + 1.5, INK, 1.0);
+                c.disc(*s, r, mix(tone, WHITE, 0.15), 1.0);
+                c.circle(*s, r * 0.7, INK, 0.6);
+                draw_text(&mut c, *s, &m.carried.to_string(), WHITE);
+                continue;
+            }
             // The flagship: bigger, white, with a gold dot.
             let flagship = f.ship_ids.get(k).is_some_and(|e| d.world.get::<Flagship>(*e).is_some());
             let (col, big) = if flagship { (WHITE, 1.6) } else { (tone, 1.0) };
@@ -2440,6 +2671,13 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
     for (p, age) in &d.booms {
         let k = age / BOOM_SECS;
         c.circle(view.to_screen(*p), (3.0 + 9.0 * k) * (z * d.scale()).clamp(0.6, 2.0), HIT, (1.0 - k) * 0.9);
+    }
+    // The selected mothership's view.
+    if let Some(m) = opts.selected.iter().find_map(|e| d.mothership_of_ship(*e)) {
+        // In the top corner away from the mothership, so it stays in view.
+        let at = d.fleet(m.fleet).map_or(Vec2::ZERO, |f| view.to_screen(f.pos));
+        let x0 = if at.x < w as f32 * 0.5 { w as i32 - 338 } else { 8 };
+        draw_mothership_panel(&mut c, d, m, x0);
     }
     // How many ships are selected, above the topmost of them.
     if !opts.selected.is_empty() {
@@ -2539,6 +2777,23 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
             rate_text(&d.planet_income(o)),
         ));
     }
+    for m in d.motherships.iter().filter(|m| m.alive) {
+        let side = match m.owner {
+            Owner::Side(s) => SIDE_NAMES[s],
+            Owner::Independent(_) => "Mutinied",
+        };
+        s.push_str(&format!(
+            "\n{side} mothership: {} people ({:.0}% working, {:.0}% rebels, {:.0}% in the brig) · morale {:.0}% · unrest {:.0}% · {} ships aboard · stores {}",
+            m.people.population(),
+            m.working() * 100.0,
+            m.people.active_share() * 100.0,
+            m.people.jailed_share() * 100.0,
+            m.morale * 100.0,
+            m.unrest * 100.0,
+            m.carried,
+            stock_text(&m.stores)
+        ));
+    }
     if let Some(p) = planet.and_then(|i| d.planets.get(i)) {
         let i = planet.unwrap();
         let who = match p.owner {
@@ -2590,6 +2845,8 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
             let i = d.fleet_index(*one).unwrap();
             let f = &d.fleets[i];
             let who = match f.owner {
+                Owner::Side(side) if f.mothership.is_some() => format!("{} mothership", SIDE_NAMES[side]),
+                Owner::Side(side) if f.wing_of.is_some() => format!("{} mothership's wing", SIDE_NAMES[side]),
                 Owner::Side(side) if f.joining.is_some() && !f.armed() => format!("{} convoy", SIDE_NAMES[side]),
                 Owner::Side(side) if f.joining.is_some() => format!("{} reinforcements", SIDE_NAMES[side]),
                 Owner::Side(side) => match f.captain.and_then(|c| d.captain(c)) {

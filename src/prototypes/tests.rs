@@ -884,3 +884,125 @@ fn a_box_takes_ships_of_one_side_only() {
     let left = d.ships_in_box(Vec2::new(0.0, 0.0), Vec2::new(320.0, 400.0));
     assert_eq!(left, ids(&d, a));
 }
+
+// prototype02: motherships.
+
+fn carrier_world() -> Dominion {
+    Dominion::with_mode(&cfg(), 12, 3, Tuning::default(), Mode::Motherships)
+}
+
+fn blue_mother(d: &Dominion) -> super::mothership::Mothership {
+    d.motherships.iter().find(|m| m.owner == BLUE).unwrap().clone()
+}
+
+#[test]
+fn motherships_start_one_a_side_at_home_and_are_no_voronoi_site() {
+    let d = carrier_world();
+    assert_eq!(d.motherships.len(), 2);
+    assert!(d.captains.is_empty());
+    for m in &d.motherships {
+        let f = d.fleet(m.fleet).unwrap();
+        let home = d.planets.iter().find(|p| p.owner == m.owner).unwrap();
+        assert!(f.pos.distance(home.pos) < 5.0);
+        assert_eq!((f.ships, f.armed()), (0, false));
+        assert!(m.carried > 0 && m.morale == 1.0);
+        assert_eq!(m.people.population(), d.tuning.start_population as usize);
+        let inf = Influence::new(&d);
+        let i = d.fleet_index(m.fleet).unwrap();
+        assert_ne!(inf.at(f.pos + Vec2::new(30.0, 0.0)), Some(Site::Fleet(i)));
+    }
+}
+
+#[test]
+fn a_mothership_builds_ships_aboard_from_parts() {
+    let mut d = carrier_world();
+    let i = d.motherships.iter().position(|m| m.owner == BLUE).unwrap();
+    d.motherships[i].stores[PARTS] = 50.0;
+    let before = d.motherships[i].carried;
+    d.tuning.mothership_build_secs = 5.0;
+    d.step(3.0 * MAINTENANCE_SECS + 0.1);
+    assert!(d.motherships[i].carried > before);
+}
+
+#[test]
+fn a_mothership_launches_at_a_threat_and_docks_when_it_is_gone() {
+    let mut d = carrier_world();
+    d.tuning.food_per_phase = 0.0;
+    let m = blue_mother(&d);
+    let at = d.fleet(m.fleet).unwrap().pos;
+    let red = d.add_fleet(RED, at + Vec2::new(70.0, 0.0), WEST, 4, None);
+    d.step(4.0);
+    let m2 = blue_mother(&d);
+    let wing = m2.wing.and_then(|w| d.fleet(w)).expect("a wing");
+    assert!(wing.ships > 0 && m2.carried < m.carried);
+    assert!(!wing.controllable());
+    // The threat gone, the wing comes home and docks.
+    d.clear_fleet(red);
+    d.step(25.0);
+    let m3 = blue_mother(&d);
+    assert!(m3.wing.and_then(|w| d.fleet(w)).is_none_or(|f| f.ships == 0), "the wing docked");
+    assert!(m3.carried + 1 >= m.carried, "{} of {}", m3.carried, m.carried);
+}
+
+#[test]
+fn shortages_and_crowding_cost_morale_and_low_morale_breeds_rebels() {
+    let mut d = carrier_world();
+    let i = d.motherships.iter().position(|m| m.owner == BLUE).unwrap();
+    // Empty stores (and a home planet with none to give), too many ships to crew.
+    d.motherships[i].stores = [0.0; 3];
+    d.motherships[i].carried = 60;
+    let home = d.planets.iter().position(|p| p.owner == BLUE).unwrap();
+    d.planets[home].stock = [0.0; 3];
+    d.planets[home].produces = [AMMO; 3];
+    d.planets[home].value = 0;
+    d.step(MAINTENANCE_SECS + 0.1);
+    let m = &d.motherships[i];
+    assert!(m.morale < 1.0, "{}", m.morale);
+    assert!(m.crowding(d.tuning.crew_per_ship) > 0.0);
+    // Legitimacy is morale: at low morale people rebel.
+    d.motherships[i].morale = 0.3;
+    d.motherships[i].carried = 0;
+    d.step(5.0);
+    assert!(d.motherships[i].people.active_share() > 0.1);
+}
+
+#[test]
+fn a_mothership_mutinies_when_unrest_passes_the_revolt_share() {
+    let mut d = carrier_world();
+    let i = d.motherships.iter().position(|m| m.owner == BLUE).unwrap();
+    d.motherships[i].morale = 0.0;
+    d.motherships[i].carried = 0;
+    d.tuning.morale_recover = 0.0;
+    d.step(20.0);
+    let m = &d.motherships[i];
+    assert!(m.mutinied, "unrest {}", m.unrest);
+    assert!(matches!(m.owner, Owner::Independent(_)));
+    assert!(!d.fleet(m.fleet).unwrap().controllable());
+}
+
+#[test]
+fn ships_near_a_mothership_board_it() {
+    let mut d = carrier_world();
+    let m = blue_mother(&d);
+    let at = d.fleet(m.fleet).unwrap().pos;
+    let g = d.add_fleet(BLUE, at + Vec2::new(12.0, 0.0), 0.0, 5, None);
+    let mut sel = ids(&d, g);
+    sel.push(m.ship);
+    let to = d.planets[d.highways.neighbors[d.planets.iter().position(|p| p.owner == BLUE).unwrap()][0]].pos;
+    d.form_fleet(&sel, to);
+    assert!(d.fleet(g).is_none());
+    assert_eq!(blue_mother(&d).carried, m.carried + 5);
+    assert!(d.fleet(m.fleet).unwrap().dest.is_some(), "and the mothership sets off");
+}
+
+#[test]
+fn the_mothership_view_renders() {
+    let d = carrier_world();
+    let m = blue_mother(&d);
+    let view = View::fit(&d.cfg, VIEW_W, VIEW_H);
+    let bg = render_background(&d, &view, 1);
+    let opts = DrawOptions { selected: vec![m.ship], ..Default::default() };
+    let c = render(&d, &bg, &view, &opts);
+    assert_eq!((c.w, c.h), (VIEW_W, VIEW_H));
+    assert!(status(&d, &[m.ship], None).contains("mothership"));
+}
