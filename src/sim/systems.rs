@@ -89,7 +89,7 @@ pub fn steer_divisions(mut divs: Query<(Entity, &mut Division)>, hash: Res<Spati
             }
         }
         let m = battle.mods_of(d.side);
-        let base = tuning.anchor_speed * m.speed;
+        let base = tuning.anchor_speed * m.speed * d.pace;
         let ahead = |d: &Division| d.anchor + d.forward() * 100.0;
         let (goal, facing, speed) = if d.morale == Morale::Routed {
             let home = home_dir(d.side);
@@ -165,7 +165,7 @@ pub fn steer_ships(
 ) {
     for (mut vel, mut heading, pos, slot, div, weapon) in &mut ships {
         let Ok(d) = divs.get(div.0) else { continue };
-        let speed = battle.mods_of(d.side).speed;
+        let speed = battle.mods_of(d.side).speed * d.pace;
         let target = d.to_world(slot.0);
         let to = target - pos.0;
         let max = match (d.morale, d.order) {

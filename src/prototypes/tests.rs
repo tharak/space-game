@@ -1,4 +1,5 @@
 use super::dominion::*;
+use super::captains::Skill;
 use super::highways::closest_on_segment;
 use crate::sim::components::{Morale, Ship, Stores, Supply};
 use crate::voronoi::Vec2;
@@ -19,12 +20,28 @@ fn duel(a: (Owner, Vec2, f32, u32), b: (Owner, Vec2, f32, u32)) -> (Dominion, u3
     for p in &mut d.planets {
         p.value = 0;
     }
-    // Combat only: supplies never run out.
+    // Combat only: supplies never run out, captains command any number.
     d.tuning.ammo_per_shot = 0.0;
     d.tuning.food_per_phase = 0.0;
-    let ia = d.add_fleet(a.0, a.1, a.2, a.3, None);
-    let ib = d.add_fleet(b.0, b.1, b.2, b.3, None);
+    d.tuning.command = 1000.0;
+    let ia = captained(&mut d, a.0, a.1, a.2, a.3);
+    let ib = captained(&mut d, b.0, b.1, b.2, b.3);
     (d, ia, ib)
+}
+
+/// A fleet of `n` ships at `pos`: for Blue and Red, `n − 1` escorts and a
+/// captain's flagship (Survivor: no effect on the fight).
+fn captained(d: &mut Dominion, owner: Owner, pos: Vec2, facing: f32, n: u32) -> u32 {
+    captained_with(d, owner, pos, facing, n, Skill::Survivor)
+}
+
+fn captained_with(d: &mut Dominion, owner: Owner, pos: Vec2, facing: f32, n: u32, skill: Skill) -> u32 {
+    if matches!(owner, Owner::Independent(_)) {
+        return d.add_fleet(owner, pos, facing, n, None);
+    }
+    let id = d.add_fleet(owner, pos, facing, n.max(2) - 1, None);
+    d.add_captain(id, skill).unwrap();
+    id
 }
 
 const BLUE: Owner = Owner::Side(0);
@@ -69,7 +86,17 @@ fn the_world_starts_with_home_planets_fleets_and_garrisons() {
         let home = d.planets.iter().find(|p| p.owner == Owner::Side(side)).unwrap();
         assert_eq!(home.value, MAX_PLANET_SIZE);
         assert_eq!(home.produces, [AMMO, FOOD, PARTS]);
-        assert_eq!(*n, 3 * START_SHIPS + home.value);
+        // Each start fleet: escorts plus the captain's flagship.
+        assert_eq!(*n, 3 * (START_SHIPS + 1) + home.value);
+    }
+    // Three captains a side, all different skills, each leading a fleet.
+    for side in 0..2 {
+        let caps: Vec<_> = d.captains.iter().filter(|c| c.side == side).collect();
+        assert_eq!(caps.len(), 3);
+        assert!(caps[0].skill != caps[1].skill && caps[1].skill != caps[2].skill && caps[0].skill != caps[2].skill);
+        for c in caps {
+            assert!(d.fleets.iter().any(|f| f.captain == Some(c.id) && f.controllable()));
+        }
     }
     assert_eq!(START_SHIPS, MAX_PLANET_SIZE);
     assert_eq!(free, 10);
@@ -80,7 +107,7 @@ fn the_world_starts_with_home_planets_fleets_and_garrisons() {
     }
     // Start fleets carry a supply ship each, out on the highways.
     for f in d.fleets.iter().filter(|f| f.home.is_none()) {
-        assert_eq!((f.ships, f.supply), (START_SHIPS, 3));
+        assert_eq!((f.ships, f.supply), (START_SHIPS + 1, 3));
         let s = d.highways.snap(f.pos).unwrap();
         assert!(s.point.distance(f.pos) < 3.0, "{:?} is off the highways", f.pos);
     }
@@ -106,11 +133,21 @@ fn planets_build_ships_into_their_garrison() {
     let g = d.fleet(id).unwrap();
     assert_eq!(g.ships, start + 8);
     assert_eq!(g.ship_px.len() as u32, start + 8);
-    // Ordered away, it stops garrisoning and the planet starts a new one.
-    d.set_ships(id, 12);
-    assert!(d.order_move(id, Vec2::new(360.0, 200.0)));
-    d.step(3.1);
-    assert!(d.fleets.iter().any(|f| f.home == Some(home) && f.id != id));
+    // Without a captain it can't be ordered away.
+    assert!(!d.order_move(id, Vec2::new(360.0, 200.0)));
+}
+
+#[test]
+fn a_new_ship_joins_the_fleet_resting_at_its_planet() {
+    let (mut d, home) = economy();
+    d.tuning.ship_cost = 0.0;
+    d.tuning.food_per_phase = 0.0;
+    let at = d.planets[home].pos;
+    let id = captained(&mut d, BLUE, at, 0.0, 4);
+    let before = ships(&d, id);
+    d.step(1.0);
+    assert!(ships(&d, id) > before, "the new ships joined the captain's fleet");
+    assert_eq!(d.fleets.iter().filter(|f| f.owner == BLUE).count(), 1, "no new garrison");
 }
 
 #[test]
@@ -133,7 +170,7 @@ fn fleets_move_at_the_set_speed_along_a_highway_and_stop_there() {
     d.clear_fleets();
     d.tuning.food_per_phase = 0.0;
     let (from, to) = long_road(&d);
-    let a = d.add_fleet(BLUE, from, (to - from).to_angle(), 10, None);
+    let a = captained(&mut d, BLUE, from, (to - from).to_angle(), 10);
     assert!(d.order_move(a, to));
     d.step(2.0);
     let gone = d.fleet(a).unwrap().pos.distance(from);
@@ -152,7 +189,8 @@ fn fleets_only_travel_on_highways() {
     let home = d.planets.iter().position(|p| p.owner == BLUE).unwrap();
     let far = d.planets.iter().position(|p| p.owner == RED).unwrap();
     d.tuning.secs_per_ship = 1e6;
-    let a = d.add_fleet(BLUE, d.planets[home].pos, 0.0, 6, None);
+    let at = d.planets[home].pos;
+    let a = captained(&mut d, BLUE, at, 0.0, 6);
     // Ordered to empty space: it goes to the nearest point on a highway.
     let goal = d.planets[far].pos + Vec2::new(-30.0, 25.0);
     assert!(d.order_move(a, goal));
@@ -318,8 +356,8 @@ fn a_moving_fleet_never_rams_an_enemy() {
     d.clear_fleets();
     let (from, to) = long_road(&d);
     let dir = (to - from).normalize();
-    let a = d.add_fleet(BLUE, from, dir.to_angle(), 20, None);
-    let b = d.add_fleet(RED, from + dir * 200.0_f32.min(from.distance(to) * 0.6), WEST + dir.to_angle(), 30, None);
+    let a = captained(&mut d, BLUE, from, dir.to_angle(), 20);
+    let b = captained(&mut d, RED, from + dir * 200.0_f32.min(from.distance(to) * 0.6), WEST + dir.to_angle(), 30);
     assert!(d.order_move(a, to));
     d.step(12.0);
     let (fa, fb) = (d.fleet(a).unwrap(), d.fleet(b).unwrap());
@@ -334,7 +372,8 @@ fn a_fleet_sent_at_a_planet_takes_it() {
     let mut d = world();
     let (i, p) = d.planets.iter().enumerate().find(|(_, p)| matches!(p.owner, Owner::Independent(_))).map(|(i, p)| (i, *p)).unwrap();
     d.planets[i].value = 1;
-    let blue = d.add_fleet(BLUE, p.pos + Vec2::new(-80.0, 0.0), 0.0, 80, None);
+    d.tuning.command = 100.0;
+    let blue = captained(&mut d, BLUE, p.pos + Vec2::new(-80.0, 0.0), 0.0, 80);
     assert!(d.order_move(blue, p.pos));
     let mut t = 0.0;
     while d.planets[i].owner != BLUE && t < 90.0 {
@@ -590,7 +629,7 @@ fn supply_ships_trail_their_fleet_and_can_be_shot() {
     assert!(behind < 0.0 && behind > -d.range(), "close behind: {behind}");
     assert!(d.world.get::<Supply>(f.ship_ids[k]).is_some());
     // A lone supply ship next to an enemy fleet gets shot down.
-    let lone = d.add_convoy(BLUE, d.fleet(b).unwrap().pos + Vec2::new(-30.0, 0.0), [5.0; 3], None);
+    let lone = d.add_convoy(BLUE, d.fleet(b).unwrap().pos + Vec2::new(-18.0, 0.0), [5.0; 3], None);
     assert_eq!(d.fleet(lone).unwrap().supply, 1);
     d.step(30.0);
     assert!(d.fleet(lone).is_none(), "the supply ship survived");
@@ -610,7 +649,7 @@ fn one_whole_fleet_selected_just_moves() {
 }
 
 #[test]
-fn fleets_ordered_together_travel_apart_and_merge_where_they_arrive() {
+fn captains_travel_apart_and_never_merge() {
     let mut d = world();
     d.clear_fleets();
     d.tuning.food_per_phase = 0.0;
@@ -618,35 +657,53 @@ fn fleets_ordered_together_travel_apart_and_merge_where_they_arrive() {
     let home = d.planets.iter().position(|p| p.owner == BLUE).unwrap();
     let ns = d.highways.neighbors[home].clone();
     let (p1, p2) = (d.planets[ns[0]].pos, d.planets[ns[1]].pos);
-    let a = d.add_fleet(BLUE, p1, 0.0, 12, None);
-    let b = d.add_fleet(BLUE, p2, 0.0, 5, None);
+    let a = captained(&mut d, BLUE, p1, 0.0, 12);
+    let b = captained(&mut d, BLUE, p2, 0.0, 5);
     let mut sel = ids(&d, a);
     sel.extend(ids(&d, b));
     let to = d.planets[home].pos;
-    assert_eq!(d.form_fleet(&sel, to), Some(a));
-    // Under way: still two fleets, each on its own route.
-    d.step(1.0);
-    assert!(d.fleet(a).is_some() && d.fleet(b).is_some());
-    assert_eq!(d.fleet(b).unwrap().rendezvous, Some(a));
+    assert_eq!(d.form_fleet(&sel, to), Some(a), "the strongest leads");
     d.step(60.0);
-    assert!(d.fleet(b).is_none(), "the smaller fleet merged in");
-    let f = d.fleet(a).unwrap();
-    assert_eq!(f.ships, 17);
-    assert!(f.pos.distance(to) < 30.0);
-    assert_eq!(f.rendezvous, None);
+    let (fa, fb) = (d.fleet(a).unwrap(), d.fleet(b).unwrap());
+    assert_eq!((fa.ships, fb.ships), (12, 5));
+    assert!(fa.pos.distance(to) < 30.0 && fb.pos.distance(to) < 30.0);
 }
 
 #[test]
-fn part_of_a_fleet_splits_off() {
+fn ships_without_a_captain_stay_unless_a_captain_takes_them() {
+    let (mut d, home) = economy();
+    d.tuning.food_per_phase = 0.0;
+    d.tuning.ship_cost = 1e6;
+    let at = d.planets[home].pos;
+    let garrison = d.add_fleet(BLUE, at, 0.0, 6, Some(home));
+    assert!(!d.controllable_id(garrison));
+    // Alone, a right-click moves nothing.
+    let to = d.planets[d.highways.neighbors[home][0]].pos;
+    assert_eq!(d.form_fleet(&ids(&d, garrison), to), None);
+    // With a captain nearby, the captain takes them along.
+    let cap = captained(&mut d, BLUE, at + Vec2::new(15.0, 0.0), 0.0, 3);
+    let mut sel = ids(&d, garrison);
+    sel.extend(ids(&d, cap));
+    assert_eq!(d.form_fleet(&sel, to), Some(cap));
+    assert!(d.fleet(garrison).is_none());
+    assert_eq!(ships(&d, cap), 9);
+}
+
+#[test]
+fn part_of_a_fleet_without_its_flagship_splits_off_and_stays() {
     let (mut d, a, _) = duel((BLUE, Vec2::new(100.0, 100.0), 0.0, 10), (RED, Vec2::new(650.0, 350.0), WEST, 10));
-    let part: Vec<_> = ids(&d, a).into_iter().take(4).collect();
-    let new = d.form_fleet(&part, Vec2::new(100.0, 300.0)).unwrap();
-    assert_ne!(new, a);
-    assert_eq!((ships(&d, a), ships(&d, new)), (6, 4));
-    assert!(d.fleet(a).unwrap().dest.is_none());
-    assert!(d.fleet(new).unwrap().ship_ids.iter().all(|e| part.contains(e)));
-    d.step(5.0);
-    assert_eq!((ships(&d, a), ships(&d, new)), (6, 4));
+    let flag = d.captain(d.fleet(a).unwrap().captain.unwrap()).unwrap().flagship.unwrap();
+    let part: Vec<_> = ids(&d, a).into_iter().filter(|e| *e != flag).take(4).collect();
+    assert_eq!(d.form_fleet(&part, Vec2::new(100.0, 300.0)), None);
+    let new = d.fleets.iter().find(|f| f.ship_ids.iter().all(|e| part.contains(e))).unwrap();
+    assert_eq!((ships(&d, a), new.ships), (6, 4));
+    assert!(new.captain.is_none() && new.dest.is_none());
+    // The flagship with part of its fleet: that part goes, the rest stays.
+    let mut go: Vec<_> = ids(&d, a).into_iter().filter(|e| *e != flag).take(2).collect();
+    go.push(flag);
+    assert_eq!(d.form_fleet(&go, Vec2::new(300.0, 100.0)), Some(a));
+    assert_eq!(ships(&d, a), 3);
+    assert!(d.fleet(a).unwrap().dest.is_some());
 }
 
 #[test]
@@ -659,6 +716,131 @@ fn a_mixed_selection_only_moves_one_owner_and_never_independents() {
     assert!(d.fleet(b).unwrap().dest.is_none());
     let ind = d.add_fleet(Owner::Independent(0), Vec2::new(400.0, 100.0), 0.0, 3, None);
     assert_eq!(d.form_fleet(&ids(&d, ind), Vec2::ZERO), None);
+}
+
+#[test]
+fn a_flagship_counts_as_several_ships() {
+    let (mut d, home) = economy();
+    d.tuning.food_per_phase = 0.0;
+    let at = d.planets[home].pos;
+    let id = captained(&mut d, BLUE, at, 0.0, 5);
+    let f = d.fleet(id).unwrap().clone();
+    assert_eq!(f.ships, 5);
+    assert_eq!(f.strength(&d.tuning), 4.0 + d.tuning.flagship_ships);
+    assert!((f.weight(&d.tuning) - (4.0 + d.tuning.flagship_ships) * d.tuning.weight_per_ship).abs() < 1e-5);
+    assert_eq!(d.police_ships(home), 4 + d.tuning.flagship_ships as u32);
+    // Its stores share and its hull are the flagship's weight.
+    let flag = d.captain(f.captain.unwrap()).unwrap().flagship.unwrap();
+    d.step(MAINTENANCE_SECS + 0.05);
+    let s = d.world.get::<Stores>(flag).unwrap().0;
+    let other = d.world.get::<Stores>(*ids(&d, id).iter().find(|e| **e != flag && d.world.get::<Stores>(**e).is_some()).unwrap()).unwrap().0;
+    assert!((s[AMMO] - other[AMMO] * d.tuning.flagship_ships).abs() < 0.01, "{s:?} {other:?}");
+    assert_eq!(d.world.get::<Ship>(flag).unwrap().max_hull, d.battle.hull * d.tuning.flagship_ships);
+}
+
+#[test]
+fn over_capacity_shakes_and_slows_a_fleet() {
+    let (mut d, _) = economy();
+    d.tuning.food_per_phase = 0.0;
+    let (from, _) = long_road(&d);
+    let id = captained(&mut d, BLUE, from + Vec2::new(0.0, 60.0), 0.0, 21);
+    let e = d.fleet(id).unwrap().division;
+    d.step(MAINTENANCE_SECS + 0.05);
+    let div = d.world.get::<crate::sim::components::Division>(e).unwrap();
+    // 20 escorts for 10: 100% over.
+    assert!((div.pace - 0.5).abs() < 1e-4, "{}", div.pace);
+    assert!(div.shock > 0.0);
+    // A Commander handles 15 without slowing as much.
+    let c = captained_with(&mut d, BLUE, from + Vec2::new(0.0, 120.0), 0.0, 16, Skill::Commander);
+    assert_eq!(d.capacity(d.fleet(c).unwrap()), 15.0);
+}
+
+#[test]
+fn a_lost_flagship_kills_its_captain_or_sends_them_home() {
+    for death in [1.0, 0.0] {
+        let (mut d, home) = economy();
+        d.tuning.food_per_phase = 0.0;
+        d.tuning.captain_death = death;
+        d.tuning.captain_return = 5.0;
+        let (from, _) = long_road(&d);
+        let id = captained_with(&mut d, BLUE, from + Vec2::new(0.0, 60.0), 0.0, 6, Skill::Gunner);
+        let cid = d.fleet(id).unwrap().captain.unwrap();
+        let flag = d.captain(cid).unwrap().flagship.unwrap();
+        let e = d.fleet(id).unwrap().division;
+        crate::sim::despawn_ships(&mut d.world, e, &[flag]);
+        d.step(0.1);
+        let f = d.fleet(id).unwrap();
+        assert!(f.captain.is_none() && !f.controllable(), "the fleet lost its captain");
+        let c = d.captain(cid).unwrap().clone();
+        if death == 1.0 {
+            assert!(!c.alive);
+            d.step(10.0);
+            assert!(d.captain(cid).unwrap().flagship.is_none());
+        } else {
+            assert!(c.alive && c.flagship.is_none());
+            d.step(6.0);
+            let back = d.fleets.iter().find(|f| f.captain == Some(cid)).expect("a new flagship");
+            assert!(back.pos.distance(d.planets[home].pos) < 30.0);
+        }
+    }
+}
+
+#[test]
+fn skills_change_the_rules() {
+    let (mut d, home) = economy();
+    d.tuning.food_per_phase = 0.0;
+    let at = d.planets[home].pos;
+    d.planets[home].home_of = None;
+    // Governor: ships count double as cops.
+    let plain = d.cops_for(home);
+    let g = captained_with(&mut d, BLUE, at, 0.0, 4, Skill::Governor);
+    let gov = d.cops_for(home);
+    d.clear_fleet(g);
+    let p = captained_with(&mut d, BLUE, at, 0.0, 4, Skill::Survivor);
+    let normal = d.cops_for(home);
+    assert!(gov > normal && normal > plain, "{plain} {normal} {gov}");
+    d.clear_fleet(p);
+    // Navigator: faster.
+    let (from, _) = long_road(&d);
+    let n = captained_with(&mut d, BLUE, from + Vec2::new(0.0, 60.0), 0.0, 4, Skill::Navigator);
+    d.step(MAINTENANCE_SECS + 0.05);
+    let e = d.fleet(n).unwrap().division;
+    assert_eq!(d.world.get::<crate::sim::components::Division>(e).unwrap().pace, 1.25);
+}
+
+#[test]
+fn a_sharpshooter_spends_half_the_ammo() {
+    let mut used = Vec::new();
+    for skill in [Skill::Survivor, Skill::Sharpshooter] {
+        let (mut d, a, b) = duel((BLUE, Vec2::new(300.0, 200.0), 0.0, 10), (RED, Vec2::new(325.0, 200.0), WEST, 30));
+        let _ = b;
+        d.tuning.ammo_per_shot = 0.1;
+        // Swap the captain's skill.
+        let cid = d.fleet(a).unwrap().captain.unwrap();
+        d.captains.iter_mut().find(|c| c.id == cid).unwrap().skill = skill;
+        set_stores(&mut d, a, [10.0, 3.0, 2.0]);
+        let (before, _) = d.fleet_stores(d.fleet(a).unwrap());
+        let shots_before = d.shots.len();
+        d.step(3.0);
+        let fired = d.shots.iter().filter(|s| s.2 == 0).count().max(shots_before);
+        let (after, _) = d.fleet_stores(d.fleet(a).unwrap());
+        used.push((before[AMMO] - after[AMMO]) / fired.max(1) as f32);
+    }
+    assert!(used[1] < used[0] * 0.75, "{used:?}");
+}
+
+#[test]
+fn a_conqueror_takes_planets_twice_as_fast() {
+    let mut d = world();
+    let (i, p) = d.planets.iter().enumerate().find(|(_, p)| matches!(p.owner, Owner::Independent(_))).map(|(i, p)| (i, *p)).unwrap();
+    d.fleets.retain(|f| f.home != Some(i));
+    d.clear_fleets();
+    d.tuning.food_per_phase = 0.0;
+    d.tuning.secs_per_ship = 1e6;
+    captained_with(&mut d, BLUE, p.pos, 0.0, 5, Skill::Conqueror);
+    d.step(HOLD_SECS * 0.5 + 0.2);
+    assert_eq!(d.planets[i].owner, BLUE);
+    assert!((d.planets[i].occupation - OCCUPATION_PENALTY * 0.5).abs() < 0.02);
 }
 
 #[test]

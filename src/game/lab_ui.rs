@@ -171,6 +171,9 @@ pub enum SliderParam {
     FoodUse,
     SupplyLoad,
     PartRepair,
+    FlagshipShips,
+    Command,
+    CaptainDeath,
     GrowRadius,
     Crack,
     Weight(usize),
@@ -196,6 +199,9 @@ impl SliderParam {
             SliderParam::FoodUse => (0.0, 2.0, 0.05),
             SliderParam::SupplyLoad => (5.0, 200.0, 5.0),
             SliderParam::PartRepair => (0.5, 10.0, 0.5),
+            SliderParam::FlagshipShips => (1.0, 10.0, 0.5),
+            SliderParam::Command => (1.0, 40.0, 1.0),
+            SliderParam::CaptainDeath => (0.0, 1.0, 0.05),
             SliderParam::GrowRadius => (0.0, LabState::grow_max(cfg), 1.0),
             SliderParam::Crack => (0.5, 10.0, 0.1),
             SliderParam::Weight(_) => (0.2, 4.0, 0.1),
@@ -223,6 +229,9 @@ impl SliderParam {
             SliderParam::FoodUse => proto.d.tuning.food_per_phase,
             SliderParam::SupplyLoad => proto.d.tuning.supply_load,
             SliderParam::PartRepair => proto.d.tuning.hull_per_part,
+            SliderParam::FlagshipShips => proto.d.tuning.flagship_ships,
+            SliderParam::Command => proto.d.tuning.command,
+            SliderParam::CaptainDeath => proto.d.tuning.captain_death,
             SliderParam::GrowRadius => st.grow_radius,
             SliderParam::Crack => st.crack,
             SliderParam::Weight(i) => st.weights[i],
@@ -248,6 +257,9 @@ impl SliderParam {
             SliderParam::FoodUse => format!("{v:.2} food a ship every 5 s"),
             SliderParam::SupplyLoad => format!("{v:.0} units a supply ship"),
             SliderParam::PartRepair => format!("{v:.1} hull points a part"),
+            SliderParam::FlagshipShips => format!("a flagship counts as {v:.1} ships"),
+            SliderParam::Command => format!("{v:.0} escorts a captain commands"),
+            SliderParam::CaptainDeath => format!("{:.0}% chance to die with the flagship", v * 100.0),
             SliderParam::GrowRadius => format!("{v:.0} px"),
             SliderParam::Crack => format!("{v:.1}"),
             SliderParam::Weight(_) => format!("{v:.1}×"),
@@ -390,6 +402,9 @@ fn set_slider(param: SliderParam, v: f32, cfg: &mut VoronoiConfig, labs: &mut La
         SliderParam::FoodUse => proto.d.tuning.food_per_phase = v,
         SliderParam::SupplyLoad => proto.d.tuning.supply_load = v,
         SliderParam::PartRepair => proto.d.tuning.hull_per_part = v,
+        SliderParam::FlagshipShips => proto.d.tuning.flagship_ships = v,
+        SliderParam::Command => proto.d.tuning.command = v,
+        SliderParam::CaptainDeath => proto.d.tuning.captain_death = v,
         SliderParam::GrowRadius => {
             labs.state.grow_radius = v;
             if labs.playing == Some(LabId::Grow) {
@@ -489,7 +504,11 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                      ships desert. No parts: damaged ships may break up. Shortages shake morale. \
                      Each owned planet's people (drawn inside it) run Epstein's rebellion model: legitimacy is \
                      1 − tax − occupation (fresh conquests are resented), ships nearby are the cops, fighting adds \
-                     hardship. Rebels strike (red arc) and, past the revolt share, the planet goes independent.",
+                     hardship. Rebels strike (red arc) and, past the revolt share, the planet goes independent. \
+                     Captains: only fleets led by a captain's flagship (big white ship, letter above) move. Each captain \
+                     has a skill and commands a number of escorts (more slows and shakes the fleet). A flagship counts \
+                     as 3 ships. Lose it and the captain may die, or comes back later at home with a new one. \
+                     Under each planet: ships there / ships needed to keep its people calm.",
                 );
                 p.spawn(row()).with_children(|r| {
                     button_for(r, "Pause", LabAction::ProtoPause, BtnKind::Primary);
@@ -532,6 +551,9 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                 slider(p, "Food use", SliderParam::FoodUse);
                 slider(p, "Supply load", SliderParam::SupplyLoad);
                 slider(p, "Part repair", SliderParam::PartRepair);
+                slider(p, "Flagship counts as", SliderParam::FlagshipShips);
+                slider(p, "Command", SliderParam::Command);
+                slider(p, "Captain death", SliderParam::CaptainDeath);
                 slider(p, "Selected ships", SliderParam::FleetShips);
                 slider(p, "Weight per ship", SliderParam::WeightPerShip);
                 slider(p, "Planet weight", SliderParam::PlanetWeight);

@@ -272,6 +272,7 @@ pub fn spawn_battle(world: &mut World) {
                     half_width,
                     since_contact: f32::INFINITY,
                     closest: f32::INFINITY,
+                    pace: 1.0,
                 })
                 .id();
             let div_rot = Vec2::from_angle(div_facing);

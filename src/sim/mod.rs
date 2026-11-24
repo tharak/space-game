@@ -91,6 +91,7 @@ pub fn spawn_division(world: &mut World, side: usize, form: Formation, anchor: V
             half_width,
             since_contact: f32::INFINITY,
             closest: f32::INFINITY,
+            pace: 1.0,
         })
         .id();
     let rot = Vec2::from_angle(facing);
@@ -137,6 +138,15 @@ pub fn add_supply(world: &mut World, division: Entity, at: Vec2, cargo: [f32; 3]
     spawn_ships(world, division, &[at]);
     let e = world.query_filtered::<Entity, With<Ship>>().iter(world).find(|e| !before.contains(e))?;
     world.entity_mut(e).insert(Supply(cargo));
+    reform(world, division);
+    Some(e)
+}
+
+/// One new ship for `division` at `at` (battle units); returns it.
+pub fn add_ship(world: &mut World, division: Entity, at: Vec2) -> Option<Entity> {
+    let before: Vec<Entity> = world.query_filtered::<Entity, With<Ship>>().iter(world).collect();
+    spawn_ships(world, division, &[at]);
+    let e = world.query_filtered::<Entity, With<Ship>>().iter(world).find(|e| !before.contains(e))?;
     reform(world, division);
     Some(e)
 }

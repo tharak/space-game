@@ -38,8 +38,9 @@ use bevy::prelude::{Entity, Rect, World};
 
 use super::rebellion::{Rebellion, RebellionParams};
 use crate::sim::battle::{Battle, DT, SimEvent, Tuning as BattleTuning};
+use super::captains::{Captain, Skill, draw_name, draw_skills};
 use super::highways::Highways;
-use crate::sim::components::{Division, Heading, InDivision, Morale, Order, Pos, Ship, Stores, Supply, Weapon};
+use crate::sim::components::{Division, Flagship, Heading, InDivision, Morale, Order, Pos, Ship, Stores, Supply, Weapon};
 pub use crate::sim::formation::Formation;
 use crate::sim::formation::SHIP_DART;
 use crate::voronoi::Vec2;
@@ -147,6 +148,19 @@ pub struct Tuning {
     pub wreck_chance: f32,
     /// Shock added to a fleet per maintenance phase, × its shortage (0..1).
     pub shortage_shock: f32,
+    /// How many ships a flagship counts as, for everything (weight, cops,
+    /// stores, food, hull, rate of fire).
+    pub flagship_ships: f32,
+    /// Escorts a captain commands without penalty.
+    pub command: f32,
+    /// Shock per maintenance phase per 100% over command capacity.
+    pub over_shock: f32,
+    /// Shock when a fleet loses its flagship.
+    pub flag_shock: f32,
+    /// Chance a captain dies with their flagship.
+    pub captain_death: f32,
+    /// Seconds until a surviving captain has a new flagship at home.
+    pub captain_return: f32,
     /// Cops in a planet's rebellion model per ship nearby, divided by the
     /// planet's size (bigger populations need more ships).
     pub cops_per_ship: f32,
@@ -175,6 +189,12 @@ impl Default for Tuning {
             desert_chance: 0.25,
             wreck_chance: 0.3,
             shortage_shock: 0.4,
+            flagship_ships: 3.0,
+            command: 10.0,
+            over_shock: 0.3,
+            flag_shock: 0.4,
+            captain_death: 0.5,
+            captain_return: 60.0,
             cops_per_ship: 40.0,
             war_hardship: 0.3,
             revolt_share: 0.25,
@@ -278,8 +298,8 @@ pub struct Fleet {
     pub route: Vec<Vec2>,
     /// A convoy on its way to this fleet (by id) to join it.
     pub convoy: Option<u32>,
-    /// Fleets ordered together merge where they arrive: the group's lead.
-    pub rendezvous: Option<u32>,
+    /// The captain whose flagship leads it (by id). Only these move.
+    pub captain: Option<u32>,
     /// Supply ships only: held up at the edge of the other side's cells.
     pub waiting: bool,
     /// Combat ships.
@@ -301,8 +321,13 @@ pub struct Fleet {
 }
 
 impl Fleet {
+    /// Combat ships, the flagship counting as `flagship_ships`.
+    pub fn strength(&self, t: &Tuning) -> f32 {
+        self.ships as f32 + if self.captain.is_some() { t.flagship_ships - 1.0 } else { 0.0 }
+    }
+
     pub fn weight(&self, t: &Tuning) -> f32 {
-        self.ships as f32 * t.weight_per_ship
+        self.strength(t) * t.weight_per_ship
     }
 
     /// Has combat ships (a convoy of supply ships alone doesn't).
@@ -310,8 +335,13 @@ impl Fleet {
         self.ships > 0
     }
 
-    /// Blue and Red fleets, unless routed.
+    /// Blue and Red fleets with a captain, unless routed.
     pub fn controllable(&self) -> bool {
+        self.selectable() && self.captain.is_some()
+    }
+
+    /// Blue and Red ships the player can pick (garrisons included).
+    pub fn selectable(&self) -> bool {
         matches!(self.owner, Owner::Side(_)) && self.morale != Morale::Routed
     }
 }
@@ -348,6 +378,8 @@ pub struct Dominion {
     rng: ParkMiller,
     convoy_timer: f32,
     supply_timer: f32,
+    /// Every captain, dead or alive.
+    pub captains: Vec<Captain>,
     /// Each planet's people (rebellion model), stepped while Blue or Red own it.
     pub people: Vec<Rebellion>,
     pub rebellion: RebellionParams,
@@ -449,6 +481,7 @@ impl Dominion {
             rng: ParkMiller::new(cfg.seed as i64 * 7 + 3),
             convoy_timer: 0.0,
             supply_timer: 0.0,
+            captains: Vec::new(),
             people: (0..list_len).map(|i| Rebellion::new(cfg.seed as i64 * 31 + i as i64 + 101)).collect(),
             rebellion: RebellionParams::default(),
             revolts: [0; 2],
@@ -466,7 +499,9 @@ impl Dominion {
         let west = (0..d.planets.len()).min_by(|a, b| d.planets[*a].pos.x.total_cmp(&d.planets[*b].pos.x)).unwrap();
         let east = (0..d.planets.len()).filter(|i| *i != west).max_by(|a, b| d.planets[*a].pos.x.total_cmp(&d.planets[*b].pos.x)).unwrap();
         let scale = map_scale(cfg);
+        let mut names = ParkMiller::new(cfg.seed as i64 * 13 + 5);
         for (side, home) in [(0, west), (1, east)] {
+            let skills = draw_skills(&mut names, fleets.clamp(1, MAX_FLEETS_PER_SIDE));
             let p = &mut d.planets[home];
             p.owner = Owner::Side(side);
             p.home_of = Some(side);
@@ -487,6 +522,7 @@ impl Dominion {
                 let out = (45.0 + 20.0 * (k / roads.len()) as f32) * scale;
                 let pos = at + dir * out.min(at.distance(to) * 0.5);
                 let id = d.spawn(Owner::Side(side), pos, dir.to_angle(), START_SHIPS, None);
+                d.add_captain_named(id, skills[k], &mut names);
                 let e = d.fleets.iter().find(|f| f.id == id).unwrap().division;
                 let load = d.tuning.supply_load / 3.0;
                 let at = pos / d.unit();
@@ -522,18 +558,25 @@ impl Dominion {
     /// radius × cops per ship ÷ size.
     pub fn cops_for(&self, i: usize) -> usize {
         let p = &self.planets[i];
-        ((self.police_ships(i) as f32 * self.tuning.cops_per_ship / p.value.max(1) as f32).round() as usize).min(MAX_COPS)
+        ((self.police_strength(i, true) * self.tuning.cops_per_ship / p.value.max(1) as f32).round() as usize).min(MAX_COPS)
     }
 
-    /// The owner's combat ships policing planet `i` (within the police radius).
-    pub fn police_ships(&self, i: usize) -> u32 {
+    /// The owner's ships policing planet `i` (within the police radius),
+    /// flagships counting as `flagship_ships`; with `governors`, ships of a
+    /// Governor's fleet count double.
+    pub fn police_strength(&self, i: usize, governors: bool) -> f32 {
         let p = &self.planets[i];
         let police = self.police_radius();
         self.fleets
             .iter()
             .filter(|f| f.owner == p.owner && f.morale != Morale::Routed && f.pos.distance(p.pos) <= police)
-            .map(|f| f.ships)
+            .map(|f| f.strength(&self.tuning) * if governors && self.has_skill(f, Skill::Governor) { 2.0 } else { 1.0 })
             .sum()
+    }
+
+    /// `police_strength` without skills, in whole ships (rounded down).
+    pub fn police_ships(&self, i: usize) -> u32 {
+        (self.police_strength(i, false) + 1e-3) as u32
     }
 
     /// Ships planet `i` needs nearby to keep its people calm: for Blue's
@@ -607,7 +650,7 @@ impl Dominion {
             dest: None,
             route: Vec::new(),
             convoy: None,
-            rendezvous: None,
+            captain: None,
             waiting: false,
             ships,
             supply: 0,
@@ -750,7 +793,6 @@ impl Dominion {
         let Some(i) = self.fleet_index(id).filter(|i| self.fleets[*i].controllable()) else { return false };
         self.fleets[i].home = None;
         self.fleets[i].convoy = None;
-        self.fleets[i].rendezvous = None;
         self.fleets[i].waiting = false;
         self.route_to(i, to)
     }
@@ -816,7 +858,7 @@ impl Dominion {
     pub fn ships_in_box(&self, a: Vec2, b: Vec2) -> Vec<Entity> {
         let (lo, hi) = (a.min(b), a.max(b));
         let mut found: [Vec<Entity>; 2] = [Vec::new(), Vec::new()];
-        for f in self.fleets.iter().filter(|f| f.controllable()) {
+        for f in self.fleets.iter().filter(|f| f.selectable()) {
             let side = f.owner.side();
             for (p, e) in f.ship_px.iter().zip(&f.ship_ids) {
                 if p.0.cmpge(lo).all() && p.0.cmple(hi).all() {
@@ -833,98 +875,231 @@ impl Dominion {
         self.fleets.iter().filter(|f| !f.ship_ids.is_empty() && f.ship_ids.iter().all(|e| ships.contains(e))).map(|f| f.id).collect()
     }
 
-    /// Right-click with `ships` selected: they go to `to` along the
-    /// highways. A wholly selected fleet goes as it is; part of a fleet
-    /// splits off as a new one. Several groups each take their own
-    /// shortest route and merge where they arrive (into the biggest). Only
-    /// one owner's controllable ships count. Returns the lead fleet.
+    /// Right-click with `ships` selected. Only captains move: each
+    /// selected captain's fleet goes to `to` along the highways (captains
+    /// never merge). Its unselected combat ships split off and stay; its
+    /// supply ships always go with it. Selected ships without a captain
+    /// join the nearest selected captain within the police radius (that
+    /// is how captains pick up garrisons); the rest stay. A selected part
+    /// of a captain's fleet without the flagship splits off and stays.
+    /// Returns the strongest moving fleet.
     pub fn form_fleet(&mut self, ships: &[Entity], to: Vec2) -> Option<u32> {
         let mut picked: Vec<(Entity, Owner, u32)> = ships
             .iter()
-            .filter_map(|e| self.fleet_of_ship(*e).filter(|f| f.controllable()).map(|f| (*e, f.owner, f.id)))
+            .filter_map(|e| self.fleet_of_ship(*e).filter(|f| f.selectable()).map(|f| (*e, f.owner, f.id)))
             .collect();
         let owner = picked.first()?.1;
         picked.retain(|p| p.1 == owner);
         let mut sources: Vec<u32> = picked.iter().map(|p| p.2).collect();
         sources.sort();
         sources.dedup();
+        let flag_of = |d: &Self, id: u32| d.fleet(id).and_then(|f| f.captain).and_then(|c| d.captain(c)).and_then(|c| c.flagship);
+        // Captains first.
         let mut movers: Vec<u32> = Vec::new();
-        for src in sources {
+        for &src in &sources {
+            let Some(flag) = flag_of(self, src) else { continue };
             let mine: Vec<Entity> = picked.iter().filter(|p| p.2 == src).map(|p| p.0).collect();
             let f = self.fleet(src)?;
-            if mine.len() == f.ship_ids.len() {
+            if mine.contains(&flag) {
+                let rest: Vec<Entity> =
+                    f.ship_ids.iter().zip(&f.is_supply).filter(|(e, s)| !**s && !mine.contains(e)).map(|(e, _)| *e).collect();
+                self.split_off(&rest);
                 movers.push(src);
+            } else {
+                self.split_off(&mine);
+            }
+        }
+        // Then ships without a captain: to the nearest moving captain.
+        let reach = self.police_radius();
+        for &src in &sources {
+            if flag_of(self, src).is_some() {
                 continue;
             }
-            // Split off where the ships are, facing like their fleet.
-            let (facing, formation) = (f.facing, f.formation);
-            let unit = self.unit();
-            let centre = self
-                .world
-                .query::<(Entity, &Pos)>()
-                .iter(&self.world)
-                .filter(|(e, _)| mine.contains(e))
-                .map(|(_, p)| p.0 * unit)
-                .sum::<Vec2>()
-                / mine.len() as f32;
-            let id = self.spawn(owner, centre, facing, 0, None);
-            let e = self.fleets.last().unwrap().division;
-            crate::sim::set_formation(&mut self.world, e, formation);
-            crate::sim::transfer_ships(&mut self.world, &mine, e);
-            movers.push(id);
-        }
-        self.sync();
-        movers.retain(|id| self.fleet(*id).is_some());
-        let lead = *movers.iter().max_by_key(|id| (self.fleet(**id).map_or(0, |f| f.ships), std::cmp::Reverse(**id)))?;
-        for &id in &movers {
-            self.order_move(id, to);
-            if movers.len() > 1
-                && let Some(i) = self.fleet_index(id)
-            {
-                self.fleets[i].rendezvous = Some(lead);
+            let mine: Vec<Entity> = picked.iter().filter(|p| p.2 == src).map(|p| p.0).collect();
+            let Some(f) = self.fleet(src) else { continue };
+            let at = f.pos;
+            let best = movers
+                .iter()
+                .filter_map(|id| self.fleet(*id).map(|g| (g.division, g.pos.distance(at))))
+                .filter(|(_, dist)| *dist <= reach)
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some((division, _)) = best {
+                crate::sim::transfer_ships(&mut self.world, &mine, division);
             }
         }
-        Some(lead)
+        self.sync();
+        for &id in &movers {
+            self.order_move(id, to);
+        }
+        let t = self.tuning;
+        movers.into_iter().filter_map(|id| self.fleet(id)).max_by(|a, b| a.strength(&t).total_cmp(&b.strength(&t))).map(|f| f.id)
     }
 
-    /// Fleets of one rendezvous that have arrived and are within gun range
-    /// of each other merge into the biggest; once none is under way, the
-    /// rendezvous is over.
-    fn merge_arrivals(&mut self) {
-        let mut keys: Vec<u32> = self.fleets.iter().filter_map(|f| f.rendezvous).collect();
-        if keys.is_empty() {
-            return;
+    /// These ships (all of one fleet) become a new fleet where they are,
+    /// holding; nothing when empty.
+    fn split_off(&mut self, ships: &[Entity]) {
+        let Some(f) = ships.first().and_then(|e| self.fleet_of_ship(*e)) else { return };
+        let (owner, facing, formation) = (f.owner, f.facing, f.formation);
+        let unit = self.unit();
+        let centre = self
+            .world
+            .query::<(Entity, &Pos)>()
+            .iter(&self.world)
+            .filter(|(e, _)| ships.contains(e))
+            .map(|(_, p)| p.0 * unit)
+            .sum::<Vec2>()
+            / ships.len() as f32;
+        self.spawn(owner, centre, facing, 0, None);
+        let e = self.fleets.last().unwrap().division;
+        crate::sim::set_formation(&mut self.world, e, formation);
+        crate::sim::transfer_ships(&mut self.world, ships, e);
+        self.sync();
+    }
+
+    pub fn captain(&self, id: u32) -> Option<&Captain> {
+        self.captains.iter().find(|c| c.id == id)
+    }
+
+    /// The skill of a fleet's captain.
+    pub fn skill(&self, f: &Fleet) -> Option<Skill> {
+        f.captain.and_then(|c| self.captain(c)).map(|c| c.skill)
+    }
+
+    pub fn has_skill(&self, f: &Fleet, skill: Skill) -> bool {
+        self.skill(f) == Some(skill)
+    }
+
+    /// Escorts a fleet's captain commands without penalty.
+    pub fn capacity(&self, f: &Fleet) -> f32 {
+        self.tuning.command * if self.has_skill(f, Skill::Commander) { 1.5 } else { 1.0 }
+    }
+
+    /// A fleet's combat ships besides its flagship.
+    pub fn escorts(&self, f: &Fleet) -> u32 {
+        f.ships.saturating_sub(u32::from(f.captain.is_some()))
+    }
+
+    /// A new captain with `skill` takes command of fleet `id` on a new
+    /// flagship; returns the captain's id.
+    pub fn add_captain(&mut self, id: u32, skill: Skill) -> Option<u32> {
+        let mut names = ParkMiller::new(self.cfg.seed as i64 * 17 + self.captains.len() as i64 * 7 + 1);
+        self.add_captain_named(id, skill, &mut names)
+    }
+
+    fn add_captain_named(&mut self, id: u32, skill: Skill, names: &mut ParkMiller) -> Option<u32> {
+        let side = match self.fleet(id)?.owner {
+            Owner::Side(s) => s,
+            Owner::Independent(_) => return None,
+        };
+        let taken: Vec<String> = self.captains.iter().map(|c| c.name.clone()).collect();
+        let cid = self.captains.len() as u32 + 1;
+        self.captains.push(Captain { id: cid, name: draw_name(names, &taken), side, skill, flagship: None, alive: true, back_in: 0.0 });
+        let fi = self.fleet_index(id)?;
+        self.make_flagship(fi, cid);
+        Some(cid)
+    }
+
+    /// A new flagship for captain `cid` in fleet `fi`.
+    fn make_flagship(&mut self, fi: usize, cid: u32) {
+        let unit = self.unit();
+        let (division, at) = (self.fleets[fi].division, self.fleets[fi].pos / unit);
+        let Some(e) = crate::sim::add_ship(&mut self.world, division, at) else { return };
+        let k = self.tuning.flagship_ships.max(1.0);
+        let hull = self.battle.hull * k;
+        self.world.entity_mut(e).insert((Flagship(cid), Ship { hull, max_hull: hull }, Stores(SHIP_CAP.map(|v| v * k))));
+        if let Some(c) = self.captains.iter_mut().find(|c| c.id == cid) {
+            c.flagship = Some(e);
+            c.back_in = 0.0;
         }
-        keys.sort();
-        keys.dedup();
-        let reach = self.range();
-        let mut merged = false;
-        for key in keys {
-            let here: Vec<usize> = (0..self.fleets.len())
-                .filter(|i| {
-                    let f = &self.fleets[*i];
-                    f.rendezvous == Some(key) && f.route.is_empty() && f.morale != Morale::Routed
-                })
-                .collect();
-            if let Some(&big) = here.iter().max_by_key(|i| (self.fleets[**i].ships, std::cmp::Reverse(self.fleets[**i].id))) {
-                let (into, at) = (self.fleets[big].division, self.fleets[big].pos);
-                for &i in &here {
-                    if i != big && self.fleets[i].pos.distance(at) <= reach {
-                        let ships = self.fleets[i].ship_ids.clone();
-                        crate::sim::transfer_ships(&mut self.world, &ships, into);
-                        merged = true;
+        self.fleets[fi].captain = Some(cid);
+        self.sync();
+    }
+
+    /// Captains follow their flagships between fleets; a captain whose
+    /// flagship is gone loses the fleet (shaken, it becomes a garrison
+    /// group), and dies or gets a new flagship later.
+    fn track_captains(&mut self) {
+        let t = self.tuning;
+        for ci in 0..self.captains.len() {
+            let c = &self.captains[ci];
+            let (cid, flag) = (c.id, c.flagship);
+            if !c.alive {
+                continue;
+            }
+            let holder = flag.and_then(|e| self.fleets.iter().position(|f| f.ship_ids.contains(&e)));
+            let had: Vec<usize> = (0..self.fleets.len()).filter(|i| self.fleets[*i].captain == Some(cid) && Some(*i) != holder).collect();
+            for &i in &had {
+                let f = &mut self.fleets[i];
+                f.captain = None;
+                f.route.clear();
+                f.dest = None;
+                let (e, inspiring) = (f.division, self.captains[ci].skill == Skill::Inspiring);
+                if let Some(mut d) = self.world.get_mut::<Division>(e) {
+                    d.flagship = false;
+                    d.pace = 1.0;
+                    if d.morale != Morale::Routed {
+                        d.order = Order::Hold;
+                    }
+                    if holder.is_none() {
+                        d.shock += t.flag_shock * if inspiring { 0.5 } else { 1.0 };
                     }
                 }
             }
-            let under_way = self.fleets.iter().any(|f| f.rendezvous == Some(key) && !f.route.is_empty() && f.morale != Morale::Routed);
-            if !under_way && here.len() <= 1 {
-                for f in self.fleets.iter_mut().filter(|f| f.rendezvous == Some(key)) {
-                    f.rendezvous = None;
+            if let Some(h) = holder {
+                self.fleets[h].captain = Some(cid);
+                if let Some(mut d) = self.world.get_mut::<Division>(self.fleets[h].division) {
+                    d.flagship = true;
+                }
+            } else if flag.is_some() {
+                // The flagship is gone.
+                let survivor = self.captains[ci].skill == Skill::Survivor;
+                let death = t.captain_death * if survivor { 0.5 } else { 1.0 };
+                let c = &mut self.captains[ci];
+                c.flagship = None;
+                if self.rng.next_float() < death {
+                    c.alive = false;
+                } else {
+                    c.back_in = t.captain_return;
                 }
             }
         }
-        if merged {
-            self.sync();
+    }
+
+    /// Surviving captains without a flagship get a new one at their home
+    /// planet (or their side's nearest planet) when their time comes,
+    /// taking command of the ships waiting there.
+    fn return_captains(&mut self, dt: f32) {
+        for ci in 0..self.captains.len() {
+            let c = &self.captains[ci];
+            if !c.alive || c.flagship.is_some() {
+                continue;
+            }
+            let (cid, side) = (c.id, c.side);
+            self.captains[ci].back_in -= dt;
+            if self.captains[ci].back_in > 0.0 {
+                continue;
+            }
+            let owner = Owner::Side(side);
+            let home = (0..self.planets.len())
+                .find(|i| self.planets[*i].owner == owner && self.planets[*i].home_of == Some(side))
+                .or_else(|| (0..self.planets.len()).find(|i| self.planets[*i].owner == owner));
+            let Some(pi) = home else { continue };
+            let pos = self.planets[pi].pos;
+            let r = self.capture_radius();
+            let waiting = (0..self.fleets.len())
+                .filter(|i| {
+                    let f = &self.fleets[*i];
+                    f.owner == owner && f.captain.is_none() && f.armed() && f.route.is_empty() && f.pos.distance(pos) <= r
+                })
+                .max_by_key(|i| self.fleets[*i].ships);
+            let fi = match waiting {
+                Some(fi) => fi,
+                None => {
+                    self.spawn(owner, pos, 0.0, 0, None);
+                    self.fleets.len() - 1
+                }
+            };
+            self.make_flagship(fi, cid);
         }
     }
 
@@ -1011,7 +1186,7 @@ impl Dominion {
             }
         }
         self.sync();
-        self.merge_arrivals();
+        self.return_captains(DT);
         self.capture(DT);
         self.unrest(DT);
         self.run_convoys(DT);
@@ -1038,11 +1213,27 @@ impl Dominion {
         }
     }
 
-    /// The shooter spends a round.
+    /// The shooter spends a round (a Sharpshooter's ships half). A
+    /// flagship reloads `flagship_ships` times as fast, and a Gunner's
+    /// ships 25% faster.
     fn spend_ammo(&mut self, shooter: Entity) {
-        let per_shot = self.tuning.ammo_per_shot;
+        let skill = self
+            .world
+            .get::<InDivision>(shooter)
+            .and_then(|d| self.fleets.iter().find(|f| f.division == d.0))
+            .and_then(|f| self.skill(f));
+        let per_shot = self.tuning.ammo_per_shot * if skill == Some(Skill::Sharpshooter) { 0.5 } else { 1.0 };
         if let Some(mut s) = self.world.get_mut::<Stores>(shooter) {
             s.0[AMMO] = (s.0[AMMO] - per_shot).max(0.0);
+        }
+        let mut faster = if skill == Some(Skill::Gunner) { 1.25 } else { 1.0 };
+        if self.world.get::<Flagship>(shooter).is_some() {
+            faster *= self.tuning.flagship_ships.max(1.0);
+        }
+        if faster != 1.0
+            && let Some(mut w) = self.world.get_mut::<Weapon>(shooter)
+        {
+            w.cooldown /= faster;
         }
     }
 
@@ -1078,24 +1269,38 @@ impl Dominion {
         for fi in 0..self.fleets.len() {
             let f = &self.fleets[fi];
             let (owner, division, engaged) = (f.owner, f.division, f.engaged);
-            let mut combat: Vec<(Entity, Stock, f32, f32, Vec2)> = Vec::new();
+            let skill = self.skill(f);
+            let flag_k = t.flagship_ships.max(1.0);
+            // (ship, stores, hull, max hull, where, share: a flagship's is
+            // `flagship_ships`)
+            let mut combat: Vec<(Entity, Stock, f32, f32, Vec2, f32)> = Vec::new();
             let mut supply: Vec<(Entity, Stock)> = Vec::new();
             for (k, e) in f.ship_ids.iter().enumerate() {
                 if let Some(c) = self.world.get::<Supply>(*e) {
                     supply.push((*e, c.0));
                 } else if let (Some(st), Some(sh)) = (self.world.get::<Stores>(*e), self.world.get::<Ship>(*e)) {
-                    combat.push((*e, st.0, sh.hull, sh.max_hull, f.ship_px[k].0));
+                    let share = if self.world.get::<Flagship>(*e).is_some() { flag_k } else { 1.0 };
+                    combat.push((*e, st.0, sh.hull, sh.max_hull, f.ship_px[k].0, share));
                 }
             }
             let n = combat.len();
             if n == 0 {
                 continue;
             }
+            let shares: f32 = combat.iter().map(|c| c.5).sum();
             let mut pool: Stock = [0.0; 3];
             for c in &combat {
                 (0..3).for_each(|k| pool[k] += c.1[k]);
             }
-            let cap: Stock = std::array::from_fn(|k| SHIP_CAP[k] * n as f32);
+            let cap: Stock = std::array::from_fn(|k| SHIP_CAP[k] * shares);
+            // Over command capacity: shock, and the fleet slows.
+            let over = if f.captain.is_some() { (self.escorts(f) as f32 / self.capacity(f).max(1.0) - 1.0).max(0.0) } else { 0.0 };
+            let calm = if skill == Some(Skill::Inspiring) { 0.5 } else { 1.0 };
+            let pace = if skill == Some(Skill::Navigator) { 1.25 } else { 1.0 } / (1.0 + over);
+            if let Some(mut d) = self.world.get_mut::<Division>(division) {
+                d.pace = pace;
+                d.shock += over * t.over_shock * calm;
+            }
             // At home: the planet's stock.
             if let Some(pi) = self.friendly_planet(owner, f.pos) {
                 let stock = &mut self.planets[pi].stock;
@@ -1120,37 +1325,43 @@ impl Dominion {
                 }
             }
             // Eat.
-            let need = n as f32 * t.food_per_phase;
+            let need = shares * t.food_per_phase * if skill == Some(Skill::Quartermaster) { 0.7 } else { 1.0 };
             let hungry = if need > 0.0 { (1.0 - pool[FOOD] / need).clamp(0.0, 1.0) } else { 0.0 };
             pool[FOOD] = (pool[FOOD] - need).max(0.0);
             // Repair out of combat, as far as parts go.
             let missing: f32 = combat.iter().map(|c| (c.3 - c.2).max(0.0)).sum();
             let mut fixed = 0.0;
-            if !engaged && missing > 0.0 && t.hull_per_part > 0.0 {
-                fixed = missing.min(pool[PARTS] * t.hull_per_part);
-                pool[PARTS] -= fixed / t.hull_per_part;
+            let per_part = t.hull_per_part * if skill == Some(Skill::Engineer) { 2.0 } else { 1.0 };
+            if !engaged && missing > 0.0 && per_part > 0.0 {
+                fixed = missing.min(pool[PARTS] * per_part);
+                pool[PARTS] -= fixed / per_part;
             }
             let share = if missing > 0.0 { fixed / missing } else { 0.0 };
             let no_parts = pool[PARTS] < 0.01;
-            let each: Stock = std::array::from_fn(|k| pool[k] / n as f32);
+            let each: Stock = std::array::from_fn(|k| pool[k] / shares);
+            let desert = t.desert_chance * if skill == Some(Skill::Quartermaster) { 0.5 } else { 1.0 };
+            let wreck = t.wreck_chance * if skill == Some(Skill::Engineer) { 0.5 } else { 1.0 };
             let mut gone: Vec<Entity> = Vec::new();
             let mut booms: Vec<Vec2> = Vec::new();
             let mut damaged_short = 0;
-            for (e, _, hull, max, pos) in &combat {
+            for (e, _, hull, max, pos, ship_share) in &combat {
                 let hull = (*hull + (*max - *hull).max(0.0) * share).min(*max);
                 if let Some(mut sh) = self.world.get_mut::<Ship>(*e) {
                     sh.hull = hull;
                 }
                 if let Some(mut st) = self.world.get_mut::<Stores>(*e) {
-                    st.0 = each;
+                    st.0 = each.map(|v| v * ship_share);
                 }
-                if hungry > 0.0 && self.rng.next_float() < hungry * t.desert_chance {
+                // The flagship never deserts nor breaks up for want of
+                // supplies: its captain sees to that.
+                let flagship = *ship_share > 1.0 || self.world.get::<Flagship>(*e).is_some();
+                if hungry > 0.0 && !flagship && self.rng.next_float() < hungry * desert {
                     gone.push(*e);
                     continue;
                 }
                 if hull < *max - 1e-3 && no_parts {
                     damaged_short += 1;
-                    if self.rng.next_float() < (1.0 - hull / max) * t.wreck_chance {
+                    if !flagship && self.rng.next_float() < (1.0 - hull / max) * wreck {
                         gone.push(*e);
                         booms.push(*pos);
                     }
@@ -1162,7 +1373,7 @@ impl Dominion {
             if shortage > 0.0
                 && let Some(mut d) = self.world.get_mut::<Division>(division)
             {
-                d.shock += shortage * t.shortage_shock;
+                d.shock += shortage * t.shortage_shock * calm;
             }
             if let Owner::Side(s) = owner {
                 self.deserted[s] += gone.len() as u32;
@@ -1212,18 +1423,20 @@ impl Dominion {
                     }
                     let (stores, cargo) = self.fleet_stores(f);
                     let inc = incoming.get(&f.id).map_or(0.0, |s| s[kind]);
-                    let cap = SHIP_CAP[kind] * f.ships as f32;
+                    let cap = SHIP_CAP[kind] * f.strength(&t);
                     let have = stores[kind] + cargo[kind] + inc;
                     if have >= cap * NEED_SHARE {
                         continue;
                     }
-                    let dist = self.road_distance(p.pos, f.pos);
+                    // A Logistician's fleet is served first (counts as half as far).
+                    let dist = self.road_distance(p.pos, f.pos) * if self.has_skill(f, Skill::Logistician) { 0.5 } else { 1.0 };
                     if best.is_none_or(|b| dist < b.0) {
                         best = Some((dist, f.id, cap - have));
                     }
                 }
                 let Some((_, target, short)) = best else { continue };
-                let amount = self.planets[pi].stock[kind].min(t.supply_load).min(short.max(t.supply_load * 0.5));
+                let load = t.supply_load * if self.fleet(target).is_some_and(|f| self.has_skill(f, Skill::Logistician)) { 1.5 } else { 1.0 };
+                let amount = self.planets[pi].stock[kind].min(load).min(short.max(load * 0.5));
                 self.planets[pi].stock[kind] -= amount;
                 let mut cargo = [0.0; 3];
                 cargo[kind] = amount;
@@ -1433,6 +1646,7 @@ impl Dominion {
                 self.world.despawn(e);
             }
         }
+        self.track_captains();
     }
 
     /// Fleets that aren't moving turn to face the nearest enemy close by.
@@ -1479,7 +1693,18 @@ impl Dominion {
                 }
                 self.planets[i].stock[PARTS] -= cost;
                 self.planets[i].build -= 1.0;
-                match self.fleets.iter().position(|f| f.home == Some(i) && f.owner == owner) {
+                // Into the ships already there: its garrison, or else the
+                // biggest of its owner's fleets resting at the planet.
+                let r = self.capture_radius();
+                let here = self.fleets.iter().position(|f| f.home == Some(i) && f.owner == owner).or_else(|| {
+                    (0..self.fleets.len())
+                        .filter(|g| {
+                            let f = &self.fleets[*g];
+                            f.owner == owner && f.armed() && f.route.is_empty() && f.morale != Morale::Routed && f.pos.distance(pos) <= r
+                        })
+                        .max_by_key(|g| self.fleets[*g].ships)
+                });
+                match here {
                     Some(g) => {
                         let e = self.fleets[g].division;
                         crate::sim::add_ships(&mut self.world, e, 1);
@@ -1516,13 +1741,19 @@ impl Dominion {
                 Some((o, t)) if o == by => t + dt,
                 _ => dt,
             };
-            if held >= HOLD_SECS - 1e-4 {
+            // A Conqueror takes it twice as fast, and is resented half as much.
+            let conqueror = self
+                .fleets
+                .iter()
+                .any(|f| f.owner == by && f.armed() && f.pos.distance(pos) <= r && self.has_skill(f, Skill::Conqueror));
+            let k = if conqueror { 0.5 } else { 1.0 };
+            if held >= HOLD_SECS * k - 1e-4 {
                 let p = &mut self.planets[i];
                 p.owner = by;
                 p.build = 0.0;
                 p.hold = None;
                 // A fresh conquest is resented.
-                p.occupation = OCCUPATION_PENALTY;
+                p.occupation = OCCUPATION_PENALTY * k;
                 p.unrest = 0.0;
                 for f in &mut self.fleets {
                     if f.home == Some(i) {
@@ -1763,26 +1994,56 @@ fn draw_icons(c: &mut Canvas, p: &Planet, at: Vec2, r: f32) {
     }
 }
 
-/// 3×5 pixel glyphs: digits, then '!'.
-const GLYPHS: [[u8; 5]; 11] = [
-    [0b111, 0b101, 0b101, 0b101, 0b111],
-    [0b010, 0b110, 0b010, 0b010, 0b111],
-    [0b111, 0b001, 0b111, 0b100, 0b111],
-    [0b111, 0b001, 0b111, 0b001, 0b111],
-    [0b101, 0b101, 0b111, 0b001, 0b001],
-    [0b111, 0b100, 0b111, 0b001, 0b111],
-    [0b111, 0b100, 0b111, 0b101, 0b111],
-    [0b111, 0b001, 0b010, 0b010, 0b010],
-    [0b111, 0b101, 0b111, 0b101, 0b111],
-    [0b111, 0b101, 0b111, 0b001, 0b111],
-    [0b010, 0b010, 0b010, 0b000, 0b010],
-];
+/// A 3×5 pixel glyph: digits, capitals, '!' and '/'.
+fn glyph(ch: char) -> Option<[u8; 5]> {
+    Some(match ch.to_ascii_uppercase() {
+        'A' => [0b010, 0b101, 0b111, 0b101, 0b101],
+        'B' => [0b110, 0b101, 0b110, 0b101, 0b110],
+        'C' => [0b011, 0b100, 0b100, 0b100, 0b011],
+        'D' => [0b110, 0b101, 0b101, 0b101, 0b110],
+        'E' => [0b111, 0b100, 0b110, 0b100, 0b111],
+        'F' => [0b111, 0b100, 0b110, 0b100, 0b100],
+        'G' => [0b011, 0b100, 0b101, 0b101, 0b011],
+        'H' => [0b101, 0b101, 0b111, 0b101, 0b101],
+        'I' => [0b111, 0b010, 0b010, 0b010, 0b111],
+        'J' => [0b001, 0b001, 0b001, 0b101, 0b010],
+        'K' => [0b101, 0b101, 0b110, 0b101, 0b101],
+        'L' => [0b100, 0b100, 0b100, 0b100, 0b111],
+        'M' => [0b101, 0b111, 0b111, 0b101, 0b101],
+        'N' => [0b110, 0b101, 0b101, 0b101, 0b101],
+        'O' => [0b010, 0b101, 0b101, 0b101, 0b010],
+        'P' => [0b110, 0b101, 0b110, 0b100, 0b100],
+        'Q' => [0b010, 0b101, 0b101, 0b110, 0b011],
+        'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
+        'S' => [0b011, 0b100, 0b010, 0b001, 0b110],
+        'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
+        'U' => [0b101, 0b101, 0b101, 0b101, 0b111],
+        'V' => [0b101, 0b101, 0b101, 0b101, 0b010],
+        'W' => [0b101, 0b101, 0b111, 0b111, 0b101],
+        'X' => [0b101, 0b101, 0b010, 0b101, 0b101],
+        'Y' => [0b101, 0b101, 0b010, 0b010, 0b010],
+        'Z' => [0b111, 0b001, 0b010, 0b100, 0b111],
+        '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
+        '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
+        '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
+        '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
+        '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
+        '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
+        '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
+        '7' => [0b111, 0b001, 0b010, 0b010, 0b010],
+        '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
+        '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
+        '!' => [0b010, 0b010, 0b010, 0b000, 0b010],
+        '/' => [0b001, 0b001, 0b010, 0b100, 0b100],
+        _ => return None,
+    })
+}
 
-/// Draws digits (and '!') centred on `at`, 2 px a dot, ink-outlined.
-fn draw_number(c: &mut Canvas, at: Vec2, text: &str, col: Rgb) {
+/// Draws text (digits, capitals, '!', '/') centred on `at`, 2 px a dot,
+/// ink-outlined.
+fn draw_text(c: &mut Canvas, at: Vec2, text: &str, col: Rgb) {
     let px = 2i32;
-    let glyphs: Vec<&[u8; 5]> =
-        text.chars().filter_map(|ch| if ch == '!' { Some(&GLYPHS[10]) } else { ch.to_digit(10).map(|d| &GLYPHS[d as usize]) }).collect();
+    let glyphs: Vec<[u8; 5]> = text.chars().filter_map(glyph).collect();
     let w = glyphs.len() as i32 * 4 * px - px;
     let (x0, y0) = (at.x as i32 - w / 2, at.y as i32 - 5 * px / 2);
     for pass in 0..2 {
@@ -1793,17 +2054,10 @@ fn draw_number(c: &mut Canvas, at: Vec2, text: &str, col: Rgb) {
                         continue;
                     }
                     let (x, y) = (x0 + (g as i32 * 4 + bit) * px, y0 + row as i32 * px);
-                    if pass == 0 {
-                        for oy in -1..=px {
-                            for ox in -1..=px {
-                                c.set(x + ox, y + oy, INK);
-                            }
-                        }
-                    } else {
-                        for oy in 0..px {
-                            for ox in 0..px {
-                                c.set(x + ox, y + oy, col);
-                            }
+                    let (lo, hi, ink) = if pass == 0 { (-1, px, INK) } else { (0, px - 1, col) };
+                    for oy in lo..=hi {
+                        for ox in lo..=hi {
+                            c.set(x + ox, y + oy, ink);
                         }
                     }
                 }
@@ -2038,16 +2292,21 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
             c.circle(at, r + 2.5, owner_color(p.owner), 1.0);
         }
         draw_icons(&mut c, p, at, r);
-        // Ships needed to keep its people calm: green when that many are
-        // there, red when not, grey for what a conqueror would need.
-        if !p.loyal() {
-            let (text, col) = match d.ships_needed(i) {
-                None => ("!".to_string(), UNREST_HIGH),
-                Some(n) if p.restless() => (n.to_string(), if d.police_ships(i) >= n { CALM } else { UNREST_HIGH }),
-                Some(n) => (n.to_string(), [170, 170, 180]),
-            };
-            draw_number(&mut c, at + Vec2::new(0.0, r + 9.0), &text, col);
-        }
+        // Garrison: ships there / ships needed to keep its people calm.
+        // Green when met, red when not, grey for an independent (what a
+        // conqueror would need); "!" when no garrison is enough. Loyal
+        // home planets show the ships there only.
+        let there = d.police_ships(i);
+        let (text, col) = if p.loyal() {
+            (there.to_string(), owner_color(p.owner))
+        } else {
+            match d.ships_needed(i) {
+                None => (format!("{there}/!"), UNREST_HIGH),
+                Some(n) if p.restless() => (format!("{there}/{n}"), if there >= n { CALM } else { UNREST_HIGH }),
+                Some(n) => (format!("{there}/{n}"), [170, 170, 180]),
+            }
+        };
+        draw_text(&mut c, at + Vec2::new(0.0, r + 9.0), &text, col);
     }
     if let Some(p) = opts.planet.and_then(|i| d.planets.get(i)) {
         let at = view.to_screen(p.pos);
@@ -2090,7 +2349,6 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
             c.circle(centre, r, GOLD, 1.0);
             c.circle(centre, r + 1.0, GOLD, 1.0);
         }
-        let flag = (0..ships.len()).min_by(|a, b| ships[*a].0.distance(centre).total_cmp(&ships[*b].0.distance(centre)));
         let tone = match f.morale {
             Morale::Steady => mix(tones[i], WHITE, 0.25),
             Morale::Shaken => SHAKEN,
@@ -2113,15 +2371,25 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
                 draw_icon(&mut c, supply_kind(&cargo), *s, (r * 0.6).max(2.0));
                 continue;
             }
-            let col = if Some(k) == flag && f.controllable() { WHITE } else { tone };
+            // The flagship: bigger, white, with a gold dot.
+            let flagship = f.ship_ids.get(k).is_some_and(|e| d.world.get::<Flagship>(*e).is_some());
+            let (col, big) = if flagship { (WHITE, 1.6) } else { (tone, 1.0) };
             let facing = Vec2::from_angle(*heading);
-            let pts = |k: f32| -> Vec<Vec2> { SHIP_DART.iter().map(|p| *s + facing.rotate(*p * dart_scale * k)).collect() };
+            let pts = |k: f32| -> Vec<Vec2> { SHIP_DART.iter().map(|p| *s + facing.rotate(*p * dart_scale * k * big)).collect() };
             // Selected ships get a gold outline.
             if selected {
                 c.polygon_fill(&pts(2.0), GOLD, 1.0);
             }
             c.polygon_fill(&pts(1.45), INK, 1.0);
             c.polygon_fill(&pts(1.0), col, 1.0);
+            if flagship {
+                c.disc(*s, (dart_scale * 2.5).max(1.5), GOLD, 1.0);
+            }
+        }
+        // The captain's initial above the fleet.
+        if let Some(cap) = f.captain.and_then(|id| d.captain(id)) {
+            let top = ships.iter().zip(&f.is_supply).filter(|(_, s)| !**s).map(|(s, _)| s.0.y).fold(centre.y, f32::min);
+            draw_text(&mut c, Vec2::new(centre.x, top - 12.0), &cap.initial().to_string(), mix(tones[i], WHITE, 0.5));
         }
     }
     for (p, age) in &d.booms {
@@ -2187,6 +2455,22 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
         let transit = d.fleets.iter().filter(|f| f.owner == o && f.convoy.is_some()).count();
         let waiting = d.fleets.iter().filter(|f| f.owner == o && f.waiting).count();
         let waiting = if waiting > 0 { format!(" ({waiting} waiting at enemy lines)") } else { String::new() };
+        let captains: Vec<String> = d
+            .captains
+            .iter()
+            .filter(|c| c.side == side)
+            .map(|c| {
+                let state = if !c.alive {
+                    " †".to_string()
+                } else if c.flagship.is_none() {
+                    format!(" (back in {:.0} s)", c.back_in.max(0.0))
+                } else {
+                    String::new()
+                };
+                format!("{} {}{state}", c.name, c.skill.name())
+            })
+            .collect();
+        s.push_str(&format!("\n{name} captains: {}", if captains.is_empty() { "none".into() } else { captains.join(", ") }));
         s.push_str(&format!(
             "\n{name}: planets hold {} · make {}/s · {transit} supply ships under way{waiting}{gone}",
             stock_text(&d.stock_of(o)),
@@ -2245,7 +2529,17 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
             let f = &d.fleets[i];
             let who = match f.owner {
                 Owner::Side(side) if f.convoy.is_some() => format!("{} convoy", SIDE_NAMES[side]),
-                Owner::Side(side) => format!("{} fleet {}", SIDE_NAMES[side], d.fleet_number(i)),
+                Owner::Side(side) => match f.captain.and_then(|c| d.captain(c)) {
+                    Some(c) => format!(
+                        "{} — {} [{}], {}/{:.0} escorts",
+                        SIDE_NAMES[side],
+                        c.title(),
+                        c.skill.blurb(),
+                        d.escorts(f),
+                        d.capacity(f)
+                    ),
+                    None => format!("{} ships without a captain", SIDE_NAMES[side]),
+                },
                 Owner::Independent(_) => "Independent garrison".into(),
             };
             let order = if f.morale == Morale::Routed {
@@ -2270,16 +2564,22 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
             ));
             if f.morale == Morale::Routed {
                 s.push_str(" Routed: it no longer takes orders.");
-            } else if !f.controllable() {
+            } else if matches!(f.owner, Owner::Independent(_)) {
                 s.push_str(" Independents only defend.");
+            } else if !f.controllable() {
+                s.push_str(" No captain: it stays as a garrison. Select it with a captain's fleet nearby and right-click to have the captain take it along.");
             } else {
                 s.push_str(" Right-click the map to move it · keys 1–6 set its formation.");
             }
         }
         _ => {
             let n = selected.iter().filter(|e| d.fleet_of_ship(**e).is_some()).count();
-            let what = if from.len() == 1 { "split them off as a new fleet" } else { "form them into one fleet" };
-            s.push_str(&format!("\nSelected: {n} ships from {} fleets. Right-click the map to {what} and send it there.", from.len()));
+            let captains = from.iter().filter(|id| d.fleet(**id).is_some_and(|f| f.controllable())).count();
+            s.push_str(&format!(
+                "\nSelected: {n} ships from {} fleets, {captains} with a captain. Right-click: each captain goes there and takes along the \
+                 selected ships near it; the others stay.",
+                from.len()
+            ));
         }
     }
     s

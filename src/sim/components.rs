@@ -49,6 +49,11 @@ pub struct Weapon {
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Supply(pub [f32; 3]);
 
+/// A captain's flagship (prototype01), by captain id. Unlike
+/// [`FleetFlagship`], losing it shakes only its own fleet.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Flagship(pub u32);
+
 /// What a combat ship carries for itself (prototype01): ammo, food, parts.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct Stores(pub [f32; 3]);
@@ -134,6 +139,8 @@ pub struct Division {
     /// Roughly how close its nearest ship is to an enemy (from gun scans;
     /// drifts upward when nobody is in range).
     pub closest: f32,
+    /// Multiplies its speed (1.0 normally; prototype01's captains).
+    pub pace: f32,
 }
 
 impl Division {
