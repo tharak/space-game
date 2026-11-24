@@ -19,6 +19,7 @@ fn duel(a: (Owner, Vec2, f32, u32), b: (Owner, Vec2, f32, u32)) -> (Dominion, u3
     d.clear_fleets();
     for p in &mut d.planets {
         p.value = 0;
+        p.stock = [0.0; 3];
     }
     // Combat only: supplies never run out, captains command any number.
     d.tuning.ammo_per_shot = 0.0;
@@ -98,16 +99,19 @@ fn the_world_starts_with_home_planets_fleets_and_garrisons() {
             assert!(d.fleets.iter().any(|f| f.captain == Some(c.id) && f.controllable()));
         }
     }
-    assert_eq!(START_SHIPS, MAX_PLANET_SIZE);
+    assert_eq!(START_SHIPS, 0, "flagships start alone");
     assert_eq!(free, 10);
     // Every planet starts with as many ships as its size.
     for (i, p) in d.planets.iter().enumerate() {
         let g = d.fleets.iter().find(|f| f.home == Some(i)).expect("garrison");
         assert_eq!((g.owner, g.ships, g.supply), (p.owner, p.value, 0));
     }
-    // Start fleets carry a supply ship each, out on the highways.
+    // Start fleets: lone flagships at the home planet, on its highways.
     for f in d.fleets.iter().filter(|f| f.home.is_none()) {
-        assert_eq!((f.ships, f.supply), (START_SHIPS + 1, 3));
+        assert_eq!((f.ships, f.supply), (1, 0));
+        assert!(f.captain.is_some());
+        let home = d.planets.iter().find(|p| p.owner == f.owner).unwrap();
+        assert!(f.pos.distance(home.pos) <= d.capture_radius());
         let s = d.highways.snap(f.pos).unwrap();
         assert!(s.point.distance(f.pos) < 3.0, "{:?} is off the highways", f.pos);
     }
@@ -120,9 +124,10 @@ fn the_world_starts_with_home_planets_fleets_and_garrisons() {
 fn planets_build_ships_into_their_garrison() {
     let mut d = world();
     d.tuning.secs_per_ship = 6.0;
-    // Build mechanics only: no costs, no strikes.
+    // Build mechanics only: no costs, no strikes, no captain with room.
     d.rebellion.threshold = 2.0;
     d.tuning.ship_cost = 0.0;
+    d.tuning.command = 0.0;
     let home = d.planets.iter().position(|p| p.owner == BLUE).unwrap();
     d.planets[home].value = 2;
     let g = d.fleets.iter().find(|f| f.home == Some(home)).expect("a garrison");
@@ -133,8 +138,31 @@ fn planets_build_ships_into_their_garrison() {
     let g = d.fleet(id).unwrap();
     assert_eq!(g.ships, start + 8);
     assert_eq!(g.ship_px.len() as u32, start + 8);
-    // Without a captain it can't be ordered away.
-    assert!(!d.order_move(id, Vec2::new(360.0, 200.0)));
+    // Without a captain it can still be ordered away.
+    assert!(d.order_move(id, Vec2::new(360.0, 200.0)));
+}
+
+#[test]
+fn a_new_ship_goes_to_the_nearest_captain_with_room() {
+    let (mut d, home) = economy();
+    d.tuning.ship_cost = 0.0;
+    d.tuning.food_per_phase = 0.0;
+    d.tuning.command = 2.0;
+    let near_p = d.highways.neighbors[home][0];
+    let (a, b) = (d.planets[home].pos, d.planets[near_p].pos);
+    // A full captain close by, one with room further away.
+    let full = captained(&mut d, BLUE, a + (b - a) * 0.3, 0.0, 3);
+    let roomy = captained(&mut d, BLUE, a + (b - a) * 0.7, 0.0, 1);
+    d.step(0.6);
+    assert_eq!(ships(&d, full), 3);
+    let coming: Vec<&Fleet> = d.fleets.iter().filter(|f| f.joining == Some(roomy)).collect();
+    assert!(!coming.is_empty(), "a reinforcement is on its way");
+    // It travels there and joins; once both have no room, ships stay home.
+    d.step(20.0);
+    assert_eq!(ships(&d, roomy), 3);
+    assert!(!d.fleets.iter().any(|f| f.joining.is_some()));
+    let garrison = d.fleets.iter().find(|f| f.home == Some(home)).expect("the rest garrison the planet");
+    assert!(garrison.ships > 0);
 }
 
 #[test]
@@ -321,6 +349,9 @@ fn deterministic_and_renders() {
     let mut view = View::fit(&a.cfg, VIEW_W, VIEW_H);
     let bg = render_background(&a, &view, 1);
     let c = render(&a, &bg, &view, &DrawOptions::default());
+    // With a selection (its count is drawn above it).
+    let sel = DrawOptions { selected: a.fleets[0].ship_ids.clone(), ..Default::default() };
+    assert_eq!(render(&a, &bg, &view, &sel).px.len(), c.px.len());
     assert_eq!(render_background(&a, &view, 2).px.len(), bg.px.len());
     assert_eq!((c.w, c.h), (VIEW_W, VIEW_H));
     view.zoom_at(Vec2::new(700.0, 400.0), 4.0, &a.cfg);
@@ -564,7 +595,7 @@ fn a_fleet_in_need_gets_one_convoy_per_kind_that_joins_and_is_used_up() {
     set_stores(&mut d, id, [1.0, 1.0, 0.0]);
     d.step(MAINTENANCE_SECS + 0.05);
     assert_eq!(d.convoys_sent[0], 3);
-    let convoys: Vec<&Fleet> = d.fleets.iter().filter(|f| f.convoy == Some(id)).collect();
+    let convoys: Vec<&Fleet> = d.fleets.iter().filter(|f| f.joining == Some(id)).collect();
     assert_eq!(convoys.len(), 3);
     for c in &convoys {
         let (_, cargo) = d.fleet_stores(c);
@@ -576,12 +607,12 @@ fn a_fleet_in_need_gets_one_convoy_per_kind_that_joins_and_is_used_up() {
     for _ in 0..120 {
         d.step(0.05);
         seen = seen.max(d.fleet(id).unwrap().supply);
-        if !d.fleets.iter().any(|f| f.convoy == Some(id)) {
+        if !d.fleets.iter().any(|f| f.joining == Some(id)) {
             break;
         }
     }
     assert!(seen >= 1, "no convoy ever joined");
-    assert!(!d.fleets.iter().any(|f| f.convoy == Some(id)), "convoys still under way");
+    assert!(!d.fleets.iter().any(|f| f.joining == Some(id)), "convoys still under way");
     // Their cargo is used up by the next phase.
     d.step(MAINTENANCE_SECS + 0.05);
     let f = d.fleet(id).unwrap();
@@ -670,16 +701,17 @@ fn captains_travel_apart_and_never_merge() {
 }
 
 #[test]
-fn ships_without_a_captain_stay_unless_a_captain_takes_them() {
+fn ships_without_a_captain_move_or_join_a_captain_nearby() {
     let (mut d, home) = economy();
     d.tuning.food_per_phase = 0.0;
     d.tuning.ship_cost = 1e6;
     let at = d.planets[home].pos;
     let garrison = d.add_fleet(BLUE, at, 0.0, 6, Some(home));
-    assert!(!d.controllable_id(garrison));
-    // Alone, a right-click moves nothing.
+    assert!(d.controllable_id(garrison));
+    // Alone, it moves on its own.
     let to = d.planets[d.highways.neighbors[home][0]].pos;
-    assert_eq!(d.form_fleet(&ids(&d, garrison), to), None);
+    assert_eq!(d.form_fleet(&ids(&d, garrison), to), Some(garrison));
+    assert!(d.fleet(garrison).unwrap().dest.is_some());
     // With a captain nearby, the captain takes them along.
     let cap = captained(&mut d, BLUE, at + Vec2::new(15.0, 0.0), 0.0, 3);
     let mut sel = ids(&d, garrison);
@@ -690,14 +722,15 @@ fn ships_without_a_captain_stay_unless_a_captain_takes_them() {
 }
 
 #[test]
-fn part_of_a_fleet_without_its_flagship_splits_off_and_stays() {
+fn part_of_a_fleet_without_its_flagship_splits_off_and_goes_alone() {
     let (mut d, a, _) = duel((BLUE, Vec2::new(100.0, 100.0), 0.0, 10), (RED, Vec2::new(650.0, 350.0), WEST, 10));
     let flag = d.captain(d.fleet(a).unwrap().captain.unwrap()).unwrap().flagship.unwrap();
     let part: Vec<_> = ids(&d, a).into_iter().filter(|e| *e != flag).take(4).collect();
-    assert_eq!(d.form_fleet(&part, Vec2::new(100.0, 300.0)), None);
-    let new = d.fleets.iter().find(|f| f.ship_ids.iter().all(|e| part.contains(e))).unwrap();
-    assert_eq!((ships(&d, a), new.ships), (6, 4));
-    assert!(new.captain.is_none() && new.dest.is_none());
+    let new = d.form_fleet(&part, Vec2::new(100.0, 300.0)).unwrap();
+    assert_ne!(new, a);
+    let nf = d.fleet(new).unwrap();
+    assert_eq!((ships(&d, a), nf.ships), (6, 4));
+    assert!(nf.captain.is_none() && nf.dest.is_some(), "it goes on its own");
     // The flagship with part of its fleet: that part goes, the rest stays.
     let mut go: Vec<_> = ids(&d, a).into_iter().filter(|e| *e != flag).take(2).collect();
     go.push(flag);
@@ -770,7 +803,7 @@ fn a_lost_flagship_kills_its_captain_or_sends_them_home() {
         crate::sim::despawn_ships(&mut d.world, e, &[flag]);
         d.step(0.1);
         let f = d.fleet(id).unwrap();
-        assert!(f.captain.is_none() && !f.controllable(), "the fleet lost its captain");
+        assert!(f.captain.is_none(), "the fleet lost its captain");
         let c = d.captain(cid).unwrap().clone();
         if death == 1.0 {
             assert!(!c.alive);

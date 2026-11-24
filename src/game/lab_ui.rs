@@ -505,9 +505,9 @@ pub fn setup_labs(mut commands: Commands, mut images: ResMut<Assets<Image>>, cfg
                      Each owned planet's people (drawn inside it) run Epstein's rebellion model: legitimacy is \
                      1 − tax − occupation (fresh conquests are resented), ships nearby are the cops, fighting adds \
                      hardship. Rebels strike (red arc) and, past the revolt share, the planet goes independent. \
-                     Captains: only fleets led by a captain's flagship (big white ship, letter above) move. Each captain \
-                     has a skill and commands a number of escorts (more slows and shakes the fleet). A flagship counts \
-                     as 3 ships. Lose it and the captain may die, or comes back later at home with a new one. \
+                     Captains: each flagship (big white ship, letter above) has a captain with a skill who commands a \
+                     number of escorts (more slows and shakes the fleet); new ships go to the nearest captain with room. \
+                     A flagship counts as 3 ships. Lose it and the captain may die, or comes back later at home. \
                      Under each planet: ships there / ships needed to keep its people calm.",
                 );
                 p.spawn(row()).with_children(|r| {

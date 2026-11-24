@@ -53,7 +53,8 @@ use crate::voronoi::rng::ParkMiller;
 use crate::voronoi::sites::VoronoiConfig;
 
 pub const MAX_FLEETS_PER_SIDE: usize = 8;
-pub const START_SHIPS: u32 = MAX_PLANET_SIZE;
+/// Escorts each starting flagship has (it starts alone).
+pub const START_SHIPS: u32 = 0;
 pub const MIN_SHIPS: u32 = 1;
 pub const MAX_SHIPS: u32 = 100;
 /// Independent garrisons build up to this many ships per point of size
@@ -296,8 +297,9 @@ pub struct Fleet {
     pub dest: Option<Vec2>,
     /// Highway waypoints still ahead (the last one is `dest`).
     pub route: Vec<Vec2>,
-    /// A convoy on its way to this fleet (by id) to join it.
-    pub convoy: Option<u32>,
+    /// On its way to join this fleet (by id): a supply convoy, or a new
+    /// ship reinforcing it.
+    pub joining: Option<u32>,
     /// The captain whose flagship leads it (by id). Only these move.
     pub captain: Option<u32>,
     /// Supply ships only: held up at the edge of the other side's cells.
@@ -335,9 +337,9 @@ impl Fleet {
         self.ships > 0
     }
 
-    /// Blue and Red fleets with a captain, unless routed.
+    /// Blue and Red fleets, unless routed (with a captain or not).
     pub fn controllable(&self) -> bool {
-        self.selectable() && self.captain.is_some()
+        self.selectable()
     }
 
     /// Blue and Red ships the player can pick (garrisons included).
@@ -510,8 +512,8 @@ impl Dominion {
             p.stock = [HOME_STOCK; 3];
             let at = p.pos;
             let n = fleets.clamp(1, MAX_FLEETS_PER_SIDE);
-            // Out along the home planet's highways, one fleet per road
-            // (round the roads again if there are more fleets).
+            // Lone flagships at the home planet, a little way out along its
+            // highways (round the roads again if there are more of them).
             let mut roads: Vec<usize> = d.highways.neighbors[home].clone();
             if roads.is_empty() {
                 roads.push(home);
@@ -519,18 +521,10 @@ impl Dominion {
             for k in 0..n {
                 let to = d.planets[roads[k % roads.len()]].pos;
                 let dir = (to - at).normalize_or_zero();
-                let out = (45.0 + 20.0 * (k / roads.len()) as f32) * scale;
+                let out = (12.0 + 5.0 * (k / roads.len()) as f32) * scale;
                 let pos = at + dir * out.min(at.distance(to) * 0.5);
                 let id = d.spawn(Owner::Side(side), pos, dir.to_angle(), START_SHIPS, None);
                 d.add_captain_named(id, skills[k], &mut names);
-                let e = d.fleets.iter().find(|f| f.id == id).unwrap().division;
-                let load = d.tuning.supply_load / 3.0;
-                let at = pos / d.unit();
-                for kind in [AMMO, FOOD, PARTS] {
-                    let mut cargo = [0.0; 3];
-                    cargo[kind] = load;
-                    crate::sim::add_supply(&mut d.world, e, at, cargo);
-                }
             }
         }
         // Every planet starts with a garrison of `size` ships.
@@ -649,7 +643,7 @@ impl Dominion {
             facing,
             dest: None,
             route: Vec::new(),
-            convoy: None,
+            joining: None,
             captain: None,
             waiting: false,
             ships,
@@ -792,7 +786,7 @@ impl Dominion {
     pub fn order_move(&mut self, id: u32, to: Vec2) -> bool {
         let Some(i) = self.fleet_index(id).filter(|i| self.fleets[*i].controllable()) else { return false };
         self.fleets[i].home = None;
-        self.fleets[i].convoy = None;
+        self.fleets[i].joining = None;
         self.fleets[i].waiting = false;
         self.route_to(i, to)
     }
@@ -825,7 +819,7 @@ impl Dominion {
         let fi = self.fleets.len() - 1;
         let at = pos / self.unit();
         crate::sim::add_supply(&mut self.world, self.fleets[fi].division, at, cargo);
-        self.fleets[fi].convoy = target;
+        self.fleets[fi].joining = target;
         self.fleets[fi].supply = 1;
         if let Some(to) = target.and_then(|t| self.fleet(t)).map(|f| f.pos) {
             self.route_to(fi, to);
@@ -875,14 +869,13 @@ impl Dominion {
         self.fleets.iter().filter(|f| !f.ship_ids.is_empty() && f.ship_ids.iter().all(|e| ships.contains(e))).map(|f| f.id).collect()
     }
 
-    /// Right-click with `ships` selected. Only captains move: each
-    /// selected captain's fleet goes to `to` along the highways (captains
-    /// never merge). Its unselected combat ships split off and stay; its
-    /// supply ships always go with it. Selected ships without a captain
-    /// join the nearest selected captain within the police radius (that
-    /// is how captains pick up garrisons); the rest stay. A selected part
-    /// of a captain's fleet without the flagship splits off and stays.
-    /// Returns the strongest moving fleet.
+    /// Right-click with `ships` selected: they go to `to` along the
+    /// highways. A selected captain's fleet goes (its unselected combat
+    /// ships split off and stay; its supply ships always go with it), and
+    /// selected ships without a captain near it join it on the way.
+    /// Every other selected group goes on its own: a whole fleet as it is,
+    /// part of one split off first. Captains never merge. Only one
+    /// owner's ships count. Returns the strongest fleet that moves.
     pub fn form_fleet(&mut self, ships: &[Entity], to: Vec2) -> Option<u32> {
         let mut picked: Vec<(Entity, Owner, u32)> = ships
             .iter()
@@ -895,36 +888,41 @@ impl Dominion {
         sources.dedup();
         let flag_of = |d: &Self, id: u32| d.fleet(id).and_then(|f| f.captain).and_then(|c| d.captain(c)).and_then(|c| c.flagship);
         // Captains first.
-        let mut movers: Vec<u32> = Vec::new();
+        let mut captains: Vec<u32> = Vec::new();
+        let mut loose: Vec<Vec<Entity>> = Vec::new();
         for &src in &sources {
-            let Some(flag) = flag_of(self, src) else { continue };
             let mine: Vec<Entity> = picked.iter().filter(|p| p.2 == src).map(|p| p.0).collect();
-            let f = self.fleet(src)?;
-            if mine.contains(&flag) {
-                let rest: Vec<Entity> =
-                    f.ship_ids.iter().zip(&f.is_supply).filter(|(e, s)| !**s && !mine.contains(e)).map(|(e, _)| *e).collect();
-                self.split_off(&rest);
-                movers.push(src);
-            } else {
-                self.split_off(&mine);
+            match flag_of(self, src) {
+                Some(flag) if mine.contains(&flag) => {
+                    let f = self.fleet(src)?;
+                    let rest: Vec<Entity> =
+                        f.ship_ids.iter().zip(&f.is_supply).filter(|(e, s)| !**s && !mine.contains(e)).map(|(e, _)| *e).collect();
+                    self.split_off(&rest);
+                    captains.push(src);
+                }
+                _ => loose.push(mine),
             }
         }
-        // Then ships without a captain: to the nearest moving captain.
+        // Ships without a captain: into the nearest moving captain within
+        // reach, or on their own.
         let reach = self.police_radius();
-        for &src in &sources {
-            if flag_of(self, src).is_some() {
-                continue;
-            }
-            let mine: Vec<Entity> = picked.iter().filter(|p| p.2 == src).map(|p| p.0).collect();
-            let Some(f) = self.fleet(src) else { continue };
-            let at = f.pos;
-            let best = movers
+        let mut movers = captains.clone();
+        for mine in loose {
+            let Some(f) = mine.first().and_then(|e| self.fleet_of_ship(*e)) else { continue };
+            let (src, at, whole) = (f.id, f.pos, f.ship_ids.len() == mine.len());
+            let best = captains
                 .iter()
                 .filter_map(|id| self.fleet(*id).map(|g| (g.division, g.pos.distance(at))))
                 .filter(|(_, dist)| *dist <= reach)
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((division, _)) = best {
                 crate::sim::transfer_ships(&mut self.world, &mine, division);
+                self.sync();
+            } else if whole {
+                movers.push(src);
+            } else {
+                self.split_off(&mine);
+                movers.push(self.fleets.last()?.id);
             }
         }
         self.sync();
@@ -933,6 +931,22 @@ impl Dominion {
         }
         let t = self.tuning;
         movers.into_iter().filter_map(|id| self.fleet(id)).max_by(|a, b| a.strength(&t).total_cmp(&b.strength(&t))).map(|f| f.id)
+    }
+
+    /// The owner's captain nearest `pos` (by highway) whose escorts and
+    /// the ships on their way to it are fewer than it commands.
+    fn fleet_with_room(&self, owner: Owner, pos: Vec2) -> Option<u32> {
+        self.fleets
+            .iter()
+            .filter(|f| f.owner == owner && f.captain.is_some() && f.morale != Morale::Routed)
+            .filter(|f| {
+                let coming: u32 =
+                    self.fleets.iter().filter(|g| g.joining == Some(f.id) && g.armed()).map(|g| g.ships).sum();
+                ((self.escorts(f) + coming) as f32) < self.capacity(f)
+            })
+            .map(|f| (f.id, self.road_distance(pos, f.pos)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id)
     }
 
     /// These ships (all of one fleet) become a new fleet where they are,
@@ -1393,8 +1407,8 @@ impl Dominion {
 
     /// Supply ships carry one kind each. For each kind, a Blue or Red
     /// planet holding at least half a load sends one to the nearest (by
-    /// highway) of its owner's fleets that is away from a friendly planet
-    /// and short of that kind, counting what is already on its way.
+    /// highway) of its owner's fleets short of that kind (and not resting
+    /// at a planet that holds it), counting what is already on its way.
     fn load_convoys(&mut self) {
         let t = self.tuning;
         if t.supply_load <= 0.0 {
@@ -1402,9 +1416,9 @@ impl Dominion {
         }
         // What each fleet will hold once the convoys bound for it arrive.
         let mut incoming: std::collections::HashMap<u32, Stock> = std::collections::HashMap::new();
-        for f in self.fleets.iter().filter(|f| f.convoy.is_some()) {
+        for f in self.fleets.iter().filter(|f| f.joining.is_some() && !f.armed()) {
             let (_, cargo) = self.fleet_stores(f);
-            let e = incoming.entry(f.convoy.unwrap()).or_insert([0.0; 3]);
+            let e = incoming.entry(f.joining.unwrap()).or_insert([0.0; 3]);
             (0..3).for_each(|k| e[k] += cargo[k]);
         }
         // Each planet, each kind: one supply ship of that kind for the
@@ -1418,7 +1432,14 @@ impl Dominion {
                 }
                 let mut best: Option<(f32, u32, f32)> = None;
                 for f in &self.fleets {
-                    if f.owner != p.owner || !f.armed() || f.morale == Morale::Routed || self.friendly_planet(f.owner, f.pos).is_some() {
+                    // A fleet at one of its planets draws that planet's stock:
+                    // it needs a convoy only for what that planet lacks.
+                    let at_stock = self.friendly_planet(f.owner, f.pos).map(|q| (q, self.planets[q].stock[kind]));
+                    if f.owner != p.owner
+                        || !f.armed()
+                        || f.morale == Morale::Routed
+                        || at_stock.is_some_and(|(q, held)| q == pi || held >= 1.0)
+                    {
                         continue;
                     }
                     let (stores, cargo) = self.fleet_stores(f);
@@ -1448,9 +1469,9 @@ impl Dominion {
         self.sync();
     }
 
-    /// Convoys chase their fleets along the highways and join them in
-    /// range. One whose fleet is gone heads for its owner's nearest planet
-    /// and unloads there.
+    /// Convoys and reinforcements chase their fleets along the highways
+    /// and join them in range. A convoy whose fleet is gone heads for its
+    /// owner's nearest planet and unloads there; a reinforcement stays.
     fn run_convoys(&mut self, dt: f32) {
         self.convoy_timer += dt;
         if self.convoy_timer < CONVOY_SECS - 1e-4 {
@@ -1462,7 +1483,7 @@ impl Dominion {
         let mut unload: Vec<(usize, usize)> = Vec::new();
         for i in 0..self.fleets.len() {
             let f = &self.fleets[i];
-            let Some(target) = f.convoy else { continue };
+            let Some(target) = f.joining else { continue };
             let goal = self.fleet(target).filter(|g| g.armed() && g.morale != Morale::Routed && g.owner == f.owner).map(|g| (g.pos, g.division));
             match goal {
                 Some((at, division)) if at.distance(f.pos) <= reach => joins.push((f.ship_ids.clone(), division)),
@@ -1470,6 +1491,10 @@ impl Dominion {
                     if !f.waiting {
                         self.route_to(i, at);
                     }
+                }
+                None if f.armed() => {
+                    // A reinforcement with nobody left to join: it stays.
+                    self.fleets[i].joining = None;
                 }
                 None => {
                     let owner = self.fleets[i].owner;
@@ -1693,9 +1718,28 @@ impl Dominion {
                 }
                 self.planets[i].stock[PARTS] -= cost;
                 self.planets[i].build -= 1.0;
-                // Into the ships already there: its garrison, or else the
-                // biggest of its owner's fleets resting at the planet.
+                // To the nearest captain with room: at once if the fleet is
+                // here, else the new ship travels to join it.
                 let r = self.capture_radius();
+                if let Some(target) = self.fleet_with_room(owner, pos) {
+                    let tf = self.fleet_index(target).unwrap();
+                    if self.fleets[tf].pos.distance(pos) <= r {
+                        let e = self.fleets[tf].division;
+                        crate::sim::add_ships(&mut self.world, e, 1);
+                        self.equip(e, [0.0; 3]);
+                        self.fleets[tf].ships += 1;
+                    } else {
+                        let facing = (self.fleets[tf].pos - pos).to_angle();
+                        let id = self.spawn(owner, pos, facing, 1, None);
+                        let fi = self.fleet_index(id).unwrap();
+                        self.fleets[fi].joining = Some(target);
+                        let to = self.fleets[tf].pos;
+                        self.route_to(fi, to);
+                    }
+                    continue;
+                }
+                // No room anywhere: into the ships already here, its
+                // garrison or else the biggest fleet resting at the planet.
                 let here = self.fleets.iter().position(|f| f.home == Some(i) && f.owner == owner).or_else(|| {
                     (0..self.fleets.len())
                         .filter(|g| {
@@ -1994,7 +2038,7 @@ fn draw_icons(c: &mut Canvas, p: &Planet, at: Vec2, r: f32) {
     }
 }
 
-/// A 3×5 pixel glyph: digits, capitals, '!' and '/'.
+/// A 3×5 pixel glyph: digits, capitals, '!', '/' and space.
 fn glyph(ch: char) -> Option<[u8; 5]> {
     Some(match ch.to_ascii_uppercase() {
         'A' => [0b010, 0b101, 0b111, 0b101, 0b101],
@@ -2034,6 +2078,7 @@ fn glyph(ch: char) -> Option<[u8; 5]> {
         '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
         '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
         '!' => [0b010, 0b010, 0b010, 0b000, 0b010],
+        ' ' => [0b000, 0b000, 0b000, 0b000, 0b000],
         '/' => [0b001, 0b001, 0b010, 0b100, 0b100],
         _ => return None,
     })
@@ -2396,6 +2441,22 @@ pub fn render(d: &Dominion, background: &Canvas, view: &View, opts: &DrawOptions
         let k = age / BOOM_SECS;
         c.circle(view.to_screen(*p), (3.0 + 9.0 * k) * (z * d.scale()).clamp(0.6, 2.0), HIT, (1.0 - k) * 0.9);
     }
+    // How many ships are selected, above the topmost of them.
+    if !opts.selected.is_empty() {
+        let at: Vec<Vec2> = d
+            .fleets
+            .iter()
+            .flat_map(|f| f.ship_ids.iter().zip(&f.ship_px))
+            .filter(|(e, _)| opts.selected.contains(e))
+            .map(|(_, p)| view.to_screen(p.0))
+            .collect();
+        if !at.is_empty() {
+            let top = at.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+            let x = at.iter().map(|p| p.x).sum::<f32>() / at.len() as f32;
+            let y = (top - 26.0).max(8.0);
+            draw_text(&mut c, Vec2::new(x, y), &format!("{} SELECTED", at.len()), GOLD);
+        }
+    }
     // The selection box being dragged.
     if let Some((a, b)) = opts.marquee {
         let (lo, hi) = (a.min(b), a.max(b));
@@ -2452,7 +2513,8 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
         let o = Owner::Side(side);
         let gone = if d.deserted[side] > 0 { format!(" · {} ships lost to shortages", d.deserted[side]) } else { String::new() };
         let gone = if d.revolts[side] > 0 { format!("{gone} · {} planets lost to revolts", d.revolts[side]) } else { gone };
-        let transit = d.fleets.iter().filter(|f| f.owner == o && f.convoy.is_some()).count();
+        let transit = d.fleets.iter().filter(|f| f.owner == o && f.joining.is_some() && !f.armed()).count();
+        let reinforcing: u32 = d.fleets.iter().filter(|f| f.owner == o && f.joining.is_some() && f.armed()).map(|f| f.ships).sum();
         let waiting = d.fleets.iter().filter(|f| f.owner == o && f.waiting).count();
         let waiting = if waiting > 0 { format!(" ({waiting} waiting at enemy lines)") } else { String::new() };
         let captains: Vec<String> = d
@@ -2472,7 +2534,7 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
             .collect();
         s.push_str(&format!("\n{name} captains: {}", if captains.is_empty() { "none".into() } else { captains.join(", ") }));
         s.push_str(&format!(
-            "\n{name}: planets hold {} · make {}/s · {transit} supply ships under way{waiting}{gone}",
+            "\n{name}: planets hold {} · make {}/s · {transit} supply ships, {reinforcing} reinforcements under way{waiting}{gone}",
             stock_text(&d.stock_of(o)),
             rate_text(&d.planet_income(o)),
         ));
@@ -2528,7 +2590,8 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
             let i = d.fleet_index(*one).unwrap();
             let f = &d.fleets[i];
             let who = match f.owner {
-                Owner::Side(side) if f.convoy.is_some() => format!("{} convoy", SIDE_NAMES[side]),
+                Owner::Side(side) if f.joining.is_some() && !f.armed() => format!("{} convoy", SIDE_NAMES[side]),
+                Owner::Side(side) if f.joining.is_some() => format!("{} reinforcements", SIDE_NAMES[side]),
                 Owner::Side(side) => match f.captain.and_then(|c| d.captain(c)) {
                     Some(c) => format!(
                         "{} — {} [{}], {}/{:.0} escorts",
@@ -2552,7 +2615,12 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
                 "holding"
             };
             let fight = if f.engaged { " · ENGAGED" } else { "" };
-            s.push_str(&format!("\nSelected: {who}, {} ships, {}, {}, {order}{fight}.", f.ships, f.formation.name(), f.morale.name()));
+            s.push_str(&format!(
+                "\nSelected: {} ships — {who}, {}, {}, {order}{fight}.",
+                f.ships + f.supply,
+                f.formation.name(),
+                f.morale.name()
+            ));
             let (stores, cargo) = d.fleet_stores(f);
             let n = f.ships.max(1) as f32;
             s.push_str(&format!(
@@ -2566,8 +2634,6 @@ pub fn status(d: &Dominion, selected: &[Entity], planet: Option<usize>) -> Strin
                 s.push_str(" Routed: it no longer takes orders.");
             } else if matches!(f.owner, Owner::Independent(_)) {
                 s.push_str(" Independents only defend.");
-            } else if !f.controllable() {
-                s.push_str(" No captain: it stays as a garrison. Select it with a captain's fleet nearby and right-click to have the captain take it along.");
             } else {
                 s.push_str(" Right-click the map to move it · keys 1–6 set its formation.");
             }
